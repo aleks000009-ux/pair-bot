@@ -10,9 +10,12 @@ API = "https://bybit-proxy.aleks000009.workers.dev"
 
 def get_closes(symbol, limit=160):
     url = f"{API}/kline?category=linear&symbol={symbol}&interval=60&limit={limit}"
-    r = requests.get(url, timeout=15).json()
-    rows = r["result"]["list"]
-    closes = [float(c[4]) for c in rows][::-1]
+    r = requests.get(url, timeout=20).json()
+    if "result" not in r or not r["result"] or not r["result"].get("list"):
+        raise Exception(f"нет данных по {symbol}")
+    closes = [float(c[4]) for c in r["result"]["list"]][::-1]
+    if len(closes) < 30:
+        raise Exception(f"мало свечей по {symbol}")
     return closes
 
 def analyze(a, b, window=100):
