@@ -6,7 +6,7 @@ import numpy as np
 TOKEN = os.environ.get("BOT_TOKEN")
 bot = telebot.TeleBot(TOKEN)
 
-API = "https://bybit-proxy.aleks000009.workers.dev"
+API = "https://api.bybit.com/v5/market"
 
 def get_closes(symbol, limit=160):
     url = f"{API}/kline?category=linear&symbol={symbol}&interval=60&limit={limit}"
