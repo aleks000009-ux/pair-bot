@@ -6,11 +6,12 @@ import numpy as np
 TOKEN = os.environ.get("BOT_TOKEN")
 bot = telebot.TeleBot(TOKEN)
 
-API = "https://api.bytick.com/v5/market"
+API = "https://bybit-proxy.aleks000009.workers.dev"
 
 def get_closes(symbol, limit=160):
     url = f"{API}/kline?category=linear&symbol={symbol}&interval=60&limit={limit}"
-    r = requests.get(url, timeout=20).json()
+       headers = {"User-Agent": "Mozilla/5.0"}
+    r = requests.get(url, headers=headers, timeout=20).json()
     if "result" not in r or not r["result"] or not r["result"].get("list"):
         raise Exception(f"нет данных по {symbol}")
     closes = [float(c[4]) for c in r["result"]["list"]][::-1]
