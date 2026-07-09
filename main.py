@@ -11,9 +11,15 @@ API = "https://bybit-proxy.aleks000009.workers.dev"
 def get_closes(symbol, limit=160):
     url = f"{API}/kline?category=linear&symbol={symbol}&interval=60&limit={limit}"
     headers = {"User-Agent": "Mozilla/5.0"}
-    r = requests.get(url, headers=headers, timeout=20).json()
-    if "result" not in r or not r["result"] or not r["result"].get("list"):
-        raise Exception(f"нет данных по {symbol}")
+    resp = requests.get(url, headers=headers, timeout=20)
+    raw = resp.text
+    r = None
+    try:
+        r = resp.json()
+    except:
+        pass
+    if not r or "result" not in r or not r.get("result") or not r["result"].get("list"):
+        raise Exception(f"ответ прокси по {symbol} (код {resp.status_code}): {raw[:200]}")
     closes = [float(c[4]) for c in r["result"]["list"]][::-1]
     if len(closes) < 30:
         raise Exception(f"мало свечей по {symbol}")
