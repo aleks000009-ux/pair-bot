@@ -10,7 +10,7 @@ API = "https://bybit-proxy.aleks000009.workers.dev"
 
 def get_closes(symbol, limit=160):
     url = f"{API}/kline?category=linear&symbol={symbol}&interval=60&limit={limit}"
-       headers = {"User-Agent": "Mozilla/5.0"}
+    headers = {"User-Agent": "Mozilla/5.0"}
     r = requests.get(url, headers=headers, timeout=20).json()
     if "result" not in r or not r["result"] or not r["result"].get("list"):
         raise Exception(f"нет данных по {symbol}")
@@ -24,11 +24,9 @@ def analyze(a, b, window=100):
     cb = get_closes(b)
     n = min(len(ca), len(cb))
     ca, cb = ca[-n:], cb[-n:]
-    # корреляция по лог-доходностям
     ra = np.diff(np.log(ca))
     rb = np.diff(np.log(cb))
     corr = np.corrcoef(ra, rb)[0, 1]
-    # z-score по отношению цен
     ratio = np.array(ca) / np.array(cb)
     w = ratio[-window:]
     z = (ratio[-1] - w.mean()) / w.std()
@@ -36,7 +34,7 @@ def analyze(a, b, window=100):
 
 @bot.message_handler(commands=['start'])
 def start(message):
-    bot.reply_to(message, "Привет! Напиши: /pair BTC LINK — посчитаю корреляцию и z-score.")
+    bot.reply_to(message, "Привет! Напиши: /pair BTC LINK")
 
 @bot.message_handler(commands=['pair'])
 def pair(message):
@@ -47,22 +45,22 @@ def pair(message):
         bot.reply_to(message, f"Считаю {parts[1].upper()}/{parts[2].upper()}...")
         corr, z = analyze(a, b)
         if abs(z) >= 3.5:
-            state = "🛑 СТОП — расхождение слишком большое"
+            state = "СТОП - расхождение слишком большое"
         elif abs(z) >= 2:
-            state = "🎯 ЗОНА ВХОДА"
+            state = "ЗОНА ВХОДА"
         elif abs(z) <= 0.5:
-            state = "✅ почти сошлись (выход)"
+            state = "почти сошлись (выход)"
         else:
-            state = "⏳ ждём"
+            state = "ждём"
         short = a if z > 0 else b
         long = b if z > 0 else a
         text = (
-            f"🔗 {parts[1].upper()}/{parts[2].upper()}\n\n"
+            f"{parts[1].upper()}/{parts[2].upper()}\n\n"
             f"Корреляция: {corr*100:.0f}%\n"
             f"z-score: {z:+.2f}\n"
             f"Статус: {state}\n\n"
-            f"↓ шорт {short.replace('USDT','')}\n"
-            f"↑ лонг {long.replace('USDT','')}"
+            f"шорт {short.replace('USDT','')}\n"
+            f"лонг {long.replace('USDT','')}"
         )
         bot.reply_to(message, text)
     except Exception as e:
