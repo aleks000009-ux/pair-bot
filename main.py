@@ -13,19 +13,21 @@ SIZE = 1000
 ENTRY_Z = 2.0
 STOP_Z = 3.5
 TARGET_Z = 0.5
-MIN_CORR = 0.88
+MIN_CORR = 0.85
 MIN_PROFIT = 20
-MAX_HALFLIFE = 60   # макс полужизнь в часах (баров), выше - вялая, не берём
-MAX_COINS = 60
+MAX_HALFLIFE = 60
+MAX_COINS = 100
 FEE = 0.055
 
 tracked = {}
 users = set()
+waiting_pair = set()   # кто сейчас вводит свою пару
 
 def menu():
     kb = types.ReplyKeyboardMarkup(resize_keyboard=True)
     kb.row("🔍 Найти пары")
-    kb.row("📋 Мои пары", "🗑 Очистить")
+    kb.row("➕ Добавить пару", "📋 Мои пары")
+    kb.row("🗑 Очистить")
     return kb
 
 def get_closes(symbol, limit=200):
@@ -39,9 +41,7 @@ def half_life(series):
     s = np.array(series)
     if len(s) < 20:
         return None
-    lag = s[:-1]
-    delta = np.diff(s)
-    ml = lag.mean()
+    lag = s[:-1]; delta = np.diff(s); ml = lag.mean()
     denom = np.sum((lag - ml) ** 2)
     if denom == 0:
         return None
@@ -69,7 +69,6 @@ def analyze_pair(ca, cb, window=100):
 
 def profit_stop(dev, z):
     profit = SIZE * dev / 100 - SIZE * FEE / 100 * 4
-    # ход до стопа в % от текущего z
     extra = (STOP_Z - abs(z))
     loss_pct = dev / max(abs(z), 0.01) * extra
     loss = SIZE * loss_pct / 100 + SIZE * FEE / 100 * 4
@@ -80,16 +79,15 @@ def card(a, b, corr, z, dev, hl):
     profit, loss, rr = profit_stop(dev, z)
     short = a if z > 0 else b
     long = b if z > 0 else a
-    c_ok = "✅" if corr >= 0.90 else "⚠️"
+    c_ok = "✅" if corr >= 0.88 else "⚠️"
     h_ok = "✅" if (hl and hl <= 30) else ("⚠️" if hl else "❌")
-    z_ok = "✅"
     hl_txt = (str(round(hl)) + "ч") if hl else "нет возврата"
     rr_ok = "✅" if rr >= 1.5 else "⚠️"
     txt = (
         "🔗 " + a + " / " + b + "\n\n"
         + c_ok + " Корреляция: " + str(round(corr*100)) + "%\n"
         + h_ok + " Полужизнь: " + hl_txt + "\n"
-        + z_ok + " z-score: " + format(z, "+.2f") + " (зона входа)\n\n"
+        "✅ z-score: " + format(z, "+.2f") + " (зона входа)\n\n"
         "📊 Шорт " + short + " / Лонг " + long + "\n"
         "💰 Профит (z→0): ~$" + str(round(profit)) + "\n"
         "🛑 Стоп (z=" + str(STOP_Z) + "): ~$" + str(round(loss)) + "\n"
@@ -108,13 +106,18 @@ def top_coins():
 @bot.message_handler(commands=['start'])
 def start(m):
     users.add(m.chat.id)
-    bot.send_message(m.chat.id, "Привет! Слежу за парами автоматически.\nЖми кнопки 👇\n\nПришлю хорошую пару когда появится, и алерт на выход/стоп по отслеживаемым.", reply_markup=menu())
+    bot.send_message(m.chat.id, "Привет! Слежу за парами автоматически.\nЖми кнопки 👇", reply_markup=menu())
 
 @bot.message_handler(func=lambda m: m.text == "🔍 Найти пары")
 def btn_scan(m):
     users.add(m.chat.id)
-    bot.send_message(m.chat.id, "Ищу лучшие пары (корр, полужизнь, профит)... жди 2-4 мин")
+    bot.send_message(m.chat.id, "Ищу пары среди топ-100 монет... жди 5-7 мин")
     do_scan(m.chat.id, manual=True)
+
+@bot.message_handler(func=lambda m: m.text == "➕ Добавить пару")
+def btn_add(m):
+    waiting_pair.add(m.chat.id)
+    bot.send_message(m.chat.id, "Напиши две монеты через пробел, например:\nDOGE LINK")
 
 @bot.message_handler(func=lambda m: m.text == "📋 Мои пары")
 def btn_list(m):
@@ -150,7 +153,23 @@ def cb_track(c):
     if (a, b) not in tracked[c.message.chat.id]:
         tracked[c.message.chat.id].append((a, b))
     bot.answer_callback_query(c.id, "Отслеживаю " + a + "/" + b)
-    bot.send_message(c.message.chat.id, "✅ " + a + "/" + b + " добавлена. Пришлю алерт на выход/стоп.", reply_markup=menu())
+    bot.send_message(c.message.chat.id, "✅ " + a + "/" + b + " добавлена.", reply_markup=menu())
+
+# ввод своей пары (ловит любой текст, если ждём пару)
+@bot.message_handler(func=lambda m: m.chat.id in waiting_pair)
+def add_manual(m):
+    waiting_pair.discard(m.chat.id)
+    try:
+        parts = m.text.replace("/", " ").split()
+        a, b = parts[0].upper(), parts[1].upper()
+        # проверим что данные есть
+        get_closes(a+"USDT"); get_closes(b+"USDT")
+        tracked.setdefault(m.chat.id, [])
+        if (a, b) not in tracked[m.chat.id]:
+            tracked[m.chat.id].append((a, b))
+        bot.send_message(m.chat.id, "✅ Отслеживаю " + a + "/" + b + ". Пришлю алерт на выход/стоп.", reply_markup=menu())
+    except Exception:
+        bot.send_message(m.chat.id, "Не понял пару. Напиши как: DOGE LINK\n(или проверь что монеты есть на бирже)", reply_markup=menu())
 
 def do_scan(chat_id, manual=False):
     try:
@@ -161,7 +180,6 @@ def do_scan(chat_id, manual=False):
                 closes[c] = get_closes(c + "USDT")
             except:
                 pass
-            time.sleep(0.1)
         found = []
         cl = list(closes.keys())
         for i in range(len(cl)):
@@ -186,7 +204,7 @@ def do_scan(chat_id, manual=False):
                     pass
         if not found:
             if manual:
-                bot.send_message(chat_id, "Хороших пар сейчас нет (корр≥88%, полужизнь короткая, профит≥$20). Загляну позже сам.", reply_markup=menu())
+                bot.send_message(chat_id, "Хороших пар сейчас нет (корр≥85%, полужизнь короткая, профит≥$20). Загляну позже сам.", reply_markup=menu())
             return
         found.sort(reverse=True)
         bot.send_message(chat_id, "Нашёл " + str(len(found)) + " пар(ы):")
