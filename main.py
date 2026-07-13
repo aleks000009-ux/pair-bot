@@ -15,13 +15,13 @@ STOP_Z = 3.5
 TARGET_Z = 0.5
 MIN_CORR = 0.85
 MIN_PROFIT = 20
-MAX_HALFLIFE = 60
+MAX_HALFLIFE = 120
 MAX_COINS = 100
 FEE = 0.055
 
 tracked = {}
 users = set()
-waiting_pair = set()   # кто сейчас вводит свою пару
+waiting_pair = set()
 
 def menu():
     kb = types.ReplyKeyboardMarkup(resize_keyboard=True)
@@ -155,21 +155,19 @@ def cb_track(c):
     bot.answer_callback_query(c.id, "Отслеживаю " + a + "/" + b)
     bot.send_message(c.message.chat.id, "✅ " + a + "/" + b + " добавлена.", reply_markup=menu())
 
-# ввод своей пары (ловит любой текст, если ждём пару)
 @bot.message_handler(func=lambda m: m.chat.id in waiting_pair)
 def add_manual(m):
     waiting_pair.discard(m.chat.id)
     try:
         parts = m.text.replace("/", " ").split()
         a, b = parts[0].upper(), parts[1].upper()
-        # проверим что данные есть
         get_closes(a+"USDT"); get_closes(b+"USDT")
         tracked.setdefault(m.chat.id, [])
         if (a, b) not in tracked[m.chat.id]:
             tracked[m.chat.id].append((a, b))
         bot.send_message(m.chat.id, "✅ Отслеживаю " + a + "/" + b + ". Пришлю алерт на выход/стоп.", reply_markup=menu())
     except Exception:
-        bot.send_message(m.chat.id, "Не понял пару. Напиши как: DOGE LINK\n(или проверь что монеты есть на бирже)", reply_markup=menu())
+        bot.send_message(m.chat.id, "Не понял пару. Напиши как: DOGE LINK", reply_markup=menu())
 
 def do_scan(chat_id, manual=False):
     try:
@@ -204,7 +202,7 @@ def do_scan(chat_id, manual=False):
                     pass
         if not found:
             if manual:
-                bot.send_message(chat_id, "Хороших пар сейчас нет (корр≥85%, полужизнь короткая, профит≥$20). Загляну позже сам.", reply_markup=menu())
+                bot.send_message(chat_id, "Хороших пар сейчас нет (корр≥85%, полужизнь≤120ч, профит≥$20). Загляну позже сам.", reply_markup=menu())
             return
         found.sort(reverse=True)
         bot.send_message(chat_id, "Нашёл " + str(len(found)) + " пар(ы):")
