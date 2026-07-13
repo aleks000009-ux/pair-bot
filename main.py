@@ -22,6 +22,23 @@ FEE = 0.055
 tracked = {}
 users = set()
 waiting_pair = set()
+bybit_coins = set()
+
+def load_bybit_coins():
+    global bybit_coins
+    try:
+        url = "https://api.bybit.com/v5/market/instruments-info?category=linear"
+        r = requests.get(url, timeout=20, headers={"User-Agent": "Mozilla/5.0"}).json()
+        lst = r.get("result", {}).get("list", [])
+        s = set()
+        for x in lst:
+            sym = x.get("symbol", "")
+            if sym.endswith("USDT"):
+                s.add(sym.replace("USDT", ""))
+        if s:
+            bybit_coins = s
+    except:
+        pass
 
 def menu():
     kb = types.ReplyKeyboardMarkup(resize_keyboard=True)
@@ -101,17 +118,25 @@ def top_coins():
     r = requests.get(url, timeout=25).json()
     usdt = [x for x in r if x["symbol"].endswith("USDT")]
     usdt.sort(key=lambda x: float(x["quoteVolume"]), reverse=True)
-    return [x["symbol"].replace("USDT", "") for x in usdt[:MAX_COINS]]
+    coins = [x["symbol"].replace("USDT", "") for x in usdt]
+    # только те, что торгуются на Bybit
+    if bybit_coins:
+        coins = [c for c in coins if c in bybit_coins]
+    return coins[:MAX_COINS]
 
 @bot.message_handler(commands=['start'])
 def start(m):
     users.add(m.chat.id)
-    bot.send_message(m.chat.id, "Привет! Слежу за парами автоматически.\nЖми кнопки 👇", reply_markup=menu())
+    if not bybit_coins:
+        load_bybit_coins()
+    bot.send_message(m.chat.id, "Привет! Слежу за парами (только монеты с Bybit).\nЖми кнопки 👇", reply_markup=menu())
 
 @bot.message_handler(func=lambda m: m.text == "🔍 Найти пары")
 def btn_scan(m):
     users.add(m.chat.id)
-    bot.send_message(m.chat.id, "Ищу пары среди топ-100 монет... жди 5-7 мин")
+    if not bybit_coins:
+        load_bybit_coins()
+    bot.send_message(m.chat.id, "Ищу пары (монеты с Bybit)... жди 5-7 мин")
     do_scan(m.chat.id, manual=True)
 
 @bot.message_handler(func=lambda m: m.text == "➕ Добавить пару")
@@ -219,6 +244,8 @@ def auto_loop():
     last_scan = 0
     while True:
         try:
+            if not bybit_coins:
+                load_bybit_coins()
             for chat_id, pairs in list(tracked.items()):
                 for a, b in list(pairs):
                     try:
@@ -243,6 +270,7 @@ def auto_loop():
             pass
         time.sleep(90)
 
+load_bybit_coins()
 threading.Thread(target=auto_loop, daemon=True).start()
 print("Бот запущен...")
 bot.infinity_polling()
