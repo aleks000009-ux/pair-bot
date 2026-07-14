@@ -112,7 +112,7 @@ def start(m):
 @bot.message_handler(func=lambda m: m.text == "🔍 Найти пары")
 def btn_scan(m):
     users.add(m.chat.id)
-    bot.send_message(m.chat.id, "Ищу среди топ-150 монет... жди 12-15 мин")
+    bot.send_message(m.chat.id, "Ищу среди топ-150 монет... жди 12-18 мин")
     do_scan(m.chat.id, manual=True)
 
 @bot.message_handler(func=lambda m: m.text == "➕ Добавить пару")
@@ -140,6 +140,7 @@ def btn_list(m):
             out += a + "/" + b + ": " + st + "\n"
         except:
             out += a + "/" + b + ": ошибка данных\n"
+        time.sleep(0.3)
     bot.send_message(m.chat.id, out, reply_markup=menu())
 
 @bot.message_handler(func=lambda m: m.text == "🗑 Очистить")
@@ -179,6 +180,7 @@ def do_scan(chat_id, manual=False):
                 closes[c] = get_closes(c + "USDT")
             except:
                 pass
+            time.sleep(0.12)
         found = []
         cl = list(closes.keys())
         for i in range(len(cl)):
@@ -214,6 +216,7 @@ def do_scan(chat_id, manual=False):
             ikb = types.InlineKeyboardMarkup()
             ikb.add(types.InlineKeyboardButton("➡️ Отслеживать " + a + "/" + b, callback_data="track:" + a + ":" + b))
             bot.send_message(chat_id, txt, reply_markup=ikb)
+            time.sleep(1)
     except Exception:
         if manual:
             bot.send_message(chat_id, "Ошибка при поиске, попробуй ещё раз.", reply_markup=menu())
@@ -235,6 +238,7 @@ def auto_loop():
                             tracked[chat_id].remove((a, b))
                     except:
                         pass
+                    time.sleep(0.5)
             if time.time() - last_scan > 1800:
                 last_scan = time.time()
                 for uid in list(users):
@@ -244,7 +248,7 @@ def auto_loop():
                         pass
         except:
             pass
-        time.sleep(90)
+        time.sleep(120)
 
 threading.Thread(target=auto_loop, daemon=True).start()
 print("Бот запущен...")
