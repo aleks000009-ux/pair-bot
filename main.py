@@ -16,7 +16,7 @@ MAX_DIST = 0.8       # % макс расстояние до уровня
 MAX_RISK = 3.0       # % макс риск
 RR = 3               # тейк 1:3
 ATR_BUF = 0.5        # буфер стопа за уровень
-MAX_COINS = 120
+MAX_COINS = 200
 FEE = 0.055
 
 tracked = {}   # {chat_id: [ {sym, side, entry, sl, tp} ]}
