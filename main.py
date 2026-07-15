@@ -9,146 +9,103 @@ import numpy as np
 TOKEN = os.environ.get("BOT_TOKEN")
 bot = telebot.TeleBot(TOKEN)
 
-SIZE = 1000
-ENTRY_Z = 2.3
-MAX_ENTRY_Z = 2.8
-STOP_Z = 3.5
-TARGET_Z = 0.5
-MIN_CORR = 0.85
-MIN_PROFIT = 20
-MAX_HALFLIFE = 24
-MIN_RR = 1.5
-MAX_COINS = 150
+SIZE = 1000          # $ на сделку
+RSI_LEVEL = 35       # перепродан для лонга (шорт: 100-35=65)
+VOL_MULT = 1.3       # всплеск объёма
+MAX_DIST = 0.8       # % макс расстояние до уровня
+MAX_RISK = 3.0       # % макс риск
+RR = 3               # тейк 1:3
+ATR_BUF = 0.5        # буфер стопа за уровень
+MAX_COINS = 120
 FEE = 0.055
 
-tracked = {}
+tracked = {}   # {chat_id: [ {sym, side, entry, sl, tp} ]}
 users = set()
-waiting_pair = set()
 
 def menu():
     kb = types.ReplyKeyboardMarkup(resize_keyboard=True)
-    kb.row("🔍 Найти пары")
-    kb.row("🔸 Почти подходят")
-    kb.row("➕ Добавить пару", "📋 Мои пары")
-    kb.row("🗑 Очистить")
+    kb.row("🔍 Найти отскоки")
+    kb.row("📋 Мои сделки", "🗑 Очистить")
     return kb
 
-def get_closes(symbol, limit=200):
-    url = f"https://data-api.binance.vision/api/v3/klines?symbol={symbol}&interval=1h&limit={limit}"
+def get_klines(symbol, limit=250):
+    url = f"https://data-api.binance.vision/api/v3/klines?symbol={symbol}&interval=4h&limit={limit}"
     r = requests.get(url, timeout=20).json()
-    if not isinstance(r, list) or len(r) < 40:
+    if not isinstance(r, list) or len(r) < 60:
         raise Exception("нет данных " + symbol)
-    return [float(c[4]) for c in r]
+    return [{"o": float(c[1]), "h": float(c[2]), "l": float(c[3]), "c": float(c[4]), "v": float(c[5])} for c in r]
 
-def half_life(series):
-    s = np.array(series)
-    if len(s) < 20:
+def rsi(closes, period=14):
+    c = np.array(closes)
+    d = np.diff(c)
+    if len(d) < period:
         return None
-    lag = s[:-1]; delta = np.diff(s); ml = lag.mean()
-    denom = np.sum((lag - ml) ** 2)
-    if denom == 0:
-        return None
-    beta = np.sum((lag - ml) * (delta - delta.mean())) / denom
-    if beta >= 0:
-        return None
-    hl = -np.log(2) / np.log(1 + beta)
-    if hl <= 0 or not np.isfinite(hl):
-        return None
-    return hl
+    gain = np.where(d > 0, d, 0)
+    loss = np.where(d < 0, -d, 0)
+    ag = gain[:period].mean()
+    al = loss[:period].mean()
+    for i in range(period, len(d)):
+        ag = (ag * (period - 1) + gain[i]) / period
+        al = (al * (period - 1) + loss[i]) / period
+    if al == 0:
+        return 100.0
+    rs = ag / al
+    return 100 - (100 / (1 + rs))
 
-def analyze_pair(ca, cb, window=100):
-    n = min(len(ca), len(cb))
-    x, y = np.array(ca[-n:]), np.array(cb[-n:])
-    corr = np.corrcoef(np.diff(np.log(x)), np.diff(np.log(y)))[0, 1]
-    ratio = x / y
-    w = ratio[-window:]
-    mean, std = w.mean(), w.std()
-    if std == 0:
+def atr(kl, period=14):
+    if len(kl) < period + 1:
         return None
-    z = (ratio[-1] - mean) / std
-    dev = abs(ratio[-1] / mean - 1) * 100
-    hl = half_life(w)
-    return corr, z, dev, hl
+    trs = []
+    for i in range(1, len(kl)):
+        h, l, pc = kl[i]["h"], kl[i]["l"], kl[i-1]["c"]
+        trs.append(max(h - l, abs(h - pc), abs(l - pc)))
+    return float(np.mean(trs[-period:]))
 
-def profit_stop(dev, z):
-    profit = SIZE * dev / 100 - SIZE * FEE / 100 * 4
-    extra = (STOP_Z - abs(z))
-    loss_pct = dev / max(abs(z), 0.01) * extra
-    loss = SIZE * loss_pct / 100 + SIZE * FEE / 100 * 4
-    rr = profit / loss if loss > 0 else 0
-    return profit, loss, rr
-
-def backtest_pair(a, b):
-    ca = get_closes(a + "USDT", limit=1000)
-    cb = get_closes(b + "USDT", limit=1000)
-    n = min(len(ca), len(cb))
-    x, y = np.array(ca[-n:]), np.array(cb[-n:])
-    ratio = x / y
-    win = 100
-    if len(ratio) < win + 50:
+def ema(closes, period):
+    c = np.array(closes, dtype=float)
+    if len(c) < period:
         return None
-    zs, devs = [], []
-    for i in range(win, len(ratio)):
-        w = ratio[i-win:i]
-        m, s = w.mean(), w.std()
-        z = (ratio[i] - m) / s if s > 0 else 0
-        zs.append(z)
-        devs.append(abs(ratio[i] / m - 1) * 100)
-    zs = np.array(zs); devs = np.array(devs)
-    fee = SIZE * FEE / 100 * 4
-    profits, losses_l, hours = [], [], []
-    i = 0
-    while i < len(zs):
-        if ENTRY_Z <= abs(zs[i]) <= MAX_ENTRY_Z:
-            entry_i = i
-            entry_dev = devs[i]
-            done = False
-            for j in range(i + 1, len(zs)):
-                if abs(zs[j]) <= TARGET_Z:
-                    gain = (entry_dev - devs[j]) / 100 * SIZE - fee
-                    profits.append(gain)
-                    hours.append(j - entry_i)
-                    i = j
-                    done = True
-                    break
-                if abs(zs[j]) >= STOP_Z:
-                    loss = (devs[j] - entry_dev) / 100 * SIZE + fee
-                    losses_l.append(loss)
-                    i = j
-                    done = True
-                    break
-            if not done:
-                break
-        i += 1
-    total = len(profits) + len(losses_l)
-    if total == 0:
-        return None
-    avg_profit = int(np.mean(profits)) if profits else 0
-    avg_loss = int(np.mean(losses_l)) if losses_l else 0
-    avg_h = int(np.mean(hours)) if hours else 0
-    total_money = int(sum(profits) - sum(losses_l))
-    return total, len(profits), len(losses_l), avg_h, total_money, avg_profit, avg_loss
+    k = 2 / (period + 1)
+    e = c[:period].mean()
+    for p in c[period:]:
+        e = p * k + e * (1 - k)
+    return float(e)
 
-def card(a, b, corr, z, dev, hl):
-    profit, loss, rr = profit_stop(dev, z)
-    short = a if z > 0 else b
-    long = b if z > 0 else a
-    c_ok = "✅" if corr >= 0.90 else "⚠️"
-    h_ok = "✅" if (hl and hl <= 15) else "⚠️"
-    hl_txt = (str(round(hl)) + "ч") if hl else "—"
-    rr_ok = "✅" if rr >= 2 else "⚠️"
-    txt = (
-        "🔗 " + a + " / " + b + "\n\n"
-        + c_ok + " Корреляция: " + str(round(corr*100)) + "%\n"
-        + h_ok + " Полужизнь: " + hl_txt + "\n"
-        "✅ z-score: " + format(z, "+.2f") + " (зона входа)\n\n"
-        "📊 Шорт " + short + " / Лонг " + long + "\n"
-        "💰 Профит (z→0): ~$" + str(round(profit)) + "\n"
-        "🛑 Стоп (z=" + str(STOP_Z) + "): ~$" + str(round(loss)) + "\n"
-        + rr_ok + " R:R: " + str(round(rr, 1)) + "\n\n"
-        "⚙️ на $" + str(SIZE) + "/ногу, плечо 1х!"
-    )
-    return txt
+def find_levels(kl, kind):
+    lv = []
+    for i in range(3, len(kl) - 3):
+        if kind == "sup":
+            v = kl[i]["l"]
+            if v < kl[i-1]["l"] and v < kl[i-2]["l"] and v < kl[i+1]["l"] and v < kl[i+2]["l"]:
+                lv.append(v)
+        else:
+            v = kl[i]["h"]
+            if v > kl[i-1]["h"] and v > kl[i-2]["h"] and v > kl[i+1]["h"] and v > kl[i+2]["h"]:
+                lv.append(v)
+    return lv
+
+def detect_reversal(kl, side):
+    if len(kl) < 2:
+        return None
+    last, prev = kl[-1], kl[-2]
+    body = abs(last["c"] - last["o"])
+    rng = last["h"] - last["l"]
+    if rng <= 0:
+        return None
+    upper = last["h"] - max(last["o"], last["c"])
+    lower = min(last["o"], last["c"]) - last["l"]
+    small = body <= rng * 0.4
+    if side == "long":
+        if lower >= body * 2 and small and upper <= body * 0.8 and lower >= rng * 0.5:
+            return "🔨 Пин-бар"
+        if prev["c"] < prev["o"] and last["c"] > last["o"] and last["c"] >= prev["o"] and last["o"] <= prev["c"]:
+            return "🫸 Поглощение"
+    else:
+        if upper >= body * 2 and small and lower <= body * 0.8 and upper >= rng * 0.5:
+            return "⭐ Пин-бар"
+        if prev["c"] > prev["o"] and last["c"] < last["o"] and last["o"] >= prev["c"] and last["c"] <= prev["o"]:
+            return "🫷 Поглощение"
+    return None
 
 def top_coins():
     url = "https://data-api.binance.vision/api/v3/ticker/24hr"
@@ -157,245 +114,192 @@ def top_coins():
     usdt.sort(key=lambda x: float(x["quoteVolume"]), reverse=True)
     return [x["symbol"].replace("USDT", "") for x in usdt[:MAX_COINS]]
 
+def analyze(sym):
+    kl = get_klines(sym + "USDT")
+    closes = [k["c"] for k in kl]
+    price = closes[-1]
+    last = kl[-1]
+    # объём
+    v20 = np.mean([k["v"] for k in kl[-21:-1]])
+    if v20 <= 0:
+        return None
+    vr = last["v"] / v20
+    if vr < VOL_MULT:
+        return None
+    r = rsi(closes)
+    if r is None:
+        return None
+    a = atr(kl)
+    if not a:
+        return None
+    e200 = ema(closes, min(200, len(closes)))
+    rel = (price - e200) / e200 * 100 if e200 else 0
+    out = []
+    # ЛОНГ от поддержки
+    if r < RSI_LEVEL and rel >= -15:
+        sups = [s for s in find_levels(kl, "sup") if s <= price * 1.002]
+        if sups:
+            lvl = min(sups, key=lambda s: abs(price - s))
+            dist = abs(price - lvl) / lvl * 100
+            if dist <= MAX_DIST and price >= lvl * 0.995:
+                sl = lvl - a * ATR_BUF
+                if sl < price:
+                    risk = price - sl
+                    rp = risk / price * 100
+                    if 0 < rp <= MAX_RISK:
+                        pat = detect_reversal(kl, "long")
+                        if pat:
+                            out.append({"side": "long", "sym": sym, "entry": price, "lvl": lvl,
+                                        "sl": sl, "tp": price + risk * RR, "risk_pct": rp,
+                                        "rsi": r, "vr": vr, "pat": pat, "dist": dist, "atr": a})
+    # ШОРТ от сопротивления
+    if r > (100 - RSI_LEVEL) and rel <= 15:
+        ress = [s for s in find_levels(kl, "res") if s >= price * 0.998]
+        if ress:
+            lvl = min(ress, key=lambda s: abs(s - price))
+            dist = abs(lvl - price) / lvl * 100
+            if dist <= MAX_DIST and price <= lvl * 1.005:
+                sl = lvl + a * ATR_BUF
+                if sl > price:
+                    risk = sl - price
+                    rp = risk / price * 100
+                    if 0 < rp <= MAX_RISK:
+                        pat = detect_reversal(kl, "short")
+                        if pat:
+                            out.append({"side": "short", "sym": sym, "entry": price, "lvl": lvl,
+                                        "sl": sl, "tp": price - risk * RR, "risk_pct": rp,
+                                        "rsi": r, "vr": vr, "pat": pat, "dist": dist, "atr": a})
+    return out
+
+def fmt(p):
+    if p >= 100: return format(p, ".2f")
+    if p >= 1: return format(p, ".4f")
+    return format(p, ".6f")
+
+def card(s):
+    qty = SIZE / s["entry"]
+    risk_usd = qty * abs(s["entry"] - s["sl"])
+    prof_usd = risk_usd * RR
+    fees = SIZE * FEE / 100 * 2
+    side_t = "🟢 ЛОНГ от поддержки" if s["side"] == "long" else "🔴 ШОРТ от сопротивления"
+    lvl_t = "поддержка" if s["side"] == "long" else "сопротивление"
+    rsi_ok = "✅" if (s["rsi"] <= 30 or s["rsi"] >= 70) else "⚠️"
+    return (
+        "🎯 " + s["sym"] + " — " + side_t + " (4ч)\n\n"
+        "✅ Свеча: " + s["pat"] + "\n"
+        + rsi_ok + " RSI: " + str(round(s["rsi"])) + "\n"
+        "✅ Объём: ×" + format(s["vr"], ".1f") + "\n"
+        "✅ У уровня: " + format(s["dist"], ".2f") + "%\n\n"
+        "📍 Вход: " + fmt(s["entry"]) + "\n"
+        "📊 " + lvl_t.capitalize() + ": " + fmt(s["lvl"]) + "\n"
+        "🛑 Стоп: " + fmt(s["sl"]) + "  (риск " + format(s["risk_pct"], ".2f") + "%)\n"
+        "🎯 Тейк: " + fmt(s["tp"]) + "  (1:3)\n\n"
+        "💵 На $" + str(SIZE) + ":\n"
+        "   риск ≈ -$" + str(round(risk_usd + fees)) + "\n"
+        "   профит ≈ +$" + str(round(prof_usd - fees)) + "\n\n"
+        "⚙️ плечо 1х, риск ≤1% депо!"
+    )
+
 @bot.message_handler(commands=['start'])
 def start(m):
     users.add(m.chat.id)
-    bot.send_message(m.chat.id, "Привет! Фильтр: корр≥85%, полужизнь≤24ч, вход z 2.3-2.8.\nЕсли пар нет — жми «Почти подходят».", reply_markup=menu())
+    bot.send_message(m.chat.id, "Отскок от уровней 4ч 🎯\nЛонг у поддержки / шорт у сопротивления.\nATR-стоп, тейк 1:3, подтверждение свечой.\n\nЖми кнопки 👇", reply_markup=menu())
 
-@bot.message_handler(func=lambda m: m.text == "🔍 Найти пары")
+@bot.message_handler(func=lambda m: m.text == "🔍 Найти отскоки")
 def btn_scan(m):
     users.add(m.chat.id)
-    bot.send_message(m.chat.id, "Ищу среди топ-150 монет... жди 12-18 мин")
+    bot.send_message(m.chat.id, "Сканирую топ-120 монет на 4ч... жди 3-5 мин")
     do_scan(m.chat.id, manual=True)
 
-@bot.message_handler(func=lambda m: m.text == "🔸 Почти подходят")
-def btn_near(m):
-    users.add(m.chat.id)
-    bot.send_message(m.chat.id, "Смотрю, что близко к фильтру... жди 12-18 мин")
-    do_near(m.chat.id)
-
-@bot.message_handler(func=lambda m: m.text == "➕ Добавить пару")
-def btn_add(m):
-    waiting_pair.add(m.chat.id)
-    bot.send_message(m.chat.id, "Напиши две монеты через пробел, например:\nDOGE LINK")
-
-@bot.message_handler(func=lambda m: m.text == "📋 Мои пары")
+@bot.message_handler(func=lambda m: m.text == "📋 Мои сделки")
 def btn_list(m):
     t = tracked.get(m.chat.id, [])
     if not t:
-        bot.send_message(m.chat.id, "Ничего не отслеживается.", reply_markup=menu())
+        bot.send_message(m.chat.id, "Нет отслеживаемых сделок.", reply_markup=menu())
         return
-    for a, b in list(t):
+    for s in list(t):
         try:
-            ca, cb = get_closes(a+"USDT"), get_closes(b+"USDT")
-            corr, z, dev, hl = analyze_pair(ca, cb)
-            if abs(z) <= TARGET_Z:
-                st = "🎯 СОШЛИСЬ - выходи в профит"
-            elif abs(z) >= STOP_Z:
-                st = "🛑 СТОП - выходи"
+            kl = get_klines(s["sym"] + "USDT", limit=5)
+            p = kl[-1]["c"]
+            if s["side"] == "long":
+                to_tp = (s["tp"] - p) / p * 100
+                to_sl = (p - s["sl"]) / p * 100
             else:
-                st = "⏳ держим (z=" + format(z, "+.2f") + ")"
-            ikb = types.InlineKeyboardMarkup()
-            ikb.add(types.InlineKeyboardButton("📊 История " + a + "/" + b, callback_data="hist:" + a + ":" + b))
-            bot.send_message(m.chat.id, a + "/" + b + ": " + st, reply_markup=ikb)
+                to_tp = (p - s["tp"]) / p * 100
+                to_sl = (s["sl"] - p) / p * 100
+            bot.send_message(m.chat.id,
+                s["sym"] + " " + ("🟢 лонг" if s["side"] == "long" else "🔴 шорт") + "\n"
+                "цена " + fmt(p) + " · вход " + fmt(s["entry"]) + "\n"
+                "до тейка " + format(to_tp, ".2f") + "% · до стопа " + format(to_sl, ".2f") + "%",
+                reply_markup=menu())
         except:
-            bot.send_message(m.chat.id, a + "/" + b + ": ошибка данных")
-        time.sleep(0.5)
+            bot.send_message(m.chat.id, s["sym"] + ": ошибка данных")
+        time.sleep(0.4)
 
 @bot.message_handler(func=lambda m: m.text == "🗑 Очистить")
 def btn_clear(m):
     tracked[m.chat.id] = []
     bot.send_message(m.chat.id, "Всё снято.", reply_markup=menu())
 
-@bot.callback_query_handler(func=lambda c: c.data.startswith("track:"))
+@bot.callback_query_handler(func=lambda c: c.data.startswith("t:"))
 def cb_track(c):
-    _, a, b = c.data.split(":")
+    p = c.data.split(":")
+    sym, side, entry, sl, tp = p[1], p[2], float(p[3]), float(p[4]), float(p[5])
     tracked.setdefault(c.message.chat.id, [])
-    if (a, b) not in tracked[c.message.chat.id]:
-        tracked[c.message.chat.id].append((a, b))
-    bot.answer_callback_query(c.id, "Отслеживаю " + a + "/" + b)
-    bot.send_message(c.message.chat.id, "✅ " + a + "/" + b + " добавлена. Пришлю алерт на выход/стоп.", reply_markup=menu())
-
-@bot.callback_query_handler(func=lambda c: c.data.startswith("hist:"))
-def cb_hist(c):
-    _, a, b = c.data.split(":")
-    bot.answer_callback_query(c.id, "Считаю историю...")
-    try:
-        res = backtest_pair(a, b)
-        if not res:
-            bot.send_message(c.message.chat.id, "📊 " + a + "/" + b + ": сигналов в истории не было.", reply_markup=menu())
-            return
-        total, wins, losses, avg_h, money, avg_p, avg_l = res
-        wr = round(wins / total * 100) if total else 0
-        mark = "✅" if wr >= 65 else ("⚠️" if wr >= 50 else "❌")
-        txt = (
-            "📊 История " + a + "/" + b + " (~6 недель)\n\n"
-            "Сигналов: " + str(total) + "\n"
-            "🎯 Сошлось: " + str(wins) + " (" + str(wr) + "%)\n"
-            "🛑 В стоп: " + str(losses) + "\n\n"
-            "💰 Средний профит: +$" + str(avg_p) + "\n"
-            "🛑 Средний стоп: -$" + str(avg_l) + "\n"
-            "⏱ Среднее схождение: " + str(avg_h) + "ч\n\n"
-            "💵 Итого: " + ("+" if money >= 0 else "") + "$" + str(money) + "\n"
-            + mark + " " + ("хорошая пара" if wr >= 65 else ("средняя" if wr >= 50 else "слабая, пропусти"))
-        )
-        bot.send_message(c.message.chat.id, txt, reply_markup=menu())
-    except Exception:
-        bot.send_message(c.message.chat.id, "Не удалось посчитать историю.", reply_markup=menu())
-
-@bot.message_handler(func=lambda m: m.chat.id in waiting_pair)
-def add_manual(m):
-    waiting_pair.discard(m.chat.id)
-    try:
-        parts = m.text.replace("/", " ").split()
-        a, b = parts[0].upper(), parts[1].upper()
-        get_closes(a+"USDT"); get_closes(b+"USDT")
-        tracked.setdefault(m.chat.id, [])
-        if (a, b) not in tracked[m.chat.id]:
-            tracked[m.chat.id].append((a, b))
-        ikb = types.InlineKeyboardMarkup()
-        ikb.add(types.InlineKeyboardButton("📊 История " + a + "/" + b, callback_data="hist:" + a + ":" + b))
-        bot.send_message(m.chat.id, "✅ Отслеживаю " + a + "/" + b + ". Пришлю алерт на выход/стоп.", reply_markup=ikb)
-    except Exception:
-        bot.send_message(m.chat.id, "Не понял пару. Напиши как: DOGE LINK", reply_markup=menu())
-
-def load_all():
-    coins = top_coins()
-    closes = {}
-    for c in coins:
-        try:
-            closes[c] = get_closes(c + "USDT")
-        except:
-            pass
-        time.sleep(0.12)
-    return closes
+    tracked[c.message.chat.id].append({"sym": sym, "side": side, "entry": entry, "sl": sl, "tp": tp})
+    bot.answer_callback_query(c.id, "Отслеживаю " + sym)
+    bot.send_message(c.message.chat.id, "✅ " + sym + " на отслеживании.\nПришлю алерт на тейк или стоп.", reply_markup=menu())
 
 def do_scan(chat_id, manual=False):
     try:
-        closes = load_all()
+        coins = top_coins()
         found = []
-        cl = list(closes.keys())
-        for i in range(len(cl)):
-            for j in range(i + 1, len(cl)):
-                a, b = cl[i], cl[j]
-                try:
-                    res = analyze_pair(closes[a], closes[b])
-                    if not res:
-                        continue
-                    corr, z, dev, hl = res
-                    if corr < MIN_CORR:
-                        continue
-                    if abs(z) < ENTRY_Z or abs(z) > MAX_ENTRY_Z:
-                        continue
-                    if hl is None or hl > MAX_HALFLIFE:
-                        continue
-                    profit, loss, rr = profit_stop(dev, z)
-                    if profit < MIN_PROFIT:
-                        continue
-                    if rr < MIN_RR:
-                        continue
-                    found.append((abs(z), a, b, corr, z, dev, hl))
-                except:
-                    pass
+        for c in coins:
+            try:
+                res = analyze(c)
+                if res:
+                    found.extend(res)
+            except:
+                pass
+            time.sleep(0.12)
         if not found:
             if manual:
-                bot.send_message(chat_id, "Крепких пар нет. Жми «🔸 Почти подходят» — покажу что близко.", reply_markup=menu())
+                bot.send_message(chat_id, "Готовых отскоков сейчас нет.\nНужно: цена у уровня + RSI на краю + объём + разворотная свеча. Загляну позже сам.", reply_markup=menu())
             return
-        found.sort(reverse=True)
-        bot.send_message(chat_id, "Нашёл " + str(len(found)) + " пар(ы):")
-        for az, a, b, corr, z, dev, hl in found[:8]:
-            txt = card(a, b, corr, z, dev, hl)
+        found.sort(key=lambda s: s["risk_pct"])
+        bot.send_message(chat_id, "Нашёл " + str(len(found)) + " отскок(ов):")
+        for s in found[:6]:
             ikb = types.InlineKeyboardMarkup()
-            ikb.add(types.InlineKeyboardButton("➡️ Отслеживать", callback_data="track:" + a + ":" + b))
-            ikb.add(types.InlineKeyboardButton("📊 История пары", callback_data="hist:" + a + ":" + b))
-            bot.send_message(chat_id, txt, reply_markup=ikb)
+            cb = "t:" + s["sym"] + ":" + s["side"] + ":" + format(s["entry"], ".8f") + ":" + format(s["sl"], ".8f") + ":" + format(s["tp"], ".8f")
+            ikb.add(types.InlineKeyboardButton("➡️ Отслеживать " + s["sym"], callback_data=cb[:64]))
+            bot.send_message(chat_id, card(s), reply_markup=ikb)
             time.sleep(1)
     except Exception:
         if manual:
             bot.send_message(chat_id, "Ошибка при поиске, попробуй ещё раз.", reply_markup=menu())
 
-def do_near(chat_id):
-    try:
-        closes = load_all()
-        near = []
-        cl = list(closes.keys())
-        for i in range(len(cl)):
-            for j in range(i + 1, len(cl)):
-                a, b = cl[i], cl[j]
-                try:
-                    res = analyze_pair(closes[a], closes[b])
-                    if not res:
-                        continue
-                    corr, z, dev, hl = res
-                    if corr < 0.78:
-                        continue
-                    if abs(z) < 1.8 or abs(z) > 3.4:
-                        continue
-                    profit, loss, rr = profit_stop(dev, z)
-                    if profit < 10:
-                        continue
-                    fails = 0
-                    if corr < MIN_CORR: fails += 1
-                    if abs(z) < ENTRY_Z or abs(z) > MAX_ENTRY_Z: fails += 1
-                    if hl is None or hl > MAX_HALFLIFE: fails += 1
-                    if profit < MIN_PROFIT: fails += 1
-                    if rr < MIN_RR: fails += 1
-                    if fails == 0 or fails > 2:
-                        continue
-                    near.append((fails, -abs(z), a, b, corr, z, hl, profit, rr))
-                except:
-                    pass
-        if not near:
-            bot.send_message(chat_id, "Даже близких пар нет — рынок совсем спокойный.", reply_markup=menu())
-            return
-        near.sort()
-        bot.send_message(chat_id, "🔸 Близко к фильтру (" + str(len(near)) + "), показываю до 8:")
-        for fails, negz, a, b, corr, z, hl, profit, rr in near[:8]:
-            c_m = "✅" if corr >= MIN_CORR else "❌"
-            z_m = "✅" if ENTRY_Z <= abs(z) <= MAX_ENTRY_Z else "❌"
-            h_m = "✅" if (hl and hl <= MAX_HALFLIFE) else "❌"
-            p_m = "✅" if profit >= MIN_PROFIT else "❌"
-            r_m = "✅" if rr >= MIN_RR else "❌"
-            hl_txt = (str(round(hl)) + "ч") if hl else "нет возврата"
-            short = a if z > 0 else b
-            long = b if z > 0 else a
-            txt = (
-                "🔸 " + a + "/" + b + " — не хватило " + str(fails) + "\n\n"
-                + c_m + " корр " + str(round(corr*100)) + "% (надо ≥85)\n"
-                + z_m + " z " + format(z, "+.2f") + " (надо 2.3-2.8)\n"
-                + h_m + " полужизнь " + hl_txt + " (надо ≤24ч)\n"
-                + p_m + " профит $" + str(round(profit)) + " (надо ≥20)\n"
-                + r_m + " R:R " + str(round(rr, 1)) + " (надо ≥1.5)\n\n"
-                "📊 Шорт " + short + " / Лонг " + long
-            )
-            ikb = types.InlineKeyboardMarkup()
-            ikb.add(types.InlineKeyboardButton("➡️ Отслеживать", callback_data="track:" + a + ":" + b))
-            ikb.add(types.InlineKeyboardButton("📊 История", callback_data="hist:" + a + ":" + b))
-            bot.send_message(chat_id, txt, reply_markup=ikb)
-            time.sleep(1)
-    except Exception:
-        bot.send_message(chat_id, "Ошибка, попробуй ещё раз.", reply_markup=menu())
-
 def auto_loop():
-    last_scan = 0
+    last = 0
     while True:
         try:
-            for chat_id, pairs in list(tracked.items()):
-                for a, b in list(pairs):
+            for chat_id, lst in list(tracked.items()):
+                for s in list(lst):
                     try:
-                        ca, cb = get_closes(a+"USDT"), get_closes(b+"USDT")
-                        corr, z, dev, hl = analyze_pair(ca, cb)
-                        if abs(z) <= TARGET_Z:
-                            bot.send_message(chat_id, "🎯 ВЫХОД В ПРОФИТ: " + a + "/" + b + " сошлись (z=" + format(z, "+.2f") + "). Закрывай в плюс!", reply_markup=menu())
-                            tracked[chat_id].remove((a, b))
-                        elif abs(z) >= STOP_Z:
-                            bot.send_message(chat_id, "🛑 СТОП: " + a + "/" + b + " (z=" + format(z, "+.2f") + "). Закрывай, не досиживай!", reply_markup=menu())
-                            tracked[chat_id].remove((a, b))
+                        kl = get_klines(s["sym"] + "USDT", limit=5)
+                        p = kl[-1]["c"]
+                        hit_tp = (p >= s["tp"]) if s["side"] == "long" else (p <= s["tp"])
+                        hit_sl = (p <= s["sl"]) if s["side"] == "long" else (p >= s["sl"])
+                        if hit_tp:
+                            bot.send_message(chat_id, "🎯 ТЕЙК: " + s["sym"] + " дошёл до " + fmt(s["tp"]) + ". ЗАКРЫВАЙ В ПЛЮС!", reply_markup=menu())
+                            lst.remove(s)
+                        elif hit_sl:
+                            bot.send_message(chat_id, "🛑 СТОП: " + s["sym"] + " пробил " + fmt(s["sl"]) + ". ЗАКРЫВАЙ, не досиживай!", reply_markup=menu())
+                            lst.remove(s)
                     except:
                         pass
-                    time.sleep(0.5)
-            if time.time() - last_scan > 1800:
-                last_scan = time.time()
+                    time.sleep(0.4)
+            if time.time() - last > 1800:
+                last = time.time()
                 for uid in list(users):
                     try:
                         do_scan(uid, manual=False)
@@ -403,8 +307,8 @@ def auto_loop():
                         pass
         except:
             pass
-        time.sleep(120)
+        time.sleep(90)
 
 threading.Thread(target=auto_loop, daemon=True).start()
-print("Бот запущен...")
+print("Бот отскоков запущен...")
 bot.infinity_polling()
