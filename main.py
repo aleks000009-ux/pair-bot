@@ -11,11 +11,12 @@ bot = telebot.TeleBot(TOKEN)
 
 SIZE = 1000
 ENTRY_Z = 2.3
+MAX_ENTRY_Z = 2.8
 STOP_Z = 3.5
 TARGET_Z = 0.5
 MIN_CORR = 0.90
 MIN_PROFIT = 20
-MAX_HALFLIFE = 12
+MAX_HALFLIFE = 24
 MIN_RR = 1.5
 MAX_COINS = 150
 FEE = 0.055
@@ -77,7 +78,6 @@ def profit_stop(dev, z):
     return profit, loss, rr
 
 def backtest_pair(a, b):
-    # история: 1000 часовых свечей (~6 недель)
     ca = get_closes(a + "USDT", limit=1000)
     cb = get_closes(b + "USDT", limit=1000)
     n = min(len(ca), len(cb))
@@ -86,7 +86,6 @@ def backtest_pair(a, b):
     win = 100
     if len(ratio) < win + 50:
         return None
-    # катим z по всей истории
     zs = []
     for i in range(win, len(ratio)):
         w = ratio[i-win:i]
@@ -96,8 +95,7 @@ def backtest_pair(a, b):
     trades = []
     i = 0
     while i < len(zs):
-        if abs(zs[i]) >= ENTRY_Z and abs(zs[i]) < STOP_Z:
-            entry_z = zs[i]
+        if ENTRY_Z <= abs(zs[i]) <= MAX_ENTRY_Z:
             entry_i = i
             result = None
             for j in range(i + 1, len(zs)):
@@ -110,7 +108,7 @@ def backtest_pair(a, b):
                     i = j
                     break
             if result:
-                trades.append((result[0], result[1], abs(entry_z)))
+                trades.append(result)
             else:
                 break
         i += 1
@@ -119,8 +117,7 @@ def backtest_pair(a, b):
     wins = [t for t in trades if t[0] == "win"]
     losses = [t for t in trades if t[0] == "loss"]
     avg_hours = int(np.mean([t[1] for t in wins])) if wins else 0
-    # грубая оценка денег
-    approx_profit = len(wins) * 20 - len(losses) * 18
+    approx_profit = len(wins) * 25 - len(losses) * 15
     return len(trades), len(wins), len(losses), avg_hours, approx_profit
 
 def card(a, b, corr, z, dev, hl):
@@ -154,7 +151,7 @@ def top_coins():
 @bot.message_handler(commands=['start'])
 def start(m):
     users.add(m.chat.id)
-    bot.send_message(m.chat.id, "Привет! Фильтр: корр≥90%, полужизнь≤12ч, R:R≥1.5.\nПод каждой парой есть кнопка История — покажет как пара вела себя раньше.", reply_markup=menu())
+    bot.send_message(m.chat.id, "Привет! Фильтр: корр≥90%, полужизнь≤24ч, вход z 2.3-2.8, R:R≥1.5.\nПод парой есть кнопка История.", reply_markup=menu())
 
 @bot.message_handler(func=lambda m: m.text == "🔍 Найти пары")
 def btn_scan(m):
@@ -211,7 +208,7 @@ def cb_hist(c):
     try:
         res = backtest_pair(a, b)
         if not res:
-            bot.send_message(c.message.chat.id, "📊 " + a + "/" + b + ": сигналов в истории не было (пара спокойная или новая).", reply_markup=menu())
+            bot.send_message(c.message.chat.id, "📊 " + a + "/" + b + ": сигналов в истории не было.", reply_markup=menu())
             return
         total, wins, losses, avg_h, money = res
         wr = round(wins / total * 100) if total else 0
@@ -226,7 +223,7 @@ def cb_hist(c):
             + mark + " " + ("хорошая пара" if wr >= 65 else ("средняя" if wr >= 50 else "слабая, лучше пропустить"))
         )
         bot.send_message(c.message.chat.id, txt, reply_markup=menu())
-    except Exception as e:
+    except Exception:
         bot.send_message(c.message.chat.id, "Не удалось посчитать историю.", reply_markup=menu())
 
 @bot.message_handler(func=lambda m: m.chat.id in waiting_pair)
@@ -267,7 +264,7 @@ def do_scan(chat_id, manual=False):
                     corr, z, dev, hl = res
                     if corr < MIN_CORR:
                         continue
-                    if abs(z) < ENTRY_Z or abs(z) >= STOP_Z:
+                    if abs(z) < ENTRY_Z or abs(z) > MAX_ENTRY_Z:
                         continue
                     if hl is None or hl > MAX_HALFLIFE:
                         continue
@@ -281,10 +278,10 @@ def do_scan(chat_id, manual=False):
                     pass
         if not found:
             if manual:
-                bot.send_message(chat_id, "Крепких пар сейчас нет (корр≥90%, полужизнь≤12ч, R:R≥1.5). Фильтр жёсткий — жди, загляну сам.", reply_markup=menu())
+                bot.send_message(chat_id, "Крепких пар сейчас нет (корр≥90%, полужизнь≤24ч, z 2.3-2.8). Загляну позже сам.", reply_markup=menu())
             return
         found.sort(reverse=True)
-        bot.send_message(chat_id, "Нашёл " + str(len(found)) + " крепких пар(ы):")
+        bot.send_message(chat_id, "Нашёл " + str(len(found)) + " пар(ы):")
         for az, a, b, corr, z, dev, hl in found[:8]:
             txt = card(a, b, corr, z, dev, hl)
             ikb = types.InlineKeyboardMarkup()
