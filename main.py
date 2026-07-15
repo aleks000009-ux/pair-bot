@@ -76,6 +76,53 @@ def profit_stop(dev, z):
     rr = profit / loss if loss > 0 else 0
     return profit, loss, rr
 
+def backtest_pair(a, b):
+    # история: 1000 часовых свечей (~6 недель)
+    ca = get_closes(a + "USDT", limit=1000)
+    cb = get_closes(b + "USDT", limit=1000)
+    n = min(len(ca), len(cb))
+    x, y = np.array(ca[-n:]), np.array(cb[-n:])
+    ratio = x / y
+    win = 100
+    if len(ratio) < win + 50:
+        return None
+    # катим z по всей истории
+    zs = []
+    for i in range(win, len(ratio)):
+        w = ratio[i-win:i]
+        m, s = w.mean(), w.std()
+        zs.append((ratio[i] - m) / s if s > 0 else 0)
+    zs = np.array(zs)
+    trades = []
+    i = 0
+    while i < len(zs):
+        if abs(zs[i]) >= ENTRY_Z and abs(zs[i]) < STOP_Z:
+            entry_z = zs[i]
+            entry_i = i
+            result = None
+            for j in range(i + 1, len(zs)):
+                if abs(zs[j]) <= TARGET_Z:
+                    result = ("win", j - entry_i)
+                    i = j
+                    break
+                if abs(zs[j]) >= STOP_Z:
+                    result = ("loss", j - entry_i)
+                    i = j
+                    break
+            if result:
+                trades.append((result[0], result[1], abs(entry_z)))
+            else:
+                break
+        i += 1
+    if not trades:
+        return None
+    wins = [t for t in trades if t[0] == "win"]
+    losses = [t for t in trades if t[0] == "loss"]
+    avg_hours = int(np.mean([t[1] for t in wins])) if wins else 0
+    # грубая оценка денег
+    approx_profit = len(wins) * 20 - len(losses) * 18
+    return len(trades), len(wins), len(losses), avg_hours, approx_profit
+
 def card(a, b, corr, z, dev, hl):
     profit, loss, rr = profit_stop(dev, z)
     short = a if z > 0 else b
@@ -107,7 +154,7 @@ def top_coins():
 @bot.message_handler(commands=['start'])
 def start(m):
     users.add(m.chat.id)
-    bot.send_message(m.chat.id, "Привет! Жёсткий фильтр: корр≥90%, полужизнь≤24ч, R:R≥1.5.\nПары редкие, но крепкие. Жми кнопки 👇", reply_markup=menu())
+    bot.send_message(m.chat.id, "Привет! Фильтр: корр≥90%, полужизнь≤12ч, R:R≥1.5.\nПод каждой парой есть кнопка История — покажет как пара вела себя раньше.", reply_markup=menu())
 
 @bot.message_handler(func=lambda m: m.text == "🔍 Найти пары")
 def btn_scan(m):
@@ -126,7 +173,6 @@ def btn_list(m):
     if not t:
         bot.send_message(m.chat.id, "Ничего не отслеживается.", reply_markup=menu())
         return
-    out = "Отслеживаю:\n\n"
     for a, b in list(t):
         try:
             ca, cb = get_closes(a+"USDT"), get_closes(b+"USDT")
@@ -137,11 +183,12 @@ def btn_list(m):
                 st = "🛑 СТОП - выходи"
             else:
                 st = "⏳ держим (z=" + format(z, "+.2f") + ")"
-            out += a + "/" + b + ": " + st + "\n"
+            ikb = types.InlineKeyboardMarkup()
+            ikb.add(types.InlineKeyboardButton("📊 История " + a + "/" + b, callback_data="hist:" + a + ":" + b))
+            bot.send_message(m.chat.id, a + "/" + b + ": " + st, reply_markup=ikb)
         except:
-            out += a + "/" + b + ": ошибка данных\n"
-        time.sleep(0.3)
-    bot.send_message(m.chat.id, out, reply_markup=menu())
+            bot.send_message(m.chat.id, a + "/" + b + ": ошибка данных")
+        time.sleep(0.5)
 
 @bot.message_handler(func=lambda m: m.text == "🗑 Очистить")
 def btn_clear(m):
@@ -157,6 +204,31 @@ def cb_track(c):
     bot.answer_callback_query(c.id, "Отслеживаю " + a + "/" + b)
     bot.send_message(c.message.chat.id, "✅ " + a + "/" + b + " добавлена.", reply_markup=menu())
 
+@bot.callback_query_handler(func=lambda c: c.data.startswith("hist:"))
+def cb_hist(c):
+    _, a, b = c.data.split(":")
+    bot.answer_callback_query(c.id, "Считаю историю...")
+    try:
+        res = backtest_pair(a, b)
+        if not res:
+            bot.send_message(c.message.chat.id, "📊 " + a + "/" + b + ": сигналов в истории не было (пара спокойная или новая).", reply_markup=menu())
+            return
+        total, wins, losses, avg_h, money = res
+        wr = round(wins / total * 100) if total else 0
+        mark = "✅" if wr >= 65 else ("⚠️" if wr >= 50 else "❌")
+        txt = (
+            "📊 История " + a + "/" + b + " (~6 недель)\n\n"
+            "Сигналов было: " + str(total) + "\n"
+            "🎯 Сошлось: " + str(wins) + " (" + str(wr) + "%)\n"
+            "🛑 В стоп: " + str(losses) + "\n\n"
+            "⏱ Среднее схождение: " + str(avg_h) + "ч\n"
+            "💵 Итог: " + ("+" if money >= 0 else "") + "$" + str(money) + "\n\n"
+            + mark + " " + ("хорошая пара" if wr >= 65 else ("средняя" if wr >= 50 else "слабая, лучше пропустить"))
+        )
+        bot.send_message(c.message.chat.id, txt, reply_markup=menu())
+    except Exception as e:
+        bot.send_message(c.message.chat.id, "Не удалось посчитать историю.", reply_markup=menu())
+
 @bot.message_handler(func=lambda m: m.chat.id in waiting_pair)
 def add_manual(m):
     waiting_pair.discard(m.chat.id)
@@ -167,7 +239,9 @@ def add_manual(m):
         tracked.setdefault(m.chat.id, [])
         if (a, b) not in tracked[m.chat.id]:
             tracked[m.chat.id].append((a, b))
-        bot.send_message(m.chat.id, "✅ Отслеживаю " + a + "/" + b + ". Пришлю алерт на выход/стоп.", reply_markup=menu())
+        ikb = types.InlineKeyboardMarkup()
+        ikb.add(types.InlineKeyboardButton("📊 История " + a + "/" + b, callback_data="hist:" + a + ":" + b))
+        bot.send_message(m.chat.id, "✅ Отслеживаю " + a + "/" + b + ". Пришлю алерт на выход/стоп.", reply_markup=ikb)
     except Exception:
         bot.send_message(m.chat.id, "Не понял пару. Напиши как: DOGE LINK", reply_markup=menu())
 
@@ -207,14 +281,15 @@ def do_scan(chat_id, manual=False):
                     pass
         if not found:
             if manual:
-                bot.send_message(chat_id, "Крепких пар сейчас нет (корр≥90%, полужизнь≤24ч, R:R≥1.5, профит≥$20). Фильтр жёсткий — жди, загляну сам.", reply_markup=menu())
+                bot.send_message(chat_id, "Крепких пар сейчас нет (корр≥90%, полужизнь≤12ч, R:R≥1.5). Фильтр жёсткий — жди, загляну сам.", reply_markup=menu())
             return
         found.sort(reverse=True)
         bot.send_message(chat_id, "Нашёл " + str(len(found)) + " крепких пар(ы):")
         for az, a, b, corr, z, dev, hl in found[:8]:
             txt = card(a, b, corr, z, dev, hl)
             ikb = types.InlineKeyboardMarkup()
-            ikb.add(types.InlineKeyboardButton("➡️ Отслеживать " + a + "/" + b, callback_data="track:" + a + ":" + b))
+            ikb.add(types.InlineKeyboardButton("➡️ Отслеживать", callback_data="track:" + a + ":" + b))
+            ikb.add(types.InlineKeyboardButton("📊 История пары", callback_data="hist:" + a + ":" + b))
             bot.send_message(chat_id, txt, reply_markup=ikb)
             time.sleep(1)
     except Exception:
