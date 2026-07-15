@@ -28,6 +28,7 @@ waiting_pair = set()
 def menu():
     kb = types.ReplyKeyboardMarkup(resize_keyboard=True)
     kb.row("🔍 Найти пары")
+    kb.row("🔸 Почти подходят")
     kb.row("➕ Добавить пару", "📋 Мои пары")
     kb.row("🗑 Очистить")
     return kb
@@ -159,13 +160,19 @@ def top_coins():
 @bot.message_handler(commands=['start'])
 def start(m):
     users.add(m.chat.id)
-    bot.send_message(m.chat.id, "Привет! Фильтр: корр≥90%, полужизнь≤24ч, вход z 2.3-2.8, R:R≥1.5.\nПод парой кнопка История — реальная статистика пары.", reply_markup=menu())
+    bot.send_message(m.chat.id, "Привет! Фильтр: корр≥90%, полужизнь≤24ч, вход z 2.3-2.8.\nЕсли пар нет — жми «Почти подходят», покажу что близко.", reply_markup=menu())
 
 @bot.message_handler(func=lambda m: m.text == "🔍 Найти пары")
 def btn_scan(m):
     users.add(m.chat.id)
     bot.send_message(m.chat.id, "Ищу среди топ-150 монет... жди 12-18 мин")
     do_scan(m.chat.id, manual=True)
+
+@bot.message_handler(func=lambda m: m.text == "🔸 Почти подходят")
+def btn_near(m):
+    users.add(m.chat.id)
+    bot.send_message(m.chat.id, "Смотрю, что близко к фильтру... жди 12-18 мин")
+    do_near(m.chat.id)
 
 @bot.message_handler(func=lambda m: m.text == "➕ Добавить пару")
 def btn_add(m):
@@ -252,16 +259,20 @@ def add_manual(m):
     except Exception:
         bot.send_message(m.chat.id, "Не понял пару. Напиши как: DOGE LINK", reply_markup=menu())
 
+def load_all(chat_id):
+    coins = top_coins()
+    closes = {}
+    for c in coins:
+        try:
+            closes[c] = get_closes(c + "USDT")
+        except:
+            pass
+        time.sleep(0.12)
+    return closes
+
 def do_scan(chat_id, manual=False):
     try:
-        coins = top_coins()
-        closes = {}
-        for c in coins:
-            try:
-                closes[c] = get_closes(c + "USDT")
-            except:
-                pass
-            time.sleep(0.12)
+        closes = load_all(chat_id)
         found = []
         cl = list(closes.keys())
         for i in range(len(cl)):
@@ -288,7 +299,7 @@ def do_scan(chat_id, manual=False):
                     pass
         if not found:
             if manual:
-                bot.send_message(chat_id, "Крепких пар сейчас нет (корр≥90%, полужизнь≤24ч, z 2.3-2.8). Загляну позже сам.", reply_markup=menu())
+                bot.send_message(chat_id, "Крепких пар нет. Жми «🔸 Почти подходят» — покажу что близко.", reply_markup=menu())
             return
         found.sort(reverse=True)
         bot.send_message(chat_id, "Нашёл " + str(len(found)) + " пар(ы):")
@@ -302,6 +313,66 @@ def do_scan(chat_id, manual=False):
     except Exception:
         if manual:
             bot.send_message(chat_id, "Ошибка при поиске, попробуй ещё раз.", reply_markup=menu())
+
+def do_near(chat_id):
+    try:
+        closes = load_all(chat_id)
+        near = []
+        cl = list(closes.keys())
+        for i in range(len(cl)):
+            for j in range(i + 1, len(cl)):
+                a, b = cl[i], cl[j]
+                try:
+                    res = analyze_pair(closes[a], closes[b])
+                    if not res:
+                        continue
+                    corr, z, dev, hl = res
+                    # мягкие рамки: смотрим кто рядом
+                    if corr < 0.82:
+                        continue
+                    if abs(z) < 1.8 or abs(z) > 3.4:
+                        continue
+                    profit, loss, rr = profit_stop(dev, z)
+                    if profit < 10:
+                        continue
+                    # считаем сколько условий провалено
+                    fails = 0
+                    if corr < MIN_CORR: fails += 1
+                    if abs(z) < ENTRY_Z or abs(z) > MAX_ENTRY_Z: fails += 1
+                    if hl is None or hl > MAX_HALFLIFE: fails += 1
+                    if profit < MIN_PROFIT: fails += 1
+                    if rr < MIN_RR: fails += 1
+                    if fails == 0 or fails > 2:
+                        continue
+                    near.append((fails, -abs(z), a, b, corr, z, hl, profit, rr))
+                except:
+                    pass
+        if not near:
+            bot.send_message(chat_id, "Даже близких пар нет — рынок совсем спокойный.", reply_markup=menu())
+            return
+        near.sort()
+        bot.send_message(chat_id, "🔸 Близко к фильтру (" + str(len(near)) + "), показываю 8:")
+        for fails, negz, a, b, corr, z, hl, profit, rr in near[:8]:
+            c_m = "✅" if corr >= MIN_CORR else "❌"
+            z_m = "✅" if ENTRY_Z <= abs(z) <= MAX_ENTRY_Z else "❌"
+            h_m = "✅" if (hl and hl <= MAX_HALFLIFE) else "❌"
+            p_m = "✅" if profit >= MIN_PROFIT else "❌"
+            r_m = "✅" if rr >= MIN_RR else "❌"
+            hl_txt = (str(round(hl)) + "ч") if hl else "нет возврата"
+            txt = (
+                "🔸 " + a + "/" + b + " — не хватило " + str(fails) + "\n\n"
+                + c_m + " корр " + str(round(corr*100)) + "% (надо ≥90)\n"
+                + z_m + " z " + format(z, "+.2f") + " (надо 2.3-2.8)\n"
+                + h_m + " полужизнь " + hl_txt + " (надо ≤24ч)\n"
+                + p_m + " профит $" + str(round(profit)) + " (надо ≥20)\n"
+                + r_m + " R:R " + str(round(rr, 1)) + " (надо ≥1.5)"
+            )
+            ikb = types.InlineKeyboardMarkup()
+            ikb.add(types.InlineKeyboardButton("📊 История", callback_data="hist:" + a + ":" + b))
+            bot.send_message(chat_id, txt, reply_markup=ikb)
+            time.sleep(1)
+    except Exception:
+        bot.send_message(chat_id, "Ошибка, попробуй ещё раз.", reply_markup=menu())
 
 def auto_loop():
     last_scan = 0
