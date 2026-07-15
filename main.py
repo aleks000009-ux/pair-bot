@@ -86,39 +86,47 @@ def backtest_pair(a, b):
     win = 100
     if len(ratio) < win + 50:
         return None
-    zs = []
+    zs, devs = [], []
     for i in range(win, len(ratio)):
         w = ratio[i-win:i]
         m, s = w.mean(), w.std()
-        zs.append((ratio[i] - m) / s if s > 0 else 0)
-    zs = np.array(zs)
-    trades = []
+        z = (ratio[i] - m) / s if s > 0 else 0
+        zs.append(z)
+        devs.append(abs(ratio[i] / m - 1) * 100)
+    zs = np.array(zs); devs = np.array(devs)
+    fee = SIZE * FEE / 100 * 4
+    profits, losses_l, hours = [], [], []
     i = 0
     while i < len(zs):
         if ENTRY_Z <= abs(zs[i]) <= MAX_ENTRY_Z:
             entry_i = i
-            result = None
+            entry_dev = devs[i]
+            done = False
             for j in range(i + 1, len(zs)):
                 if abs(zs[j]) <= TARGET_Z:
-                    result = ("win", j - entry_i)
+                    gain = (entry_dev - devs[j]) / 100 * SIZE - fee
+                    profits.append(gain)
+                    hours.append(j - entry_i)
                     i = j
+                    done = True
                     break
                 if abs(zs[j]) >= STOP_Z:
-                    result = ("loss", j - entry_i)
+                    loss = (devs[j] - entry_dev) / 100 * SIZE + fee
+                    losses_l.append(loss)
                     i = j
+                    done = True
                     break
-            if result:
-                trades.append(result)
-            else:
+            if not done:
                 break
         i += 1
-    if not trades:
+    total = len(profits) + len(losses_l)
+    if total == 0:
         return None
-    wins = [t for t in trades if t[0] == "win"]
-    losses = [t for t in trades if t[0] == "loss"]
-    avg_hours = int(np.mean([t[1] for t in wins])) if wins else 0
-    approx_profit = len(wins) * 25 - len(losses) * 15
-    return len(trades), len(wins), len(losses), avg_hours, approx_profit
+    avg_profit = int(np.mean(profits)) if profits else 0
+    avg_loss = int(np.mean(losses_l)) if losses_l else 0
+    avg_h = int(np.mean(hours)) if hours else 0
+    total_money = int(sum(profits) - sum(losses_l))
+    return total, len(profits), len(losses_l), avg_h, total_money, avg_profit, avg_loss
 
 def card(a, b, corr, z, dev, hl):
     profit, loss, rr = profit_stop(dev, z)
@@ -151,7 +159,7 @@ def top_coins():
 @bot.message_handler(commands=['start'])
 def start(m):
     users.add(m.chat.id)
-    bot.send_message(m.chat.id, "Привет! Фильтр: корр≥90%, полужизнь≤24ч, вход z 2.3-2.8, R:R≥1.5.\nПод парой есть кнопка История.", reply_markup=menu())
+    bot.send_message(m.chat.id, "Привет! Фильтр: корр≥90%, полужизнь≤24ч, вход z 2.3-2.8, R:R≥1.5.\nПод парой кнопка История — реальная статистика пары.", reply_markup=menu())
 
 @bot.message_handler(func=lambda m: m.text == "🔍 Найти пары")
 def btn_scan(m):
@@ -210,17 +218,19 @@ def cb_hist(c):
         if not res:
             bot.send_message(c.message.chat.id, "📊 " + a + "/" + b + ": сигналов в истории не было.", reply_markup=menu())
             return
-        total, wins, losses, avg_h, money = res
+        total, wins, losses, avg_h, money, avg_p, avg_l = res
         wr = round(wins / total * 100) if total else 0
         mark = "✅" if wr >= 65 else ("⚠️" if wr >= 50 else "❌")
         txt = (
             "📊 История " + a + "/" + b + " (~6 недель)\n\n"
-            "Сигналов было: " + str(total) + "\n"
+            "Сигналов: " + str(total) + "\n"
             "🎯 Сошлось: " + str(wins) + " (" + str(wr) + "%)\n"
             "🛑 В стоп: " + str(losses) + "\n\n"
-            "⏱ Среднее схождение: " + str(avg_h) + "ч\n"
-            "💵 Итог: " + ("+" if money >= 0 else "") + "$" + str(money) + "\n\n"
-            + mark + " " + ("хорошая пара" if wr >= 65 else ("средняя" if wr >= 50 else "слабая, лучше пропустить"))
+            "💰 Средний профит: +$" + str(avg_p) + "\n"
+            "🛑 Средний стоп: -$" + str(avg_l) + "\n"
+            "⏱ Среднее схождение: " + str(avg_h) + "ч\n\n"
+            "💵 Итого: " + ("+" if money >= 0 else "") + "$" + str(money) + "\n"
+            + mark + " " + ("хорошая пара" if wr >= 65 else ("средняя" if wr >= 50 else "слабая, пропусти"))
         )
         bot.send_message(c.message.chat.id, txt, reply_markup=menu())
     except Exception:
