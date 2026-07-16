@@ -10,9 +10,9 @@ TOKEN = os.environ.get("BOT_TOKEN")
 bot = telebot.TeleBot(TOKEN)
 
 SIZE = 1000
-RSI_LEVEL = 35
-VOL_MULT = 1.3
-MAX_DIST = 0.8
+RSI_LEVEL = 40       # лонг: RSI<40, шорт: RSI>60
+VOL_MULT = 1.1       # объём не ниже обычного
+MAX_DIST = 0.8       # % макс расстояние до уровня
 MAX_RISK = 3.0
 RR = 3
 ATR_BUF = 0.5
@@ -21,7 +21,7 @@ FEE = 0.055
 
 tracked = {}
 users = set()
-sent_signals = {}   # антидубль: {chat_id: {sym_side: время}}
+sent_signals = {}
 
 def menu():
     kb = types.ReplyKeyboardMarkup(resize_keyboard=True)
@@ -143,6 +143,7 @@ def analyze(sym):
     e200 = ema(closes, min(200, len(closes)))
     rel = (price - e200) / e200 * 100 if e200 else 0
     out = []
+    # ЛОНГ от поддержки
     if r < RSI_LEVEL and rel >= -15:
         sups = [s for s in find_levels(kl, "sup") if s <= price * 1.002]
         if sups:
@@ -154,11 +155,11 @@ def analyze(sym):
                     risk = price - sl
                     rp = risk / price * 100
                     if 0 < rp <= MAX_RISK:
-                        pat = detect_reversal(kl, "long")
-                        if pat:
-                            out.append({"side": "long", "sym": sym, "entry": price, "lvl": lvl,
-                                        "sl": sl, "tp": price + risk * RR, "risk_pct": rp,
-                                        "rsi": r, "vr": vr, "pat": pat, "dist": dist})
+                        pat = detect_reversal(kl, "long") or "нет разворотной"
+                        out.append({"side": "long", "sym": sym, "entry": price, "lvl": lvl,
+                                    "sl": sl, "tp": price + risk * RR, "risk_pct": rp,
+                                    "rsi": r, "vr": vr, "pat": pat, "dist": dist})
+    # ШОРТ от сопротивления
     if r > (100 - RSI_LEVEL) and rel <= 15:
         ress = [s for s in find_levels(kl, "res") if s >= price * 0.998]
         if ress:
@@ -170,11 +171,10 @@ def analyze(sym):
                     risk = sl - price
                     rp = risk / price * 100
                     if 0 < rp <= MAX_RISK:
-                        pat = detect_reversal(kl, "short")
-                        if pat:
-                            out.append({"side": "short", "sym": sym, "entry": price, "lvl": lvl,
-                                        "sl": sl, "tp": price - risk * RR, "risk_pct": rp,
-                                        "rsi": r, "vr": vr, "pat": pat, "dist": dist})
+                        pat = detect_reversal(kl, "short") or "нет разворотной"
+                        out.append({"side": "short", "sym": sym, "entry": price, "lvl": lvl,
+                                    "sl": sl, "tp": price - risk * RR, "risk_pct": rp,
+                                    "rsi": r, "vr": vr, "pat": pat, "dist": dist})
     return out
 
 def fmt(p):
@@ -189,10 +189,11 @@ def card(s):
     fees = SIZE * FEE / 100 * 2
     side_t = "🟢 ЛОНГ от поддержки" if s["side"] == "long" else "🔴 ШОРТ от сопротивления"
     lvl_t = "Поддержка" if s["side"] == "long" else "Сопротивление"
-    rsi_ok = "✅" if (s["rsi"] <= 30 or s["rsi"] >= 70) else "⚠️"
+    pat_ok = "✅" if s["pat"] != "нет разворотной" else "⚠️"
+    rsi_ok = "✅" if (s["rsi"] <= 32 or s["rsi"] >= 68) else "⚠️"
     return (
         "🎯 " + s["sym"] + " — " + side_t + " (4ч)\n\n"
-        "✅ Свеча: " + s["pat"] + "\n"
+        + pat_ok + " Свеча: " + s["pat"] + "\n"
         + rsi_ok + " RSI: " + str(round(s["rsi"])) + "\n"
         "✅ Объём: ×" + format(s["vr"], ".1f") + "\n"
         "✅ У уровня: " + format(s["dist"], ".2f") + "%\n\n"
@@ -209,7 +210,7 @@ def card(s):
 @bot.message_handler(commands=['start'])
 def start(m):
     users.add(m.chat.id)
-    bot.send_message(m.chat.id, "Отскок от уровней 4ч 🎯\nЛонг у поддержки / шорт у сопротивления.\nATR-стоп, тейк 1:3.\n\nЖми кнопки 👇", reply_markup=menu())
+    bot.send_message(m.chat.id, "Отскок от уровней 4ч 🎯\nЛонг у поддержки / шорт у сопротивления.\nATR-стоп, тейк 1:3.\n\n✅ свеча = сильный сигнал\n⚠️ свечи нет = смотри график сам", reply_markup=menu())
 
 @bot.message_handler(func=lambda m: m.text == "🔍 Найти отскоки")
 def btn_scan(m):
@@ -239,7 +240,7 @@ def btn_list(m):
             out += (s["sym"] + " " + ("🟢 лонг" if s["side"] == "long" else "🔴 шорт") + "\n"
                     "цена " + fmt(p) + " · P&L " + sign + format(pnl, ".2f") + "%\n"
                     "до тейка " + format(to_tp, ".2f") + "% · до стопа " + format(to_sl, ".2f") + "%\n\n")
-        except Exception as e:
+        except Exception:
             out += s["sym"] + ": не удалось получить цену\n\n"
         time.sleep(0.3)
     bot.send_message(m.chat.id, out, reply_markup=menu())
@@ -260,7 +261,7 @@ def cb_track(c):
             return
         tracked[c.message.chat.id].append({"sym": sym, "side": side, "entry": entry, "sl": sl, "tp": tp})
         bot.answer_callback_query(c.id, "Отслеживаю " + sym)
-        bot.send_message(c.message.chat.id, "✅ " + sym + " на отслеживании.\nВход " + fmt(entry) + " · стоп " + fmt(sl) + " · тейк " + fmt(tp) + "\nПришлю алерт.", reply_markup=menu())
+        bot.send_message(c.message.chat.id, "✅ " + sym + " на отслеживании.\nВход " + fmt(entry) + " · стоп " + fmt(sl) + " · тейк " + fmt(tp), reply_markup=menu())
     except Exception:
         bot.answer_callback_query(c.id, "Ошибка")
 
@@ -276,23 +277,22 @@ def do_scan(chat_id, manual=False):
             except:
                 pass
             time.sleep(0.12)
-        # антидубль: не слать тот же сигнал чаще раза в 8 часов
         sent_signals.setdefault(chat_id, {})
         fresh = []
         now = time.time()
         for s in found:
             key = s["sym"] + s["side"]
-            last_t = sent_signals[chat_id].get(key, 0)
-            if manual or (now - last_t > 8 * 3600):
+            if manual or (now - sent_signals[chat_id].get(key, 0) > 8 * 3600):
                 fresh.append(s)
                 sent_signals[chat_id][key] = now
         if not fresh:
             if manual:
-                bot.send_message(chat_id, "Готовых отскоков сейчас нет.\nНужно: цена у уровня + RSI на краю + объём + разворотная свеча.", reply_markup=menu())
+                bot.send_message(chat_id, "Отскоков сейчас нет: цена ни у одного уровня (≤0.8%) при RSI на краю.", reply_markup=menu())
             return
-        fresh.sort(key=lambda s: s["risk_pct"])
+        # сначала те, где есть разворотная свеча, потом по риску
+        fresh.sort(key=lambda s: (s["pat"] == "нет разворотной", s["risk_pct"]))
         bot.send_message(chat_id, "Нашёл " + str(len(fresh)) + " отскок(ов):")
-        for s in fresh[:6]:
+        for s in fresh[:8]:
             ikb = types.InlineKeyboardMarkup()
             cb = "t:" + s["sym"] + ":" + s["side"] + ":" + format(s["entry"], ".6f") + ":" + format(s["sl"], ".6f") + ":" + format(s["tp"], ".6f")
             if len(cb) <= 64:
@@ -319,7 +319,7 @@ def auto_loop():
                             bot.send_message(chat_id, "🎯 ТЕЙК: " + s["sym"] + " дошёл до " + fmt(s["tp"]) + "!\nЗАКРЫВАЙ В ПЛЮС!", reply_markup=menu())
                             lst.remove(s)
                         elif hit_sl:
-                            bot.send_message(chat_id, "🛑 СТОП: " + s["sym"] + " пробил " + fmt(s["sl"]) + ".\nЗАКРЫВАЙ, не досиживай!", reply_markup=menu())
+                            bot.send_message(chat_id, "🛑 СТОП: " + s["sym"] + " пробил " + fmt(s["sl"]) + ".\nЗАКРЫВАЙ!", reply_markup=menu())
                             lst.remove(s)
                     except:
                         pass
