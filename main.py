@@ -1,4 +1,5 @@
 import os
+import json
 import time
 import threading
 import telebot
@@ -10,18 +11,38 @@ TOKEN = os.environ.get("BOT_TOKEN")
 bot = telebot.TeleBot(TOKEN)
 
 SIZE = 1000
-RSI_LEVEL = 40       # лонг: RSI<40, шорт: RSI>60
-VOL_MULT = 1.1       # объём не ниже обычного
-MAX_DIST = 0.8       # % макс расстояние до уровня
+RSI_LEVEL = 40
+VOL_MULT = 1.1
+MAX_DIST = 0.8
 MAX_RISK = 3.0
 RR = 3
 ATR_BUF = 0.5
 MAX_COINS = 200
 FEE = 0.055
+DB = "trades.json"
 
 tracked = {}
 users = set()
 sent_signals = {}
+
+def save():
+    try:
+        with open(DB, "w") as f:
+            json.dump({"tracked": {str(k): v for k, v in tracked.items()},
+                       "users": list(users)}, f)
+    except Exception as e:
+        print("save error:", e)
+
+def load():
+    global tracked, users
+    try:
+        with open(DB) as f:
+            d = json.load(f)
+        tracked = {int(k): v for k, v in d.get("tracked", {}).items()}
+        users = set(d.get("users", []))
+        print("загружено сделок:", sum(len(v) for v in tracked.values()))
+    except Exception:
+        print("нет сохранённых данных, старт с нуля")
 
 def menu():
     kb = types.ReplyKeyboardMarkup(resize_keyboard=True)
@@ -34,7 +55,8 @@ def get_klines(symbol, limit=250):
     r = requests.get(url, timeout=20).json()
     if not isinstance(r, list) or len(r) < 3:
         raise Exception("нет данных " + symbol)
-    return [{"o": float(c[1]), "h": float(c[2]), "l": float(c[3]), "c": float(c[4]), "v": float(c[5])} for c in r]
+    return [{"o": float(c[1]), "h": float(c[2]), "l": float(c[3]),
+             "c": float(c[4]), "v": float(c[5]), "close_t": int(c[6])} for c in r]
 
 def get_price(symbol):
     url = f"https://data-api.binance.vision/api/v3/ticker/price?symbol={symbol}"
@@ -122,12 +144,17 @@ def top_coins():
     return [x["symbol"].replace("USDT", "") for x in usdt[:MAX_COINS]]
 
 def analyze(sym):
-    kl = get_klines(sym + "USDT")
+    raw = get_klines(sym + "USDT")
+    if len(raw) < 60:
+        return None
+    # ФИКС №1: работаем ТОЛЬКО по закрытым свечам (последняя - текущая, незакрытая)
+    now_ms = int(time.time() * 1000)
+    kl = raw[:-1] if raw[-1]["close_t"] > now_ms else raw
     if len(kl) < 60:
         return None
     closes = [k["c"] for k in kl]
-    price = closes[-1]
     last = kl[-1]
+    price = get_price(sym + "USDT")   # вход по текущей цене
     v20 = np.mean([k["v"] for k in kl[-21:-1]])
     if v20 <= 0:
         return None
@@ -143,7 +170,6 @@ def analyze(sym):
     e200 = ema(closes, min(200, len(closes)))
     rel = (price - e200) / e200 * 100 if e200 else 0
     out = []
-    # ЛОНГ от поддержки
     if r < RSI_LEVEL and rel >= -15:
         sups = [s for s in find_levels(kl, "sup") if s <= price * 1.002]
         if sups:
@@ -159,7 +185,6 @@ def analyze(sym):
                         out.append({"side": "long", "sym": sym, "entry": price, "lvl": lvl,
                                     "sl": sl, "tp": price + risk * RR, "risk_pct": rp,
                                     "rsi": r, "vr": vr, "pat": pat, "dist": dist})
-    # ШОРТ от сопротивления
     if r > (100 - RSI_LEVEL) and rel <= 15:
         ress = [s for s in find_levels(kl, "res") if s >= price * 0.998]
         if ress:
@@ -193,6 +218,7 @@ def card(s):
     rsi_ok = "✅" if (s["rsi"] <= 32 or s["rsi"] >= 68) else "⚠️"
     return (
         "🎯 " + s["sym"] + " — " + side_t + " (4ч)\n\n"
+        "✅ Свеча 4ч ЗАКРЫТА\n"
         + pat_ok + " Свеча: " + s["pat"] + "\n"
         + rsi_ok + " RSI: " + str(round(s["rsi"])) + "\n"
         "✅ Объём: ×" + format(s["vr"], ".1f") + "\n"
@@ -204,17 +230,20 @@ def card(s):
         "💵 На $" + str(SIZE) + ":\n"
         "   риск ≈ -$" + str(round(risk_usd + fees)) + "\n"
         "   профит ≈ +$" + str(round(prof_usd - fees)) + "\n\n"
+        "🛡 На +50% пути пришлю сигнал двинуть стоп в безубыток\n"
         "⚙️ плечо 1х!"
     )
 
 @bot.message_handler(commands=['start'])
 def start(m):
     users.add(m.chat.id)
-    bot.send_message(m.chat.id, "Отскок от уровней 4ч 🎯\nЛонг у поддержки / шорт у сопротивления.\nATR-стоп, тейк 1:3.\n\n✅ свеча = сильный сигнал\n⚠️ свечи нет = смотри график сам", reply_markup=menu())
+    save()
+    bot.send_message(m.chat.id, "Отскок от уровней 4ч 🎯\nСигналы только по ЗАКРЫТЫМ свечам.\nATR-стоп, тейк 1:3, безубыток на полпути.\n\n✅ свеча = сильный сигнал\n⚠️ свечи нет = смотри график сам", reply_markup=menu())
 
 @bot.message_handler(func=lambda m: m.text == "🔍 Найти отскоки")
 def btn_scan(m):
     users.add(m.chat.id)
+    save()
     bot.send_message(m.chat.id, "Сканирую топ-200 монет на 4ч... жди 5-8 мин")
     do_scan(m.chat.id, manual=True)
 
@@ -237,7 +266,8 @@ def btn_list(m):
                 to_sl = (s["sl"] - p) / p * 100
                 pnl = (s["entry"] - p) / s["entry"] * 100
             sign = "+" if pnl >= 0 else ""
-            out += (s["sym"] + " " + ("🟢 лонг" if s["side"] == "long" else "🔴 шорт") + "\n"
+            be = " 🛡безубыток" if s.get("be") else ""
+            out += (s["sym"] + " " + ("🟢 лонг" if s["side"] == "long" else "🔴 шорт") + be + "\n"
                     "цена " + fmt(p) + " · P&L " + sign + format(pnl, ".2f") + "%\n"
                     "до тейка " + format(to_tp, ".2f") + "% · до стопа " + format(to_sl, ".2f") + "%\n\n")
         except Exception:
@@ -248,6 +278,7 @@ def btn_list(m):
 @bot.message_handler(func=lambda m: m.text == "🗑 Очистить")
 def btn_clear(m):
     tracked[m.chat.id] = []
+    save()
     bot.send_message(m.chat.id, "Всё снято.", reply_markup=menu())
 
 @bot.callback_query_handler(func=lambda c: c.data.startswith("t:"))
@@ -259,10 +290,13 @@ def cb_track(c):
         if any(x["sym"] == sym for x in tracked[c.message.chat.id]):
             bot.answer_callback_query(c.id, sym + " уже отслеживается")
             return
-        tracked[c.message.chat.id].append({"sym": sym, "side": side, "entry": entry, "sl": sl, "tp": tp})
+        tracked[c.message.chat.id].append({"sym": sym, "side": side, "entry": entry,
+                                           "sl": sl, "tp": tp, "be": False})
+        save()
         bot.answer_callback_query(c.id, "Отслеживаю " + sym)
         bot.send_message(c.message.chat.id, "✅ " + sym + " на отслеживании.\nВход " + fmt(entry) + " · стоп " + fmt(sl) + " · тейк " + fmt(tp), reply_markup=menu())
-    except Exception:
+    except Exception as e:
+        print("track error:", e)
         bot.answer_callback_query(c.id, "Ошибка")
 
 def do_scan(chat_id, manual=False):
@@ -274,7 +308,7 @@ def do_scan(chat_id, manual=False):
                 res = analyze(c)
                 if res:
                     found.extend(res)
-            except:
+            except Exception:
                 pass
             time.sleep(0.12)
         sent_signals.setdefault(chat_id, {})
@@ -289,7 +323,6 @@ def do_scan(chat_id, manual=False):
             if manual:
                 bot.send_message(chat_id, "Отскоков сейчас нет: цена ни у одного уровня (≤0.8%) при RSI на краю.", reply_markup=menu())
             return
-        # сначала те, где есть разворотная свеча, потом по риску
         fresh.sort(key=lambda s: (s["pat"] == "нет разворотной", s["risk_pct"]))
         bot.send_message(chat_id, "Нашёл " + str(len(fresh)) + " отскок(ов):")
         for s in fresh[:8]:
@@ -301,7 +334,8 @@ def do_scan(chat_id, manual=False):
             else:
                 bot.send_message(chat_id, card(s))
             time.sleep(1)
-    except Exception:
+    except Exception as e:
+        print("scan error:", e)
         if manual:
             bot.send_message(chat_id, "Ошибка при поиске, попробуй ещё раз.", reply_markup=menu())
 
@@ -309,6 +343,7 @@ def auto_loop():
     last = 0
     while True:
         try:
+            changed = False
             for chat_id, lst in list(tracked.items()):
                 for s in list(lst):
                     try:
@@ -317,24 +352,44 @@ def auto_loop():
                         hit_sl = (p <= s["sl"]) if s["side"] == "long" else (p >= s["sl"])
                         if hit_tp:
                             bot.send_message(chat_id, "🎯 ТЕЙК: " + s["sym"] + " дошёл до " + fmt(s["tp"]) + "!\nЗАКРЫВАЙ В ПЛЮС!", reply_markup=menu())
-                            lst.remove(s)
-                        elif hit_sl:
-                            bot.send_message(chat_id, "🛑 СТОП: " + s["sym"] + " пробил " + fmt(s["sl"]) + ".\nЗАКРЫВАЙ!", reply_markup=menu())
-                            lst.remove(s)
-                    except:
+                            lst.remove(s); changed = True
+                            continue
+                        if hit_sl:
+                            msg = "🛑 СТОП: " + s["sym"] + " пробил " + fmt(s["sl"]) + "."
+                            if s.get("be"):
+                                msg = "🛡 БЕЗУБЫТОК: " + s["sym"] + " вернулся ко входу " + fmt(s["sl"]) + ". Вышел в ноль."
+                            bot.send_message(chat_id, msg + "\nЗАКРЫВАЙ!", reply_markup=menu())
+                            lst.remove(s); changed = True
+                            continue
+                        # ФИКС №2: безубыток на +50% пути к тейку
+                        if not s.get("be"):
+                            half = s["entry"] + (s["tp"] - s["entry"]) * 0.5
+                            reached = (p >= half) if s["side"] == "long" else (p <= half)
+                            if reached:
+                                s["sl"] = s["entry"]
+                                s["be"] = True
+                                changed = True
+                                bot.send_message(chat_id,
+                                    "🛡 БЕЗУБЫТОК: " + s["sym"] + " прошёл половину пути!\n"
+                                    "Двигай стоп на вход: " + fmt(s["entry"]) + "\n"
+                                    "Дальше сделка бесплатная.", reply_markup=menu())
+                    except Exception:
                         pass
                     time.sleep(0.3)
+            if changed:
+                save()
             if time.time() - last > 1800:
                 last = time.time()
                 for uid in list(users):
                     try:
                         do_scan(uid, manual=False)
-                    except:
+                    except Exception:
                         pass
-        except:
-            pass
+        except Exception as e:
+            print("loop error:", e)
         time.sleep(90)
 
+load()
 threading.Thread(target=auto_loop, daemon=True).start()
 print("Бот отскоков запущен...")
 bot.infinity_polling()
