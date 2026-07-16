@@ -24,30 +24,34 @@ DB = "trades.json"
 tracked = {}
 users = set()
 sent_signals = {}
+history = {}   # {chat_id: [ {sym, side, result, pnl, entry, exit} ]}
 
 def save():
     try:
         with open(DB, "w") as f:
             json.dump({"tracked": {str(k): v for k, v in tracked.items()},
-                       "users": list(users)}, f)
+                       "users": list(users),
+                       "history": {str(k): v for k, v in history.items()}}, f)
     except Exception as e:
         print("save error:", e)
 
 def load():
-    global tracked, users
+    global tracked, users, history
     try:
         with open(DB) as f:
             d = json.load(f)
         tracked = {int(k): v for k, v in d.get("tracked", {}).items()}
         users = set(d.get("users", []))
-        print("загружено сделок:", sum(len(v) for v in tracked.values()))
+        history = {int(k): v for k, v in d.get("history", {}).items()}
+        print("загружено: сделок", sum(len(v) for v in tracked.values()), "| история", sum(len(v) for v in history.values()))
     except Exception:
         print("нет сохранённых данных, старт с нуля")
 
 def menu():
     kb = types.ReplyKeyboardMarkup(resize_keyboard=True)
     kb.row("🔍 Найти отскоки")
-    kb.row("📋 Мои сделки", "🗑 Очистить")
+    kb.row("📋 Мои сделки", "📊 Статистика")
+    kb.row("🗑 Очистить")
     return kb
 
 def get_klines(symbol, limit=250):
@@ -147,14 +151,13 @@ def analyze(sym):
     raw = get_klines(sym + "USDT")
     if len(raw) < 60:
         return None
-    # ФИКС №1: работаем ТОЛЬКО по закрытым свечам (последняя - текущая, незакрытая)
     now_ms = int(time.time() * 1000)
     kl = raw[:-1] if raw[-1]["close_t"] > now_ms else raw
     if len(kl) < 60:
         return None
     closes = [k["c"] for k in kl]
     last = kl[-1]
-    price = get_price(sym + "USDT")   # вход по текущей цене
+    price = get_price(sym + "USDT")
     v20 = np.mean([k["v"] for k in kl[-21:-1]])
     if v20 <= 0:
         return None
@@ -207,6 +210,12 @@ def fmt(p):
     if p >= 1: return format(p, ".4f")
     return format(p, ".6f")
 
+def pnl_usd(s, price):
+    qty = SIZE / s["entry"]
+    if s["side"] == "long":
+        return qty * (price - s["entry"])
+    return qty * (s["entry"] - price)
+
 def card(s):
     qty = SIZE / s["entry"]
     risk_usd = qty * abs(s["entry"] - s["sl"])
@@ -234,11 +243,19 @@ def card(s):
         "⚙️ плечо 1х!"
     )
 
+def close_trade(chat_id, s, price, result):
+    p = pnl_usd(s, price) - SIZE * FEE / 100 * 2
+    history.setdefault(chat_id, [])
+    history[chat_id].append({"sym": s["sym"], "side": s["side"], "result": result,
+                             "pnl": round(p, 2), "entry": s["entry"], "exit": price,
+                             "t": int(time.time())})
+    return p
+
 @bot.message_handler(commands=['start'])
 def start(m):
     users.add(m.chat.id)
     save()
-    bot.send_message(m.chat.id, "Отскок от уровней 4ч 🎯\nСигналы только по ЗАКРЫТЫМ свечам.\nATR-стоп, тейк 1:3, безубыток на полпути.\n\n✅ свеча = сильный сигнал\n⚠️ свечи нет = смотри график сам", reply_markup=menu())
+    bot.send_message(m.chat.id, "Отскок от уровней 4ч 🎯\nСигналы только по ЗАКРЫТЫМ свечам.\nATR-стоп, тейк 1:3, безубыток на полпути.\nВедётся статистика сделок.", reply_markup=menu())
 
 @bot.message_handler(func=lambda m: m.text == "🔍 Найти отскоки")
 def btn_scan(m):
@@ -253,33 +270,76 @@ def btn_list(m):
     if not t:
         bot.send_message(m.chat.id, "Нет отслеживаемых сделок.", reply_markup=menu())
         return
-    out = ""
     for s in list(t):
         try:
             p = get_price(s["sym"] + "USDT")
+            pnl = pnl_usd(s, p)
+            qty = SIZE / s["entry"]
+            risk_usd = qty * abs(s["entry"] - s["sl"])
+            prof_usd = qty * abs(s["tp"] - s["entry"])
             if s["side"] == "long":
                 to_tp = (s["tp"] - p) / p * 100
                 to_sl = (p - s["sl"]) / p * 100
-                pnl = (p - s["entry"]) / s["entry"] * 100
             else:
                 to_tp = (p - s["tp"]) / p * 100
                 to_sl = (s["sl"] - p) / p * 100
-                pnl = (s["entry"] - p) / s["entry"] * 100
-            sign = "+" if pnl >= 0 else ""
-            be = " 🛡безубыток" if s.get("be") else ""
-            out += (s["sym"] + " " + ("🟢 лонг" if s["side"] == "long" else "🔴 шорт") + be + "\n"
-                    "цена " + fmt(p) + " · P&L " + sign + format(pnl, ".2f") + "%\n"
-                    "до тейка " + format(to_tp, ".2f") + "% · до стопа " + format(to_sl, ".2f") + "%\n\n")
+            sign = "+" if pnl >= 0 else "-"
+            emo = "🟢" if pnl >= 0 else "🔴"
+            be = "\n🛡 стоп в безубытке" if s.get("be") else ""
+            txt = (
+                emo + " " + s["sym"] + " " + ("ЛОНГ" if s["side"] == "long" else "ШОРТ") + "\n\n"
+                "💵 Сейчас: " + sign + "$" + format(abs(pnl), ".2f") + "\n"
+                "📍 Вход: " + fmt(s["entry"]) + "\n"
+                "💰 Цена: " + fmt(p) + "\n\n"
+                "🛑 Стоп: " + fmt(s["sl"]) + "  (-$" + str(round(risk_usd)) + ")\n"
+                "🎯 Тейк: " + fmt(s["tp"]) + "  (+$" + str(round(prof_usd)) + ")\n\n"
+                "до тейка " + format(to_tp, ".2f") + "% · до стопа " + format(to_sl, ".2f") + "%"
+                + be
+            )
+            bot.send_message(m.chat.id, txt, reply_markup=menu())
         except Exception:
-            out += s["sym"] + ": не удалось получить цену\n\n"
-        time.sleep(0.3)
-    bot.send_message(m.chat.id, out, reply_markup=menu())
+            bot.send_message(m.chat.id, s["sym"] + ": не удалось получить цену")
+        time.sleep(0.4)
+
+@bot.message_handler(func=lambda m: m.text == "📊 Статистика")
+def btn_stats(m):
+    h = history.get(m.chat.id, [])
+    if not h:
+        bot.send_message(m.chat.id, "📊 Пока нет закрытых сделок.\nСтатистика появится после первого тейка или стопа.", reply_markup=menu())
+        return
+    total = len(h)
+    wins = [x for x in h if x["result"] == "tp"]
+    losses = [x for x in h if x["result"] == "sl"]
+    bes = [x for x in h if x["result"] == "be"]
+    money = sum(x["pnl"] for x in h)
+    wr = round(len(wins) / total * 100)
+    avg_w = round(np.mean([x["pnl"] for x in wins]), 1) if wins else 0
+    avg_l = round(np.mean([abs(x["pnl"]) for x in losses]), 1) if losses else 0
+    verdict = "✅ стратегия в плюсе" if money > 0 else "❌ пока в минусе"
+    if total < 15:
+        verdict += "\n⚠️ выборка мала (" + str(total) + "/20), рано судить"
+    txt = (
+        "📊 СТАТИСТИКА (" + str(total) + " сделок)\n\n"
+        "🎯 Тейк: " + str(len(wins)) + " (" + str(wr) + "%)\n"
+        "🛑 Стоп: " + str(len(losses)) + "\n"
+        "🛡 Безубыток: " + str(len(bes)) + "\n\n"
+        "💵 Итого: " + ("+" if money >= 0 else "") + "$" + str(round(money, 2)) + "\n"
+        "Средний плюс: +$" + str(avg_w) + "\n"
+        "Средний минус: -$" + str(avg_l) + "\n\n"
+        + verdict + "\n\n"
+        "Последние 5:\n"
+    )
+    for x in h[-5:][::-1]:
+        ic = "🎯" if x["result"] == "tp" else ("🛑" if x["result"] == "sl" else "🛡")
+        sg = "+" if x["pnl"] >= 0 else ""
+        txt += ic + " " + x["sym"] + " " + sg + "$" + str(x["pnl"]) + "\n"
+    bot.send_message(m.chat.id, txt, reply_markup=menu())
 
 @bot.message_handler(func=lambda m: m.text == "🗑 Очистить")
 def btn_clear(m):
     tracked[m.chat.id] = []
     save()
-    bot.send_message(m.chat.id, "Всё снято.", reply_markup=menu())
+    bot.send_message(m.chat.id, "Отслеживание снято. Статистика сохранена.", reply_markup=menu())
 
 @bot.callback_query_handler(func=lambda c: c.data.startswith("t:"))
 def cb_track(c):
@@ -293,8 +353,16 @@ def cb_track(c):
         tracked[c.message.chat.id].append({"sym": sym, "side": side, "entry": entry,
                                            "sl": sl, "tp": tp, "be": False})
         save()
+        qty = SIZE / entry
+        risk_usd = qty * abs(entry - sl)
+        prof_usd = qty * abs(tp - entry)
         bot.answer_callback_query(c.id, "Отслеживаю " + sym)
-        bot.send_message(c.message.chat.id, "✅ " + sym + " на отслеживании.\nВход " + fmt(entry) + " · стоп " + fmt(sl) + " · тейк " + fmt(tp), reply_markup=menu())
+        bot.send_message(c.message.chat.id,
+            "✅ " + sym + " на отслеживании\n\n"
+            "📍 Вход: " + fmt(entry) + "\n"
+            "🛑 Стоп: " + fmt(sl) + "  (-$" + str(round(risk_usd)) + ")\n"
+            "🎯 Тейк: " + fmt(tp) + "  (+$" + str(round(prof_usd)) + ")\n\n"
+            "Пришлю алерт на тейк, стоп и безубыток.", reply_markup=menu())
     except Exception as e:
         print("track error:", e)
         bot.answer_callback_query(c.id, "Ошибка")
@@ -351,17 +419,20 @@ def auto_loop():
                         hit_tp = (p >= s["tp"]) if s["side"] == "long" else (p <= s["tp"])
                         hit_sl = (p <= s["sl"]) if s["side"] == "long" else (p >= s["sl"])
                         if hit_tp:
-                            bot.send_message(chat_id, "🎯 ТЕЙК: " + s["sym"] + " дошёл до " + fmt(s["tp"]) + "!\nЗАКРЫВАЙ В ПЛЮС!", reply_markup=menu())
+                            pl = close_trade(chat_id, s, s["tp"], "tp")
+                            bot.send_message(chat_id, "🎯 ТЕЙК: " + s["sym"] + " дошёл до " + fmt(s["tp"]) + "!\nПрофит ≈ +$" + str(round(pl)) + "\nЗАКРЫВАЙ В ПЛЮС!", reply_markup=menu())
                             lst.remove(s); changed = True
                             continue
                         if hit_sl:
-                            msg = "🛑 СТОП: " + s["sym"] + " пробил " + fmt(s["sl"]) + "."
-                            if s.get("be"):
-                                msg = "🛡 БЕЗУБЫТОК: " + s["sym"] + " вернулся ко входу " + fmt(s["sl"]) + ". Вышел в ноль."
-                            bot.send_message(chat_id, msg + "\nЗАКРЫВАЙ!", reply_markup=menu())
+                            res = "be" if s.get("be") else "sl"
+                            pl = close_trade(chat_id, s, s["sl"], res)
+                            if res == "be":
+                                msg = "🛡 БЕЗУБЫТОК: " + s["sym"] + " вернулся ко входу. Вышел ~в ноль."
+                            else:
+                                msg = "🛑 СТОП: " + s["sym"] + " пробил " + fmt(s["sl"]) + ".\nУбыток ≈ -$" + str(round(abs(pl))) + "\nЗАКРЫВАЙ!"
+                            bot.send_message(chat_id, msg, reply_markup=menu())
                             lst.remove(s); changed = True
                             continue
-                        # ФИКС №2: безубыток на +50% пути к тейку
                         if not s.get("be"):
                             half = s["entry"] + (s["tp"] - s["entry"]) * 0.5
                             reached = (p >= half) if s["side"] == "long" else (p <= half)
