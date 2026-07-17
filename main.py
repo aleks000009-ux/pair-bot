@@ -31,6 +31,7 @@ ATR_BUF = 0.5
 MAX_COINS = 200
 FEE = 0.055
 BE_BAND = 5.0        # ±$5 вокруг нуля считаем безубытком
+BTC_FLAT = 0.7       # ±0.7% от EMA50 — рынок без выраженного направления
 
 # если подключишь Railway Volume и укажешь DATA_DIR=/data — статистика переживёт редеплой
 DATA_DIR = os.environ.get("DATA_DIR", ".").rstrip("/")
@@ -274,6 +275,28 @@ def detect_reversal(kl, side):
         if prev["c"] > prev["o"] and last["c"] < last["o"] and last["o"] >= prev["c"] and last["c"] <= prev["o"]:
             return "🫷 Поглощение"
     return None
+
+
+def btc_regime():
+    """куда смотрит рынок: считаем по BTC 4ч против EMA50"""
+    try:
+        raw = get_klines("BTCUSDT", 120)
+        now_ms = int(time.time() * 1000)
+        kl = raw[:-1] if raw[-1]["close_t"] > now_ms else raw
+        closes = [k["c"] for k in kl]
+        e50 = ema(closes, 50)
+        if not e50:
+            return "flat", 0.0
+        p = closes[-1]
+        d = (p - e50) / e50 * 100
+        if d < -BTC_FLAT:
+            return "bear", d
+        if d > BTC_FLAT:
+            return "bull", d
+        return "flat", d
+    except Exception as e:
+        print("btc regime error:", e)
+        return "flat", 0.0
 
 
 def top_coins():
@@ -621,6 +644,7 @@ def cb_track(c):
 
 def do_scan(chat_id, manual=False):
     try:
+        mode, dev = btc_regime()
         coins = top_coins()
         found = []
         for c in coins:
@@ -631,6 +655,18 @@ def do_scan(chat_id, manual=False):
             except Exception:
                 pass
             time.sleep(0.12)
+
+        # фильтр по битку: не ловим нож против рынка
+        cut = 0
+        if mode == "bear":
+            n0 = len(found)
+            found = [s for s in found if s["side"] == "short"]
+            cut = n0 - len(found)
+        elif mode == "bull":
+            n0 = len(found)
+            found = [s for s in found if s["side"] == "long"]
+            cut = n0 - len(found)
+
         sent_signals.setdefault(chat_id, {})
         # анти-дубль: монета уже в трекинге -> сигнал не шлём
         busy = {x["sym"] for x in tracked.get(chat_id, [])}
@@ -645,19 +681,32 @@ def do_scan(chat_id, manual=False):
             if manual or (now - sent_signals[chat_id].get(key, 0) > 8 * 3600):
                 fresh.append(s)
                 sent_signals[chat_id][key] = now
+        if mode == "bear":
+            btc_t = "📉 BTC ниже EMA50 (" + format(dev, ".1f") + "%) — только шорты"
+        elif mode == "bull":
+            btc_t = "📈 BTC выше EMA50 (+" + format(dev, ".1f") + "%) — только лонги"
+        else:
+            btc_t = "➖ BTC у EMA50 (" + format(dev, ".1f") + "%) — обе стороны"
         if not fresh:
             if manual:
-                extra = ("\n(" + str(skipped) + " пропущено — уже в трекинге)") if skipped else ""
-                bot.send_message(chat_id, "Отскоков сейчас нет: цена ни у одного уровня (≤0.8%) при RSI на краю." + extra, reply_markup=menu())
+                extra = btc_t
+                if cut:
+                    extra += "\n(" + str(cut) + " скрыто против BTC)"
+                if skipped:
+                    extra += "\n(" + str(skipped) + " уже в трекинге)"
+                bot.send_message(chat_id, "Отскоков сейчас нет.\n" + extra, reply_markup=menu())
             return
         fresh.sort(key=lambda s: (-grade(s)[0], s["risk_pct"]))
         g_cnt = {}
         for s in fresh:
             g_cnt[grade(s)[1][0]] = g_cnt.get(grade(s)[1][0], 0) + 1
         head = ("Нашёл " + str(len(fresh)) + ": 🟢" + str(g_cnt.get("🟢", 0))
-                + " 🟡" + str(g_cnt.get("🟡", 0)) + " 🔴" + str(g_cnt.get("🔴", 0)))
+                + " 🟡" + str(g_cnt.get("🟡", 0)) + " 🔴" + str(g_cnt.get("🔴", 0))
+                + "\n" + btc_t)
+        if cut:
+            head += "\n(" + str(cut) + " скрыто против BTC)"
         if skipped:
-            head += "\n(" + str(skipped) + " пропущено — уже в трекинге)"
+            head += "\n(" + str(skipped) + " уже в трекинге)"
         bot.send_message(chat_id, head)
         for s in fresh[:8]:
             ikb = types.InlineKeyboardMarkup()
