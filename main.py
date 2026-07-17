@@ -493,13 +493,12 @@ def btn_stats(m):
     try:
         rows = income_all(stats_start_ms())
         if not rows:
-            bot.send_message(m.chat.id, "📊 С " + STATS_START + " закрытых сделок на Binance нет.", reply_markup=menu())
+            bot.send_message(m.chat.id, "📊 С " + STATS_START + " закрытых сделок нет.", reply_markup=menu())
             return
 
         tot = split_income(rows)
-        net = tot["pnl"] + tot["fee"] + tot["fund"] + tot["other"]
+        real = tot["pnl"] + tot["fee"] + tot["fund"] + tot["other"]
 
-        # группируем по монете: одна монета = одна сделка (один цикл позиции)
         by = {}
         for x in rows:
             by.setdefault(x.get("symbol") or "—", []).append(x)
@@ -507,64 +506,73 @@ def btn_stats(m):
         for sym, rr in by.items():
             d = split_income(rr)
             if d["n"] == 0:
-                continue                      # только фандинг/комиссия, позиция ещё открыта
-            trades.append({"sym": sym, "net": d["pnl"] + d["fee"] + d["fund"],
-                           "gross": d["pnl"], "fee": d["fee"], "fund": d["fund"]})
-        trades.sort(key=lambda x: x["net"])
+                continue
+            trades.append(d["pnl"] + d["fee"] + d["fund"])
 
-        wins = [x for x in trades if x["net"] > 0]
-        losses = [x for x in trades if x["net"] < 0]
         total = len(trades)
-        wr = round(len(wins) / total * 100) if total else 0
-        avg_w = round(np.mean([x["net"] for x in wins]), 2) if wins else 0
-        avg_l = round(np.mean([abs(x["net"]) for x in losses]), 2) if losses else 0
-        rr_fact = round(avg_w / avg_l, 2) if avg_l > 0 else 0
-
-        txt = ("📊 СТАТИСТИКА с " + STATS_START + "\n"
-               "🔗 по фактическим данным Binance\n\n"
-               "Монет закрыто: " + str(total) + "  ·  закрытий: " + str(tot["n"]) + "\n"
-               "🟢 В плюс: " + str(len(wins)) + " (" + str(wr) + "%)\n"
-               "🔴 В минус: " + str(len(losses)) + "\n\n"
-               "📈 Грязный PnL: " + money(tot["pnl"]) + "\n"
-               "💸 Комиссии: " + money(tot["fee"]) + "\n"
-               "💱 Фандинг: " + money(tot["fund"]) + "\n")
-        if abs(tot["other"]) > 0.009:
-            txt += "➕ Прочее: " + money(tot["other"]) + "\n"
-        txt += "━━━━━━━━━━\n💵 ЧИСТЫМИ: " + money(net) + "\n\n"
-
-        if avg_w or avg_l:
-            txt += ("Средний плюс: +$" + format(avg_w, ".2f") + "\n"
-                    "Средний минус: -$" + format(avg_l, ".2f") + "\n")
-            if rr_fact:
-                txt += "Фактический R:R: 1:" + format(rr_fact, ".2f") + "  (цель 1:3)\n"
-        if tot["pnl"] != 0:
-            drag = abs(tot["fee"]) / abs(tot["pnl"]) * 100
-            txt += "⚖️ Комиссии съели " + format(drag, ".0f") + "% грязного PnL\n"
-
-        txt += "\nПо монетам:\n"
-        for x in trades[:15]:
-            ic = "🟢" if x["net"] > 0 else "🔴"
-            txt += ic + " " + x["sym"] + " " + money(x["net"]) + "  (комис " + money(x["fee"]) + ")\n"
+        wins = [x for x in trades if x > 0]
+        losses = [x for x in trades if x < 0]
+        wr = (len(wins) / total * 100) if total else 0
+        avg_w = float(np.mean(wins)) if wins else 0.0
+        avg_l = float(np.mean([abs(x) for x in losses])) if losses else 0.0
+        rr_fact = (avg_w / avg_l) if avg_l > 0 else 0
+        be_rr = ((100 - wr) / wr) if wr > 0 else 0     # R:R для выхода в ноль
 
         try:
             pos = binance_positions()
-            if pos:
-                up = sum(v["upnl"] for v in pos.values())
-                txt += "\n📌 Открыто сейчас: " + str(len(pos)) + " · плавающий " + money(up) + "\n"
-                for sym, v in pos.items():
-                    sd = "ЛОНГ" if v["amt"] > 0 else "ШОРТ"
-                    txt += "• " + sym + " " + sd + " · вход " + fmt(v["entry"]) + " · " + money(v["upnl"]) + "\n"
-            else:
-                txt += "\n📌 Открытых позиций нет.\n"
         except Exception:
-            pass
+            pos = {}
+        upnl = sum(v["upnl"] for v in pos.values())
 
+        L = []
+        L.append("📊 ОТСКОК 1:3 · с " + STATS_START)
+        L.append(str(total) + " монет · " + str(tot["n"]) + " закрытий")
+        L.append("")
+        L.append("💵 Чистыми:  " + money(real))
+        if pos:
+            L.append("📌 Плавает:  " + money(upnl) + "  (" + str(len(pos)) + ")")
+            L.append("━━━━━━━━━━━━")
+            L.append("ИТОГО:       " + money(real + upnl))
+        L.append("")
+        L.append("🟢 " + str(len(wins)) + "  🔴 " + str(len(losses)) + "   винрейт " + format(wr, ".0f") + "%")
+        if rr_fact:
+            L.append("R:R факт 1:" + format(rr_fact, ".2f"))
+            if be_rr:
+                L.append("  безубыток 1:" + format(be_rr, ".2f") + " · цель 1:" + str(RR))
+        L.append("")
+        L.append("📈 Грязный: " + money(tot["pnl"]))
+        L.append("💸 Комиссии: " + money(tot["fee"]))
+        L.append("💱 Фандинг: " + money(tot["fund"]))
+
+        # диагностика — только то, что реально течёт
+        d = []
+        cpc = (tot["n"] / total) if total else 0
+        if cpc > 2:
+            d.append("• " + format(cpc, ".1f") + " закрытий на монету — режешь позицию кусками, не доводя до тейка")
+        drag = (abs(tot["fee"]) / abs(tot["pnl"]) * 100) if tot["pnl"] else 0
+        if drag > 15:
+            d.append("• комиссии съели " + format(drag, ".0f") + "% грязного PnL")
+        if rr_fact and be_rr and rr_fact < be_rr:
+            d.append("• R:R ниже безубытка — при таком винрейте выйти в плюс невозможно")
+        if len(pos) > 6:
+            d.append("• " + str(len(pos)) + " позиций разом — это одна ставка на рынок, а не " + str(len(pos)) + " тестов")
+        if d:
+            L.append("")
+            L.append("⚠️ КУДА УХОДЯТ ДЕНЬГИ")
+            L.extend(d)
+
+        L.append("")
+        days = len({int(x.get("time", 0)) // 86400000 for x in rows
+                    if x.get("incomeType") == "REALIZED_PNL"})
         if total < 15:
-            txt += "\n⚠️ " + str(total) + " сделок — рано судить о стратегии. Нужно 15-20."
+            L.append("⚠️ " + str(total) + " сделок — рано судить. Нужно 15-20.")
+        elif days < 5:
+            L.append("⚠️ " + str(total) + " сделок, но всего за " + str(days) +
+                     " дн. — это одна рыночная фаза, а не выборка. Нужно 5+ дней.")
         else:
-            txt += "\n" + ("✅ стратегия в плюсе" if net > 0 else "❌ стратегия в минусе")
+            L.append("✅ стратегия в плюсе" if real + upnl > 0 else "❌ стратегия в минусе")
 
-        bot.send_message(m.chat.id, txt, reply_markup=menu())
+        bot.send_message(m.chat.id, "\n".join(L), reply_markup=menu())
     except Exception as e:
         bot.send_message(m.chat.id, "Ошибка Binance: " + str(e) +
                          "\n\nПроверь ключи от testnet.binancefuture.com.", reply_markup=menu())
