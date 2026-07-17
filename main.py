@@ -126,8 +126,31 @@ def auto_symbol(sym):
     return s if s in _filters else None
 
 
+def place_cond(fs, side, typ, trig):
+    """условный ордер. Binance с 09.12.2025 требует /fapi/v1/algoOrder"""
+    p = {"algoType": "CONDITIONAL", "symbol": fs, "side": side, "type": typ,
+         "triggerPrice": trig, "closePosition": "true", "workingType": "MARK_PRICE"}
+    try:
+        return signed_post("/fapi/v1/algoOrder", p)
+    except Exception as e:
+        # запасной путь на случай, если у биржи ещё старый режим
+        if "-4120" in str(e):
+            raise
+        return signed_post("/fapi/v1/order", {"symbol": fs, "side": side, "type": typ,
+                                              "stopPrice": trig, "closePosition": "true",
+                                              "workingType": "MARK_PRICE",
+                                              "timeInForce": "GTE_GTC"})
+
+
+def close_now(fs, side, qty):
+    """аварийное закрытие: позиция без стопа недопустима"""
+    opp = "SELL" if side == "BUY" else "BUY"
+    return signed_post("/fapi/v1/order", {"symbol": fs, "side": opp, "type": "MARKET",
+                                          "quantity": qty, "reduceOnly": "true"})
+
+
 def open_trade(chat_id, s):
-    """рыночный вход + TP и SL ордерами на бирже"""
+    """рыночный вход + TP и SL. Не встали оба ордера — позицию сразу закрываем."""
     fs = auto_symbol(s["sym"])
     if not fs:
         return False, "нет прямого фьючерса"
@@ -156,16 +179,25 @@ def open_trade(chat_id, s):
 
     tp = step_round(s["tp"], f["tick"])
     sl = step_round(s["sl"], f["tick"])
-    warn = ""
-    for typ, sp in (("TAKE_PROFIT_MARKET", tp), ("STOP_MARKET", sl)):
+    errs = []
+    for typ, trig in (("STOP_MARKET", sl), ("TAKE_PROFIT_MARKET", tp)):
         try:
-            signed_post("/fapi/v1/order", {"symbol": fs, "side": opp, "type": typ,
-                                           "stopPrice": sp, "closePosition": "true",
-                                           "workingType": "MARK_PRICE",
-                                           "timeInForce": "GTE_GTC"})
+            place_cond(fs, opp, typ, trig)
         except Exception as e:
-            warn += "\n⚠️ не встал " + typ + ": " + str(e)
-    return True, ("qty " + str(qty) + " · $" + str(round(qty * price)) + warn)
+            errs.append(typ + ": " + str(e))
+
+    if errs:
+        # позиция открыта, но не защищена — закрываем немедленно
+        try:
+            close_now(fs, side, qty)
+            opened_keys.discard(key)
+            return False, ("❗️ЗАКРЫЛ СРАЗУ — не встали защитные ордера:\n" + "\n".join(errs))
+        except Exception as e2:
+            bot.send_message(chat_id, "🆘 " + s["sym"] + " ОТКРЫТА БЕЗ СТОПА, закрыть не смог: "
+                             + str(e2) + "\n\nЗАКРОЙ РУКАМИ НА БИРЖЕ СЕЙЧАС.")
+            return False, "не защищена, закрыть не удалось"
+
+    return True, ("qty " + str(qty) + " · $" + str(round(qty * price)) + " · TP/SL стоят")
 
 
 def signed_get(path, params=None):
@@ -891,6 +923,8 @@ def auto_enter(chat_id, fresh):
             bot.send_message(chat_id, "🤖 ❌ " + s["sym"] + ": " + str(e))
             continue
         if not ok:
+            if info and ("ЗАКРЫЛ" in info or "не защищена" in info):
+                bot.send_message(chat_id, "🤖 " + s["sym"] + " — " + info, reply_markup=menu())
             continue
         free -= 1
         tracked.setdefault(chat_id, [])
@@ -905,7 +939,7 @@ def auto_enter(chat_id, fresh):
             + "  " + grade(s)[1] + "\n"
             "📍 " + fmt(s["entry"]) + " · " + info + "\n"
             "🛑 " + fmt(s["sl"]) + "  🎯 " + fmt(s["tp"]) + "\n"
-            "TP и SL стоят ордерами. Руками не трогаем.", reply_markup=menu())
+            "Руками не трогаем.", reply_markup=menu())
         time.sleep(1)
 
 
