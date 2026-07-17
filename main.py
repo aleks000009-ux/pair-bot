@@ -30,6 +30,7 @@ RR = 3
 ATR_BUF = 0.5
 MAX_COINS = 200
 FEE = 0.055
+BE_BAND = 5.0        # ±$5 вокруг нуля считаем безубытком
 
 # если подключишь Railway Volume и укажешь DATA_DIR=/data — статистика переживёт редеплой
 DATA_DIR = os.environ.get("DATA_DIR", ".").rstrip("/")
@@ -359,6 +360,26 @@ def pnl_usd(s, price):
     return qty * (s["entry"] - price)
 
 
+def grade(s):
+    """оценка входа: считаем, сколько условий отработали идеально"""
+    pts = 0
+    if s["pat"] != "нет разворотной":
+        pts += 2                                  # разворотная свеча — главное
+    if s["rsi"] <= 32 or s["rsi"] >= 68:
+        pts += 1                                  # RSI на самом краю
+    if s["vr"] >= 1.5:
+        pts += 1                                  # объём заметно выше нормы
+    if s["dist"] <= 0.4:
+        pts += 1                                  # вплотную к уровню
+    if s["risk_pct"] <= 1.5:
+        pts += 1                                  # короткий стоп
+    if pts >= 5:
+        return pts, "🟢 ХОРОШАЯ ПАРА"
+    if pts >= 3:
+        return pts, "🟡 СРЕДНЯЯ ПАРА"
+    return pts, "🔴 СЛАБАЯ ПАРА"
+
+
 def card(s):
     qty = SIZE / s["entry"]
     risk_usd = qty * abs(s["entry"] - s["sl"])
@@ -368,16 +389,21 @@ def card(s):
     lvl_t = "Поддержка" if s["side"] == "long" else "Сопротивление"
     pat_ok = "✅" if s["pat"] != "нет разворотной" else "⚠️"
     rsi_ok = "✅" if (s["rsi"] <= 32 or s["rsi"] >= 68) else "⚠️"
+    vol_ok = "✅" if s["vr"] >= 1.5 else "⚠️"
+    dst_ok = "✅" if s["dist"] <= 0.4 else "⚠️"
+    rsk_ok = "✅" if s["risk_pct"] <= 1.5 else "⚠️"
+    pts, lab = grade(s)
     return (
-        "🎯 " + s["sym"] + " — " + side_t + " (4ч)\n\n"
-        "✅ Свеча 4ч ЗАКРЫТА\n"
+        "🎯 " + s["sym"] + " — " + side_t + " (4ч)\n"
+        + lab + "  (" + str(pts) + "/6)\n\n"
         + pat_ok + " Свеча: " + s["pat"] + "\n"
         + rsi_ok + " RSI: " + str(round(s["rsi"])) + "\n"
-        "✅ Объём: ×" + format(s["vr"], ".1f") + "\n"
-        "✅ У уровня: " + format(s["dist"], ".2f") + "%\n\n"
+        + vol_ok + " Объём: ×" + format(s["vr"], ".1f") + "\n"
+        + dst_ok + " У уровня: " + format(s["dist"], ".2f") + "%\n"
+        + rsk_ok + " Стоп: " + format(s["risk_pct"], ".2f") + "%\n\n"
         "📍 Вход: " + fmt(s["entry"]) + "\n"
         "📊 " + lvl_t + ": " + fmt(s["lvl"]) + "\n"
-        "🛑 Стоп: " + fmt(s["sl"]) + "  (риск " + format(s["risk_pct"], ".2f") + "%)\n"
+        "🛑 Стоп: " + fmt(s["sl"]) + "\n"
         "🎯 Тейк: " + fmt(s["tp"]) + "  (1:3)\n\n"
         "💵 На $" + str(SIZE) + ":\n"
         "   риск ≈ -$" + str(round(risk_usd + fees)) + "\n"
@@ -510,13 +536,12 @@ def btn_stats(m):
             trades.append(d["pnl"] + d["fee"] + d["fund"])
 
         total = len(trades)
-        wins = [x for x in trades if x > 0]
-        losses = [x for x in trades if x < 0]
+        wins = [x for x in trades if x > BE_BAND]
+        losses = [x for x in trades if x < -BE_BAND]
+        bes = [x for x in trades if abs(x) <= BE_BAND]
         wr = (len(wins) / total * 100) if total else 0
         avg_w = float(np.mean(wins)) if wins else 0.0
         avg_l = float(np.mean([abs(x) for x in losses])) if losses else 0.0
-        rr_fact = (avg_w / avg_l) if avg_l > 0 else 0
-        be_rr = ((100 - wr) / wr) if wr > 0 else 0     # R:R для выхода в ноль
 
         try:
             pos = binance_positions()
@@ -534,43 +559,22 @@ def btn_stats(m):
             L.append("━━━━━━━━━━━━")
             L.append("ИТОГО:       " + money(real + upnl))
         L.append("")
-        L.append("🟢 " + str(len(wins)) + "  🔴 " + str(len(losses)) + "   винрейт " + format(wr, ".0f") + "%")
-        if rr_fact:
-            L.append("R:R факт 1:" + format(rr_fact, ".2f"))
-            if be_rr:
-                L.append("  безубыток 1:" + format(be_rr, ".2f") + " · цель 1:" + str(RR))
+        L.append("🟢 В плюс:   " + str(len(wins)) + "   (" + format(wr, ".0f") + "%)")
+        L.append("🔴 В минус:  " + str(len(losses)))
+        L.append("🛡 В ноль:   " + str(len(bes)))
+        L.append("")
+        L.append("Средний плюс:  " + money(avg_w))
+        L.append("Средний минус: " + money(-avg_l))
         L.append("")
         L.append("📈 Грязный: " + money(tot["pnl"]))
         L.append("💸 Комиссии: " + money(tot["fee"]))
         L.append("💱 Фандинг: " + money(tot["fund"]))
-
-        # диагностика — только то, что реально течёт
-        d = []
-        cpc = (tot["n"] / total) if total else 0
-        if cpc > 2:
-            d.append("• " + format(cpc, ".1f") + " закрытий на монету — режешь позицию кусками, не доводя до тейка")
-        drag = (abs(tot["fee"]) / abs(tot["pnl"]) * 100) if tot["pnl"] else 0
-        if drag > 15:
-            d.append("• комиссии съели " + format(drag, ".0f") + "% грязного PnL")
-        if rr_fact and be_rr and rr_fact < be_rr:
-            d.append("• R:R ниже безубытка — при таком винрейте выйти в плюс невозможно")
-        if len(pos) > 6:
-            d.append("• " + str(len(pos)) + " позиций разом — это одна ставка на рынок, а не " + str(len(pos)) + " тестов")
-        if d:
-            L.append("")
-            L.append("⚠️ КУДА УХОДЯТ ДЕНЬГИ")
-            L.extend(d)
-
         L.append("")
         days = len({int(x.get("time", 0)) // 86400000 for x in rows
                     if x.get("incomeType") == "REALIZED_PNL"})
-        if total < 15:
-            L.append("⚠️ " + str(total) + " сделок — рано судить. Нужно 15-20.")
-        elif days < 5:
-            L.append("⚠️ " + str(total) + " сделок, но всего за " + str(days) +
-                     " дн. — это одна рыночная фаза, а не выборка. Нужно 5+ дней.")
-        else:
-            L.append("✅ стратегия в плюсе" if real + upnl > 0 else "❌ стратегия в минусе")
+        cpc = (tot["n"] / total) if total else 0
+        L.append("Выборка: " + str(total) + " сделок за " + str(days) + " дн.")
+        L.append("Закрытий на монету: " + format(cpc, ".1f"))
 
         bot.send_message(m.chat.id, "\n".join(L), reply_markup=menu())
     except Exception as e:
@@ -646,8 +650,12 @@ def do_scan(chat_id, manual=False):
                 extra = ("\n(" + str(skipped) + " пропущено — уже в трекинге)") if skipped else ""
                 bot.send_message(chat_id, "Отскоков сейчас нет: цена ни у одного уровня (≤0.8%) при RSI на краю." + extra, reply_markup=menu())
             return
-        fresh.sort(key=lambda s: (s["pat"] == "нет разворотной", s["risk_pct"]))
-        head = "Нашёл " + str(len(fresh)) + " отскок(ов):"
+        fresh.sort(key=lambda s: (-grade(s)[0], s["risk_pct"]))
+        g_cnt = {}
+        for s in fresh:
+            g_cnt[grade(s)[1][0]] = g_cnt.get(grade(s)[1][0], 0) + 1
+        head = ("Нашёл " + str(len(fresh)) + ": 🟢" + str(g_cnt.get("🟢", 0))
+                + " 🟡" + str(g_cnt.get("🟡", 0)) + " 🔴" + str(g_cnt.get("🔴", 0)))
         if skipped:
             head += "\n(" + str(skipped) + " пропущено — уже в трекинге)"
         bot.send_message(chat_id, head)
@@ -655,7 +663,7 @@ def do_scan(chat_id, manual=False):
             ikb = types.InlineKeyboardMarkup()
             cb = "t:" + s["sym"] + ":" + s["side"] + ":" + format(s["entry"], ".6f") + ":" + format(s["sl"], ".6f") + ":" + format(s["tp"], ".6f")
             if len(cb) <= 64:
-                ikb.add(types.InlineKeyboardButton("➡️ Отслеживать " + s["sym"], callback_data=cb))
+                ikb.add(types.InlineKeyboardButton(grade(s)[1][0] + " Отслеживать " + s["sym"], callback_data=cb))
                 bot.send_message(chat_id, card(s), reply_markup=ikb)
             else:
                 bot.send_message(chat_id, card(s))
