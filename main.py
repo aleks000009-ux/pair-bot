@@ -4,6 +4,8 @@ import time
 import hmac
 import hashlib
 import urllib.parse
+import math
+from datetime import datetime, timedelta, timezone
 import threading
 import telebot
 from telebot import types
@@ -18,8 +20,10 @@ BINANCE_KEY = os.environ.get("BINANCE_KEY", "").strip()
 BINANCE_SECRET = os.environ.get("BINANCE_SECRET", "").strip()
 FAPI = os.environ.get("FAPI_BASE", "https://testnet.binancefuture.com").rstrip("/")
 
-# с какой даты считаем статистику (UTC). меняется переменной STATS_START в Railway
-STATS_START = os.environ.get("STATS_START", "2026-07-16").strip()
+# с какого момента считаем статистику. Время МОСКОВСКОЕ.
+# форматы: "2026-07-17 20:00" или "2026-07-17"
+STATS_START = os.environ.get("STATS_START", "2026-07-17 20:00").strip()
+MSK = timezone(timedelta(hours=3))
 
 SIZE = 1000
 RSI_LEVEL = 40
@@ -32,6 +36,14 @@ MAX_COINS = 200
 FEE = 0.055
 BE_BAND = 5.0        # ±$5 вокруг нуля считаем безубытком
 BTC_FLAT = 0.7       # ±0.7% от EMA50 — рынок без выраженного направления
+
+# ---------- АВТОТОРГОВЛЯ ----------
+AUTO_TRADE = os.environ.get("AUTO_TRADE", "0") == "1"   # рубильник в Railway
+AUTO_MIN_PTS = int(os.environ.get("AUTO_MIN_PTS", "5"))  # 5 = только 🟢, 3 = 🟢+🟡
+MAX_POS = int(os.environ.get("MAX_POS", "4"))            # потолок одновременных позиций
+LEVERAGE = int(os.environ.get("LEVERAGE", "5"))          # маржа; нотионал всегда SIZE
+auto_on = AUTO_TRADE
+opened_keys = set()   # защита от дублей при перезапуске
 
 # если подключишь Railway Volume и укажешь DATA_DIR=/data — статистика переживёт редеплой
 DATA_DIR = os.environ.get("DATA_DIR", ".").rstrip("/")
@@ -57,6 +69,103 @@ def sync_time():
         print("время синхронизировано, сдвиг", _offset["ms"], "мс")
     except Exception as e:
         print("time sync error:", e)
+
+
+def signed_post(path, params=None):
+    p = dict(params or {})
+    p["timestamp"] = int(time.time() * 1000) + _offset["ms"]
+    p["recvWindow"] = 10000
+    q = urllib.parse.urlencode(p)
+    sig = hmac.new(BINANCE_SECRET.encode(), q.encode(), hashlib.sha256).hexdigest()
+    r = requests.post(FAPI + path + "?" + q + "&signature=" + sig,
+                      headers={"X-MBX-APIKEY": BINANCE_KEY}, timeout=20)
+    d = r.json()
+    if isinstance(d, dict) and "code" in d and "msg" in d and d.get("code") != 200:
+        raise Exception("Binance: " + str(d.get("code")) + " " + str(d.get("msg")))
+    return d
+
+
+_filters = {}
+
+
+def load_filters():
+    """шаг лота, шаг цены и мин. нотионал по каждому фьючерсному символу"""
+    try:
+        d = requests.get(FAPI + "/fapi/v1/exchangeInfo", timeout=25).json()
+        for s in d.get("symbols", []):
+            if s.get("contractType") != "PERPETUAL" or s.get("quoteAsset") != "USDT":
+                continue
+            if s.get("status") != "TRADING":
+                continue
+            f = {"step": 0.001, "tick": 0.0001, "minQty": 0.0, "minNot": 5.0}
+            for x in s.get("filters", []):
+                t = x.get("filterType")
+                if t == "LOT_SIZE":
+                    f["step"] = float(x["stepSize"]); f["minQty"] = float(x["minQty"])
+                elif t == "PRICE_FILTER":
+                    f["tick"] = float(x["tickSize"])
+                elif t in ("MIN_NOTIONAL", "NOTIONAL"):
+                    f["minNot"] = float(x.get("notional") or x.get("minNotional") or 5)
+            _filters[s["symbol"]] = f
+        print("фильтров загружено:", len(_filters))
+    except Exception as e:
+        print("exchangeInfo error:", e)
+
+
+def step_round(v, step):
+    if step <= 0:
+        return v
+    n = math.floor(round(v / step, 8)) * step
+    d = max(0, -int(math.floor(math.log10(step)))) if step < 1 else 0
+    return round(n, d)
+
+
+def auto_symbol(sym):
+    """торгуем только прямые SYM+USDT — у 1000-контрактов другой масштаб цен"""
+    s = sym + "USDT"
+    return s if s in _filters else None
+
+
+def open_trade(chat_id, s):
+    """рыночный вход + TP и SL ордерами на бирже"""
+    fs = auto_symbol(s["sym"])
+    if not fs:
+        return False, "нет прямого фьючерса"
+    key = fs + s["side"] + str(int(s["entry"] * 1e6))
+    if key in opened_keys:
+        return False, "уже открывали"
+    f = _filters[fs]
+
+    try:
+        signed_post("/fapi/v1/leverage", {"symbol": fs, "leverage": LEVERAGE})
+    except Exception as e:
+        print("leverage:", e)
+
+    price = get_price(fs)
+    qty = step_round(SIZE / price, f["step"])
+    if qty < f["minQty"] or qty * price < f["minNot"]:
+        return False, "размер меньше минимума"
+
+    side = "BUY" if s["side"] == "long" else "SELL"
+    opp = "SELL" if side == "BUY" else "BUY"
+    cid = "otsk" + str(abs(hash(key)) % 10**10)
+
+    signed_post("/fapi/v1/order", {"symbol": fs, "side": side, "type": "MARKET",
+                                   "quantity": qty, "newClientOrderId": cid})
+    opened_keys.add(key)
+
+    tp = step_round(s["tp"], f["tick"])
+    sl = step_round(s["sl"], f["tick"])
+    warn = ""
+    for typ, sp in (("TAKE_PROFIT_MARKET", tp), ("STOP_MARKET", sl)):
+        try:
+            signed_post("/fapi/v1/order", {"symbol": fs, "side": opp, "type": typ,
+                                           "stopPrice": sp, "closePosition": "true",
+                                           "workingType": "MARK_PRICE",
+                                           "timeInForce": "GTE_GTC"})
+        except Exception as e:
+            warn += "\n⚠️ не встал " + typ + ": " + str(e)
+    return True, ("qty " + str(qty) + " · $" + str(round(qty * price)) + warn)
 
 
 def signed_get(path, params=None):
@@ -100,12 +209,17 @@ def binance_income(start_ms, symbol=None, end_ms=None):
 
 
 def stats_start_ms():
-    try:
-        y, mo, d = [int(x) for x in STATS_START.split("-")]
-        return int(time.mktime((y, mo, d, 0, 0, 0, 0, 0, 0)) - time.timezone) * 1000
-    except Exception:
-        now = int(time.time())
-        return ((now - (now % 86400)) - 86400) * 1000
+    """STATS_START задаётся по Москве, Binance хочет миллисекунды UTC"""
+    s = STATS_START.replace("T", " ").strip()
+    for f in ("%Y-%m-%d %H:%M", "%Y-%m-%d"):
+        try:
+            dt = datetime.strptime(s, f).replace(tzinfo=MSK)
+            return int(dt.timestamp() * 1000)
+        except ValueError:
+            continue
+    print("STATS_START не разобран, беру вчера:", STATS_START)
+    now = int(time.time())
+    return ((now - (now % 86400)) - 86400) * 1000
 
 
 def income_all(start_ms, symbol=None):
@@ -180,6 +294,7 @@ def menu():
     kb = types.ReplyKeyboardMarkup(resize_keyboard=True)
     kb.row("🔍 Найти отскоки")
     kb.row("📋 Мои сделки", "📊 Статистика")
+    kb.row("🤖 Автоторговля")
     kb.row("🗑 Очистить")
     return kb
 
@@ -475,7 +590,7 @@ def classify(s, net):
 def start(m):
     users.add(m.chat.id)
     save()
-    k = ("✅ Binance подключён — статистика с " + STATS_START + " по реальным сделкам.") if has_keys() \
+    k = ("✅ Binance подключён — статистика с " + STATS_START + " МСК по реальным сделкам.") if has_keys() \
         else "⚠️ Binance не подключён — добавь ключи в Railway."
     bot.send_message(m.chat.id,
         "Отскок от уровней 4ч 🎯\nСигналы только по ЗАКРЫТЫМ свечам.\n"
@@ -542,7 +657,7 @@ def btn_stats(m):
     try:
         rows = income_all(stats_start_ms())
         if not rows:
-            bot.send_message(m.chat.id, "📊 С " + STATS_START + " закрытых сделок нет.", reply_markup=menu())
+            bot.send_message(m.chat.id, "📊 С " + STATS_START + " МСК закрытых сделок нет.", reply_markup=menu())
             return
 
         tot = split_income(rows)
@@ -573,7 +688,7 @@ def btn_stats(m):
         upnl = sum(v["upnl"] for v in pos.values())
 
         L = []
-        L.append("📊 ОТСКОК 1:3 · с " + STATS_START)
+        L.append("📊 ОТСКОК 1:3 · с " + STATS_START + " МСК")
         L.append(str(total) + " монет · " + str(tot["n"]) + " закрытий")
         L.append("")
         L.append("💵 Чистыми:  " + money(real))
@@ -603,6 +718,31 @@ def btn_stats(m):
     except Exception as e:
         bot.send_message(m.chat.id, "Ошибка Binance: " + str(e) +
                          "\n\nПроверь ключи от testnet.binancefuture.com.", reply_markup=menu())
+
+
+@bot.message_handler(func=lambda m: m.text == "🤖 Автоторговля")
+def btn_auto(m):
+    global auto_on
+    if not has_keys():
+        bot.send_message(m.chat.id, "⚠️ Нет ключей Binance.", reply_markup=menu())
+        return
+    auto_on = not auto_on
+    if auto_on:
+        try:
+            pos = len(binance_positions())
+        except Exception:
+            pos = "?"
+        grd = "только 🟢 (5+/6)" if AUTO_MIN_PTS >= 5 else "🟢 и 🟡 (" + str(AUTO_MIN_PTS) + "+/6)"
+        bot.send_message(m.chat.id,
+            "🤖 АВТОТОРГОВЛЯ ВКЛЮЧЕНА\n\n"
+            "Вхожу: " + grd + "\n"
+            "Размер: $" + str(SIZE) + " · плечо " + str(LEVERAGE) + "x\n"
+            "Потолок: " + str(MAX_POS) + " позиций (сейчас " + str(pos) + ")\n"
+            "TP/SL ставлю ордерами сразу при входе\n\n"
+            "Фильтр BTC работает. Руками не трогай — иначе статистика опять поедет.",
+            reply_markup=menu())
+    else:
+        bot.send_message(m.chat.id, "🤖 Автоторговля ВЫКЛЮЧЕНА.\nОткрытые позиции не трогаю — их закроют TP/SL.", reply_markup=menu())
 
 
 @bot.message_handler(func=lambda m: m.text == "🗑 Очистить")
@@ -708,6 +848,9 @@ def do_scan(chat_id, manual=False):
         if skipped:
             head += "\n(" + str(skipped) + " уже в трекинге)"
         bot.send_message(chat_id, head)
+        if auto_on and has_keys():
+            auto_enter(chat_id, fresh)
+
         for s in fresh[:8]:
             ikb = types.InlineKeyboardMarkup()
             cb = "t:" + s["sym"] + ":" + s["side"] + ":" + format(s["entry"], ".6f") + ":" + format(s["sl"], ".6f") + ":" + format(s["tp"], ".6f")
@@ -721,6 +864,49 @@ def do_scan(chat_id, manual=False):
         print("scan error:", e)
         if manual:
             bot.send_message(chat_id, "Ошибка при поиске, попробуй ещё раз.", reply_markup=menu())
+
+
+def auto_enter(chat_id, fresh):
+    """открываем сами: только сильные сигналы, не больше MAX_POS позиций"""
+    try:
+        pos = binance_positions()
+    except Exception as e:
+        print("auto positions:", e)
+        return
+    free = MAX_POS - len(pos)
+    if free <= 0:
+        bot.send_message(chat_id, "🤖 занято " + str(len(pos)) + "/" + str(MAX_POS) + " — не вхожу")
+        return
+    for s in fresh:
+        if free <= 0:
+            break
+        if grade(s)[0] < AUTO_MIN_PTS:
+            continue
+        fs = auto_symbol(s["sym"])
+        if not fs or fs in pos:
+            continue
+        try:
+            ok, info = open_trade(chat_id, s)
+        except Exception as e:
+            bot.send_message(chat_id, "🤖 ❌ " + s["sym"] + ": " + str(e))
+            continue
+        if not ok:
+            continue
+        free -= 1
+        tracked.setdefault(chat_id, [])
+        if not any(x["sym"] == s["sym"] for x in tracked[chat_id]):
+            tracked[chat_id].append({"sym": s["sym"], "side": s["side"], "entry": s["entry"],
+                                     "sl": s["sl"], "tp": s["tp"], "be": False, "bn": False,
+                                     "a_tp": False, "a_sl": False, "auto": True,
+                                     "t0": int(time.time() * 1000)})
+        save()
+        bot.send_message(chat_id,
+            "🤖 ОТКРЫЛ " + s["sym"] + " " + ("ЛОНГ" if s["side"] == "long" else "ШОРТ")
+            + "  " + grade(s)[1] + "\n"
+            "📍 " + fmt(s["entry"]) + " · " + info + "\n"
+            "🛑 " + fmt(s["sl"]) + "  🎯 " + fmt(s["tp"]) + "\n"
+            "TP и SL стоят ордерами. Руками не трогаем.", reply_markup=menu())
+        time.sleep(1)
 
 
 def sync_binance():
@@ -868,11 +1054,14 @@ def auto_loop():
 load()
 if has_keys():
     sync_time()
+    load_filters()
     try:
         p = binance_positions()
         print("Binance OK, открытых позиций:", len(p))
     except Exception as e:
         print("Binance ключи не работают:", e)
+    print("автоторговля:", "ВКЛ" if auto_on else "выкл",
+          "| мин. оценка", AUTO_MIN_PTS, "| потолок", MAX_POS, "| плечо", LEVERAGE)
 else:
     print("Binance ключи не заданы — работаю в расчётном режиме")
 threading.Thread(target=auto_loop, daemon=True).start()
