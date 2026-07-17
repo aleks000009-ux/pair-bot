@@ -1,6 +1,9 @@
 import os
 import json
 import time
+import hmac
+import hashlib
+import urllib.parse
 import threading
 import telebot
 from telebot import types
@@ -9,6 +12,14 @@ import numpy as np
 
 TOKEN = os.environ.get("BOT_TOKEN")
 bot = telebot.TeleBot(TOKEN)
+
+# ---------- Binance приватный доступ (демо/тестнет) ----------
+BINANCE_KEY = os.environ.get("BINANCE_KEY", "").strip()
+BINANCE_SECRET = os.environ.get("BINANCE_SECRET", "").strip()
+FAPI = os.environ.get("FAPI_BASE", "https://testnet.binancefuture.com").rstrip("/")
+
+# с какой даты считаем статистику (UTC). меняется переменной STATS_START в Railway
+STATS_START = os.environ.get("STATS_START", "2026-07-16").strip()
 
 SIZE = 1000
 RSI_LEVEL = 40
@@ -19,12 +30,125 @@ RR = 3
 ATR_BUF = 0.5
 MAX_COINS = 200
 FEE = 0.055
-DB = "trades.json"
+
+# если подключишь Railway Volume и укажешь DATA_DIR=/data — статистика переживёт редеплой
+DATA_DIR = os.environ.get("DATA_DIR", ".").rstrip("/")
+DB = DATA_DIR + "/trades.json"
 
 tracked = {}
 users = set()
 sent_signals = {}
-history = {}   # {chat_id: [ {sym, side, result, pnl, entry, exit} ]}
+history = {}   # {chat_id: [ {sym, side, result, pnl, entry, exit, fee, fund, src} ]}
+
+
+def has_keys():
+    return bool(BINANCE_KEY and BINANCE_SECRET)
+
+
+_offset = {"ms": 0}
+
+
+def sync_time():
+    try:
+        r = requests.get(FAPI + "/fapi/v1/time", timeout=10).json()
+        _offset["ms"] = int(r["serverTime"]) - int(time.time() * 1000)
+        print("время синхронизировано, сдвиг", _offset["ms"], "мс")
+    except Exception as e:
+        print("time sync error:", e)
+
+
+def signed_get(path, params=None):
+    p = dict(params or {})
+    p["timestamp"] = int(time.time() * 1000) + _offset["ms"]
+    p["recvWindow"] = 10000
+    q = urllib.parse.urlencode(p)
+    sig = hmac.new(BINANCE_SECRET.encode(), q.encode(), hashlib.sha256).hexdigest()
+    url = FAPI + path + "?" + q + "&signature=" + sig
+    r = requests.get(url, headers={"X-MBX-APIKEY": BINANCE_KEY}, timeout=20)
+    d = r.json()
+    if isinstance(d, dict) and "code" in d and "msg" in d:
+        raise Exception("Binance: " + str(d.get("code")) + " " + str(d.get("msg")))
+    return d
+
+
+def binance_positions():
+    """{'SYMBOL': {'amt':..,'entry':..,'upnl':..}} только реально открытые"""
+    d = signed_get("/fapi/v2/positionRisk")
+    out = {}
+    for x in d:
+        try:
+            amt = float(x.get("positionAmt", 0))
+        except Exception:
+            continue
+        if abs(amt) > 0:
+            out[x["symbol"]] = {"amt": amt,
+                                "entry": float(x.get("entryPrice", 0) or 0),
+                                "upnl": float(x.get("unRealizedProfit", 0) or 0)}
+    return out
+
+
+def binance_income(start_ms, symbol=None, end_ms=None):
+    p = {"startTime": int(start_ms), "limit": 1000}
+    if end_ms:
+        p["endTime"] = int(end_ms)
+    if symbol:
+        p["symbol"] = symbol
+    d = signed_get("/fapi/v1/income", p)
+    return d if isinstance(d, list) else []
+
+
+def stats_start_ms():
+    try:
+        y, mo, d = [int(x) for x in STATS_START.split("-")]
+        return int(time.mktime((y, mo, d, 0, 0, 0, 0, 0, 0)) - time.timezone) * 1000
+    except Exception:
+        now = int(time.time())
+        return ((now - (now % 86400)) - 86400) * 1000
+
+
+def income_all(start_ms, symbol=None):
+    """Binance отдаёт максимум 7 дней за запрос — тянем кусками"""
+    out = []
+    week = 7 * 86400 * 1000
+    cur = int(start_ms)
+    end = int(time.time() * 1000) + 60000
+    guard = 0
+    while cur < end and guard < 30:
+        guard += 1
+        stop = min(cur + week, end)
+        try:
+            out.extend(binance_income(cur, symbol, stop))
+        except Exception as e:
+            print("income chunk error:", e)
+        cur = stop
+        time.sleep(0.2)
+    return out
+
+
+def split_income(rows):
+    r = {"pnl": 0.0, "fee": 0.0, "fund": 0.0, "other": 0.0, "n": 0}
+    for x in rows:
+        try:
+            v = float(x.get("income", 0))
+        except Exception:
+            continue
+        t = x.get("incomeType", "")
+        if t == "REALIZED_PNL":
+            r["pnl"] += v
+            r["n"] += 1
+        elif t == "COMMISSION":
+            r["fee"] += v
+        elif t == "FUNDING_FEE":
+            r["fund"] += v
+        else:
+            r["other"] += v
+    return r
+
+
+def fut_candidates(sym):
+    """на фьючах бывают 1000-контракты: SHIB -> 1000SHIBUSDT"""
+    return [sym + "USDT", "1000" + sym + "USDT"]
+
 
 def save():
     try:
@@ -35,6 +159,7 @@ def save():
     except Exception as e:
         print("save error:", e)
 
+
 def load():
     global tracked, users, history
     try:
@@ -43,9 +168,11 @@ def load():
         tracked = {int(k): v for k, v in d.get("tracked", {}).items()}
         users = set(d.get("users", []))
         history = {int(k): v for k, v in d.get("history", {}).items()}
-        print("загружено: сделок", sum(len(v) for v in tracked.values()), "| история", sum(len(v) for v in history.values()))
+        print("загружено: сделок", sum(len(v) for v in tracked.values()),
+              "| история", sum(len(v) for v in history.values()))
     except Exception:
         print("нет сохранённых данных, старт с нуля")
+
 
 def menu():
     kb = types.ReplyKeyboardMarkup(resize_keyboard=True)
@@ -53,6 +180,7 @@ def menu():
     kb.row("📋 Мои сделки", "📊 Статистика")
     kb.row("🗑 Очистить")
     return kb
+
 
 def get_klines(symbol, limit=250):
     url = f"https://data-api.binance.vision/api/v3/klines?symbol={symbol}&interval=4h&limit={limit}"
@@ -62,12 +190,14 @@ def get_klines(symbol, limit=250):
     return [{"o": float(c[1]), "h": float(c[2]), "l": float(c[3]),
              "c": float(c[4]), "v": float(c[5]), "close_t": int(c[6])} for c in r]
 
+
 def get_price(symbol):
     url = f"https://data-api.binance.vision/api/v3/ticker/price?symbol={symbol}"
     r = requests.get(url, timeout=15).json()
     if "price" not in r:
         raise Exception("нет цены " + symbol)
     return float(r["price"])
+
 
 def rsi(closes, period=14):
     c = np.array(closes)
@@ -85,6 +215,7 @@ def rsi(closes, period=14):
         return 100.0
     return 100 - (100 / (1 + ag / al))
 
+
 def atr(kl, period=14):
     if len(kl) < period + 1:
         return None
@@ -93,6 +224,7 @@ def atr(kl, period=14):
         h, l, pc = kl[i]["h"], kl[i]["l"], kl[i-1]["c"]
         trs.append(max(h - l, abs(h - pc), abs(l - pc)))
     return float(np.mean(trs[-period:]))
+
 
 def ema(closes, period):
     c = np.array(closes, dtype=float)
@@ -103,6 +235,7 @@ def ema(closes, period):
     for p in c[period:]:
         e = p * k + e * (1 - k)
     return float(e)
+
 
 def find_levels(kl, kind):
     lv = []
@@ -116,6 +249,7 @@ def find_levels(kl, kind):
             if v > kl[i-1]["h"] and v > kl[i-2]["h"] and v > kl[i+1]["h"] and v > kl[i+2]["h"]:
                 lv.append(v)
     return lv
+
 
 def detect_reversal(kl, side):
     if len(kl) < 2:
@@ -140,12 +274,14 @@ def detect_reversal(kl, side):
             return "🫷 Поглощение"
     return None
 
+
 def top_coins():
     url = "https://data-api.binance.vision/api/v3/ticker/24hr"
     r = requests.get(url, timeout=25).json()
     usdt = [x for x in r if x["symbol"].endswith("USDT")]
     usdt.sort(key=lambda x: float(x["quoteVolume"]), reverse=True)
     return [x["symbol"].replace("USDT", "") for x in usdt[:MAX_COINS]]
+
 
 def analyze(sym):
     raw = get_klines(sym + "USDT")
@@ -205,16 +341,23 @@ def analyze(sym):
                                     "rsi": r, "vr": vr, "pat": pat, "dist": dist})
     return out
 
+
 def fmt(p):
     if p >= 100: return format(p, ".2f")
     if p >= 1: return format(p, ".4f")
     return format(p, ".6f")
+
+
+def money(v):
+    return ("+" if v >= 0 else "-") + "$" + format(abs(v), ".2f")
+
 
 def pnl_usd(s, price):
     qty = SIZE / s["entry"]
     if s["side"] == "long":
         return qty * (price - s["entry"])
     return qty * (s["entry"] - price)
+
 
 def card(s):
     qty = SIZE / s["entry"]
@@ -243,19 +386,52 @@ def card(s):
         "⚙️ плечо 1х!"
     )
 
+
 def close_trade(chat_id, s, price, result):
+    """расчётное закрытие (когда позиции на бирже не видно)"""
     p = pnl_usd(s, price) - SIZE * FEE / 100 * 2
     history.setdefault(chat_id, [])
     history[chat_id].append({"sym": s["sym"], "side": s["side"], "result": result,
                              "pnl": round(p, 2), "entry": s["entry"], "exit": price,
-                             "t": int(time.time())})
+                             "fee": round(-SIZE * FEE / 100 * 2, 2), "fund": 0.0,
+                             "src": "calc", "t": int(time.time())})
     return p
+
+
+def close_trade_real(chat_id, s, inc, result):
+    """реальное закрытие по данным Binance"""
+    net = inc["pnl"] + inc["fee"] + inc["fund"]
+    history.setdefault(chat_id, [])
+    history[chat_id].append({"sym": s["sym"], "side": s["side"], "result": result,
+                             "pnl": round(net, 2), "entry": s.get("bn_entry", s["entry"]),
+                             "exit": 0, "gross": round(inc["pnl"], 2),
+                             "fee": round(inc["fee"], 2), "fund": round(inc["fund"], 2),
+                             "src": "binance", "t": int(time.time())})
+    return net
+
+
+def classify(s, net):
+    """тейк / стоп / безубыток по реальному результату"""
+    qty = s.get("bn_qty") or (SIZE / s["entry"])
+    ent = s.get("bn_entry") or s["entry"]
+    risk = qty * abs(ent - s["sl"])
+    if risk > 0 and abs(net) < risk * 0.25:
+        return "be"
+    return "tp" if net > 0 else "sl"
+
+
+# ---------- хендлеры ----------
 
 @bot.message_handler(commands=['start'])
 def start(m):
     users.add(m.chat.id)
     save()
-    bot.send_message(m.chat.id, "Отскок от уровней 4ч 🎯\nСигналы только по ЗАКРЫТЫМ свечам.\nATR-стоп, тейк 1:3, безубыток на полпути.\nВедётся статистика сделок.", reply_markup=menu())
+    k = ("✅ Binance подключён — статистика с " + STATS_START + " по реальным сделкам.") if has_keys() \
+        else "⚠️ Binance не подключён — добавь ключи в Railway."
+    bot.send_message(m.chat.id,
+        "Отскок от уровней 4ч 🎯\nСигналы только по ЗАКРЫТЫМ свечам.\n"
+        "ATR-стоп, тейк 1:3, безубыток на полпути.\n\n" + k, reply_markup=menu())
+
 
 @bot.message_handler(func=lambda m: m.text == "🔍 Найти отскоки")
 def btn_scan(m):
@@ -263,6 +439,7 @@ def btn_scan(m):
     save()
     bot.send_message(m.chat.id, "Сканирую топ-200 монет на 4ч... жди 5-8 мин")
     do_scan(m.chat.id, manual=True)
+
 
 @bot.message_handler(func=lambda m: m.text == "📋 Мои сделки")
 def btn_list(m):
@@ -283,63 +460,122 @@ def btn_list(m):
             else:
                 to_tp = (p - s["tp"]) / p * 100
                 to_sl = (s["sl"] - p) / p * 100
-            sign = "+" if pnl >= 0 else "-"
             emo = "🟢" if pnl >= 0 else "🔴"
             be = "\n🛡 стоп в безубытке" if s.get("be") else ""
+            if s.get("bn"):
+                link = "\n🔗 открыта на Binance (" + s.get("bn_sym", "") + ")"
+            elif has_keys():
+                link = "\n⏳ на Binance пока не вижу позицию"
+            else:
+                link = ""
             txt = (
                 emo + " " + s["sym"] + " " + ("ЛОНГ" if s["side"] == "long" else "ШОРТ") + "\n\n"
-                "💵 Сейчас: " + sign + "$" + format(abs(pnl), ".2f") + "\n"
+                "💵 Расчётно: " + money(pnl) + "\n"
                 "📍 Вход: " + fmt(s["entry"]) + "\n"
                 "💰 Цена: " + fmt(p) + "\n\n"
                 "🛑 Стоп: " + fmt(s["sl"]) + "  (-$" + str(round(risk_usd)) + ")\n"
                 "🎯 Тейк: " + fmt(s["tp"]) + "  (+$" + str(round(prof_usd)) + ")\n\n"
                 "до тейка " + format(to_tp, ".2f") + "% · до стопа " + format(to_sl, ".2f") + "%"
-                + be
+                + be + link
             )
             bot.send_message(m.chat.id, txt, reply_markup=menu())
         except Exception:
             bot.send_message(m.chat.id, s["sym"] + ": не удалось получить цену")
         time.sleep(0.4)
 
+
 @bot.message_handler(func=lambda m: m.text == "📊 Статистика")
 def btn_stats(m):
-    h = history.get(m.chat.id, [])
-    if not h:
-        bot.send_message(m.chat.id, "📊 Пока нет закрытых сделок.\nСтатистика появится после первого тейка или стопа.", reply_markup=menu())
+    if not has_keys():
+        bot.send_message(m.chat.id, "⚠️ Binance не подключён.\nДобавь BINANCE_KEY и BINANCE_SECRET в Railway → Variables.", reply_markup=menu())
         return
-    total = len(h)
-    wins = [x for x in h if x["result"] == "tp"]
-    losses = [x for x in h if x["result"] == "sl"]
-    bes = [x for x in h if x["result"] == "be"]
-    money = sum(x["pnl"] for x in h)
-    wr = round(len(wins) / total * 100)
-    avg_w = round(np.mean([x["pnl"] for x in wins]), 1) if wins else 0
-    avg_l = round(np.mean([abs(x["pnl"]) for x in losses]), 1) if losses else 0
-    verdict = "✅ стратегия в плюсе" if money > 0 else "❌ пока в минусе"
-    if total < 15:
-        verdict += "\n⚠️ выборка мала (" + str(total) + "/20), рано судить"
-    txt = (
-        "📊 СТАТИСТИКА (" + str(total) + " сделок)\n\n"
-        "🎯 Тейк: " + str(len(wins)) + " (" + str(wr) + "%)\n"
-        "🛑 Стоп: " + str(len(losses)) + "\n"
-        "🛡 Безубыток: " + str(len(bes)) + "\n\n"
-        "💵 Итого: " + ("+" if money >= 0 else "") + "$" + str(round(money, 2)) + "\n"
-        "Средний плюс: +$" + str(avg_w) + "\n"
-        "Средний минус: -$" + str(avg_l) + "\n\n"
-        + verdict + "\n\n"
-        "Последние 5:\n"
-    )
-    for x in h[-5:][::-1]:
-        ic = "🎯" if x["result"] == "tp" else ("🛑" if x["result"] == "sl" else "🛡")
-        sg = "+" if x["pnl"] >= 0 else ""
-        txt += ic + " " + x["sym"] + " " + sg + "$" + str(x["pnl"]) + "\n"
-    bot.send_message(m.chat.id, txt, reply_markup=menu())
+    bot.send_message(m.chat.id, "Тяну реальные сделки с Binance...")
+    try:
+        rows = income_all(stats_start_ms())
+        if not rows:
+            bot.send_message(m.chat.id, "📊 С " + STATS_START + " закрытых сделок на Binance нет.", reply_markup=menu())
+            return
+
+        tot = split_income(rows)
+        net = tot["pnl"] + tot["fee"] + tot["fund"] + tot["other"]
+
+        # группируем по монете: одна монета = одна сделка (один цикл позиции)
+        by = {}
+        for x in rows:
+            by.setdefault(x.get("symbol") or "—", []).append(x)
+        trades = []
+        for sym, rr in by.items():
+            d = split_income(rr)
+            if d["n"] == 0:
+                continue                      # только фандинг/комиссия, позиция ещё открыта
+            trades.append({"sym": sym, "net": d["pnl"] + d["fee"] + d["fund"],
+                           "gross": d["pnl"], "fee": d["fee"], "fund": d["fund"]})
+        trades.sort(key=lambda x: x["net"])
+
+        wins = [x for x in trades if x["net"] > 0]
+        losses = [x for x in trades if x["net"] < 0]
+        total = len(trades)
+        wr = round(len(wins) / total * 100) if total else 0
+        avg_w = round(np.mean([x["net"] for x in wins]), 2) if wins else 0
+        avg_l = round(np.mean([abs(x["net"]) for x in losses]), 2) if losses else 0
+        rr_fact = round(avg_w / avg_l, 2) if avg_l > 0 else 0
+
+        txt = ("📊 СТАТИСТИКА с " + STATS_START + "\n"
+               "🔗 по фактическим данным Binance\n\n"
+               "Монет закрыто: " + str(total) + "  ·  закрытий: " + str(tot["n"]) + "\n"
+               "🟢 В плюс: " + str(len(wins)) + " (" + str(wr) + "%)\n"
+               "🔴 В минус: " + str(len(losses)) + "\n\n"
+               "📈 Грязный PnL: " + money(tot["pnl"]) + "\n"
+               "💸 Комиссии: " + money(tot["fee"]) + "\n"
+               "💱 Фандинг: " + money(tot["fund"]) + "\n")
+        if abs(tot["other"]) > 0.009:
+            txt += "➕ Прочее: " + money(tot["other"]) + "\n"
+        txt += "━━━━━━━━━━\n💵 ЧИСТЫМИ: " + money(net) + "\n\n"
+
+        if avg_w or avg_l:
+            txt += ("Средний плюс: +$" + format(avg_w, ".2f") + "\n"
+                    "Средний минус: -$" + format(avg_l, ".2f") + "\n")
+            if rr_fact:
+                txt += "Фактический R:R: 1:" + format(rr_fact, ".2f") + "  (цель 1:3)\n"
+        if tot["pnl"] != 0:
+            drag = abs(tot["fee"]) / abs(tot["pnl"]) * 100
+            txt += "⚖️ Комиссии съели " + format(drag, ".0f") + "% грязного PnL\n"
+
+        txt += "\nПо монетам:\n"
+        for x in trades[:15]:
+            ic = "🟢" if x["net"] > 0 else "🔴"
+            txt += ic + " " + x["sym"] + " " + money(x["net"]) + "  (комис " + money(x["fee"]) + ")\n"
+
+        try:
+            pos = binance_positions()
+            if pos:
+                up = sum(v["upnl"] for v in pos.values())
+                txt += "\n📌 Открыто сейчас: " + str(len(pos)) + " · плавающий " + money(up) + "\n"
+                for sym, v in pos.items():
+                    sd = "ЛОНГ" if v["amt"] > 0 else "ШОРТ"
+                    txt += "• " + sym + " " + sd + " · вход " + fmt(v["entry"]) + " · " + money(v["upnl"]) + "\n"
+            else:
+                txt += "\n📌 Открытых позиций нет.\n"
+        except Exception:
+            pass
+
+        if total < 15:
+            txt += "\n⚠️ " + str(total) + " сделок — рано судить о стратегии. Нужно 15-20."
+        else:
+            txt += "\n" + ("✅ стратегия в плюсе" if net > 0 else "❌ стратегия в минусе")
+
+        bot.send_message(m.chat.id, txt, reply_markup=menu())
+    except Exception as e:
+        bot.send_message(m.chat.id, "Ошибка Binance: " + str(e) +
+                         "\n\nПроверь ключи от testnet.binancefuture.com.", reply_markup=menu())
+
 
 @bot.message_handler(func=lambda m: m.text == "🗑 Очистить")
 def btn_clear(m):
     tracked[m.chat.id] = []
     save()
     bot.send_message(m.chat.id, "Отслеживание снято. Статистика сохранена.", reply_markup=menu())
+
 
 @bot.callback_query_handler(func=lambda c: c.data.startswith("t:"))
 def cb_track(c):
@@ -351,21 +587,25 @@ def cb_track(c):
             bot.answer_callback_query(c.id, sym + " уже отслеживается")
             return
         tracked[c.message.chat.id].append({"sym": sym, "side": side, "entry": entry,
-                                           "sl": sl, "tp": tp, "be": False})
+                                           "sl": sl, "tp": tp, "be": False,
+                                           "bn": False, "a_tp": False, "a_sl": False,
+                                           "t0": int(time.time() * 1000)})
         save()
         qty = SIZE / entry
         risk_usd = qty * abs(entry - sl)
         prof_usd = qty * abs(tp - entry)
         bot.answer_callback_query(c.id, "Отслеживаю " + sym)
+        tail = "\nКак откроешь на Binance — подхвачу позицию и буду считать по факту." if has_keys() else ""
         bot.send_message(c.message.chat.id,
             "✅ " + sym + " на отслеживании\n\n"
             "📍 Вход: " + fmt(entry) + "\n"
             "🛑 Стоп: " + fmt(sl) + "  (-$" + str(round(risk_usd)) + ")\n"
             "🎯 Тейк: " + fmt(tp) + "  (+$" + str(round(prof_usd)) + ")\n\n"
-            "Пришлю алерт на тейк, стоп и безубыток.", reply_markup=menu())
+            "Пришлю алерт на тейк, стоп и безубыток." + tail, reply_markup=menu())
     except Exception as e:
         print("track error:", e)
         bot.answer_callback_query(c.id, "Ошибка")
+
 
 def do_scan(chat_id, manual=False):
     try:
@@ -380,19 +620,29 @@ def do_scan(chat_id, manual=False):
                 pass
             time.sleep(0.12)
         sent_signals.setdefault(chat_id, {})
+        # анти-дубль: монета уже в трекинге -> сигнал не шлём
+        busy = {x["sym"] for x in tracked.get(chat_id, [])}
+        skipped = 0
         fresh = []
         now = time.time()
         for s in found:
+            if s["sym"] in busy:
+                skipped += 1
+                continue
             key = s["sym"] + s["side"]
             if manual or (now - sent_signals[chat_id].get(key, 0) > 8 * 3600):
                 fresh.append(s)
                 sent_signals[chat_id][key] = now
         if not fresh:
             if manual:
-                bot.send_message(chat_id, "Отскоков сейчас нет: цена ни у одного уровня (≤0.8%) при RSI на краю.", reply_markup=menu())
+                extra = ("\n(" + str(skipped) + " пропущено — уже в трекинге)") if skipped else ""
+                bot.send_message(chat_id, "Отскоков сейчас нет: цена ни у одного уровня (≤0.8%) при RSI на краю." + extra, reply_markup=menu())
             return
         fresh.sort(key=lambda s: (s["pat"] == "нет разворотной", s["risk_pct"]))
-        bot.send_message(chat_id, "Нашёл " + str(len(fresh)) + " отскок(ов):")
+        head = "Нашёл " + str(len(fresh)) + " отскок(ов):"
+        if skipped:
+            head += "\n(" + str(skipped) + " пропущено — уже в трекинге)"
+        bot.send_message(chat_id, head)
         for s in fresh[:8]:
             ikb = types.InlineKeyboardMarkup()
             cb = "t:" + s["sym"] + ":" + s["side"] + ":" + format(s["entry"], ".6f") + ":" + format(s["sl"], ".6f") + ":" + format(s["tp"], ".6f")
@@ -407,32 +657,120 @@ def do_scan(chat_id, manual=False):
         if manual:
             bot.send_message(chat_id, "Ошибка при поиске, попробуй ещё раз.", reply_markup=menu())
 
+
+def sync_binance():
+    """сверяем трекинг с реальными позициями на бирже"""
+    if not has_keys() or not tracked:
+        return False
+    try:
+        pos = binance_positions()
+    except Exception as e:
+        print("positions error:", e)
+        return False
+    changed = False
+    for chat_id, lst in list(tracked.items()):
+        for s in list(lst):
+            hit = None
+            for cand in fut_candidates(s["sym"]):
+                if cand in pos:
+                    hit = cand
+                    break
+            if hit:
+                if not s.get("bn"):
+                    s["bn"] = True
+                    s["bn_sym"] = hit
+                    s["bn_qty"] = abs(pos[hit]["amt"])
+                    s["bn_entry"] = pos[hit]["entry"] or s["entry"]
+                    s["bn_t"] = int(time.time() * 1000) - 10 * 60 * 1000
+                    changed = True
+                    try:
+                        bot.send_message(chat_id, "🔗 " + s["sym"] + " вижу на Binance ("
+                                         + hit + ", " + ("ЛОНГ" if pos[hit]["amt"] > 0 else "ШОРТ")
+                                         + ", вход " + fmt(pos[hit]["entry"]) + ")\n"
+                                         "Дальше считаю по реальным данным биржи.")
+                    except Exception:
+                        pass
+            else:
+                if s.get("bn"):
+                    # позиция была, теперь её нет -> биржа закрыла
+                    try:
+                        rows = binance_income(s.get("bn_t", int(time.time() * 1000) - 86400000),
+                                              s.get("bn_sym", s["sym"] + "USDT"))
+                        inc = split_income(rows)
+                    except Exception as e:
+                        print("income error:", e)
+                        inc = {"pnl": 0.0, "fee": 0.0, "fund": 0.0, "other": 0.0, "n": 0}
+                    net = inc["pnl"] + inc["fee"] + inc["fund"]
+                    res = classify(s, net)
+                    close_trade_real(chat_id, s, inc, res)
+                    lst.remove(s)
+                    changed = True
+                    ic = "🎯" if res == "tp" else ("🛑" if res == "sl" else "🛡")
+                    try:
+                        bot.send_message(chat_id,
+                            ic + " " + s["sym"] + " ЗАКРЫТА НА BINANCE\n\n"
+                            "📈 Грязный PnL: " + money(inc["pnl"]) + "\n"
+                            "💸 Комиссии: " + money(inc["fee"]) + "\n"
+                            "💱 Фандинг: " + money(inc["fund"]) + "\n"
+                            "━━━━━━━━━━\n"
+                            "💵 Чистыми: " + money(net) + "\n\n"
+                            "Убрал из трекинга, записал в статистику.", reply_markup=menu())
+                    except Exception:
+                        pass
+    return changed
+
+
 def auto_loop():
     last = 0
+    last_sync = 0
     while True:
         try:
             changed = False
+            if time.time() - last_sync > 60:
+                last_sync = time.time()
+                if sync_binance():
+                    changed = True
+
             for chat_id, lst in list(tracked.items()):
                 for s in list(lst):
                     try:
                         p = get_price(s["sym"] + "USDT")
                         hit_tp = (p >= s["tp"]) if s["side"] == "long" else (p <= s["tp"])
                         hit_sl = (p <= s["sl"]) if s["side"] == "long" else (p >= s["sl"])
+                        on_bn = s.get("bn")
+
                         if hit_tp:
-                            pl = close_trade(chat_id, s, s["tp"], "tp")
-                            bot.send_message(chat_id, "🎯 ТЕЙК: " + s["sym"] + " дошёл до " + fmt(s["tp"]) + "!\nПрофит ≈ +$" + str(round(pl)) + "\nЗАКРЫВАЙ В ПЛЮС!", reply_markup=menu())
-                            lst.remove(s); changed = True
+                            if on_bn:
+                                # позицию ведёт биржа: только напоминаем, из трекинга не убираем
+                                if not s.get("a_tp"):
+                                    s["a_tp"] = True
+                                    changed = True
+                                    bot.send_message(chat_id, "🎯 ТЕЙК: " + s["sym"] + " дошёл до " + fmt(s["tp"]) + "!\nЗАКРЫВАЙ В ПЛЮС.\nКак закроешь — посчитаю реальный итог.", reply_markup=menu())
+                            else:
+                                pl = close_trade(chat_id, s, s["tp"], "tp")
+                                bot.send_message(chat_id, "🎯 ТЕЙК: " + s["sym"] + " дошёл до " + fmt(s["tp"]) + "!\nПрофит ≈ " + money(pl) + "\nЗАКРЫВАЙ В ПЛЮС!", reply_markup=menu())
+                                lst.remove(s); changed = True
                             continue
+
                         if hit_sl:
                             res = "be" if s.get("be") else "sl"
-                            pl = close_trade(chat_id, s, s["sl"], res)
-                            if res == "be":
-                                msg = "🛡 БЕЗУБЫТОК: " + s["sym"] + " вернулся ко входу. Вышел ~в ноль."
+                            if on_bn:
+                                if not s.get("a_sl"):
+                                    s["a_sl"] = True
+                                    changed = True
+                                    msg = ("🛡 БЕЗУБЫТОК: " + s["sym"] + " вернулся ко входу." ) if res == "be" \
+                                        else ("🛑 СТОП: " + s["sym"] + " пробил " + fmt(s["sl"]) + ".\nЗАКРЫВАЙ!")
+                                    bot.send_message(chat_id, msg + "\nКак закроешь — посчитаю реальный итог.", reply_markup=menu())
                             else:
-                                msg = "🛑 СТОП: " + s["sym"] + " пробил " + fmt(s["sl"]) + ".\nУбыток ≈ -$" + str(round(abs(pl))) + "\nЗАКРЫВАЙ!"
-                            bot.send_message(chat_id, msg, reply_markup=menu())
-                            lst.remove(s); changed = True
+                                pl = close_trade(chat_id, s, s["sl"], res)
+                                if res == "be":
+                                    msg = "🛡 БЕЗУБЫТОК: " + s["sym"] + " вернулся ко входу. Вышел ~в ноль."
+                                else:
+                                    msg = "🛑 СТОП: " + s["sym"] + " пробил " + fmt(s["sl"]) + ".\nУбыток ≈ " + money(pl) + "\nЗАКРЫВАЙ!"
+                                bot.send_message(chat_id, msg, reply_markup=menu())
+                                lst.remove(s); changed = True
                             continue
+
                         if not s.get("be"):
                             half = s["entry"] + (s["tp"] - s["entry"]) * 0.5
                             reached = (p >= half) if s["side"] == "long" else (p <= half)
@@ -447,6 +785,7 @@ def auto_loop():
                     except Exception:
                         pass
                     time.sleep(0.3)
+
             if changed:
                 save()
             if time.time() - last > 1800:
@@ -460,7 +799,17 @@ def auto_loop():
             print("loop error:", e)
         time.sleep(90)
 
+
 load()
+if has_keys():
+    sync_time()
+    try:
+        p = binance_positions()
+        print("Binance OK, открытых позиций:", len(p))
+    except Exception as e:
+        print("Binance ключи не работают:", e)
+else:
+    print("Binance ключи не заданы — работаю в расчётном режиме")
 threading.Thread(target=auto_loop, daemon=True).start()
 print("Бот отскоков запущен...")
 bot.infinity_polling()
