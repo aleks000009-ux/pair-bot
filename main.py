@@ -21,8 +21,7 @@ BINANCE_SECRET = os.environ.get("BINANCE_SECRET", "").strip()
 FAPI = os.environ.get("FAPI_BASE", "https://testnet.binancefuture.com").rstrip("/")
 
 # с какого момента считаем статистику. Время МОСКОВСКОЕ.
-# форматы: "2026-07-17 20:00" или "2026-07-17"
-STATS_START = os.environ.get("STATS_START", "2026-07-17 20:00").strip()
+STATS_START = os.environ.get("STATS_START", "2026-07-21 00:00").strip()
 MSK = timezone(timedelta(hours=3))
 
 SIZE = 1000
@@ -34,25 +33,35 @@ RR = 3
 ATR_BUF = 0.5
 MAX_COINS = 200
 FEE = 0.055
-BE_BAND = 5.0        # ±$5 вокруг нуля считаем безубытком
-BTC_FLAT = 0.7       # ±0.7% от EMA50 — рынок без выраженного направления
+BE_BAND = 5.0
+BTC_FLAT = 0.7
+
+# фильтр тренда самой монеты по MA99 (нейтральная зона ±%)
+MA_TREND_FLAT = float(os.environ.get("MA_TREND_FLAT", "0.3"))
+
+# мусорные/тестовые монеты — не торгуем и не показываем
+BLACKLIST = set(x.strip().upper() for x in os.environ.get(
+    "BLACKLIST", "币安人生,BINANCELIFE").split(",") if x.strip())
+
+# статистику по этим символам игнорируем (случайные ручные сделки)
+STATS_IGNORE = set(x.strip().upper() for x in os.environ.get(
+    "STATS_IGNORE", "BTCUSDT,ETHUSDT").split(",") if x.strip())
 
 # ---------- АВТОТОРГОВЛЯ ----------
-AUTO_TRADE = os.environ.get("AUTO_TRADE", "0") == "1"   # рубильник в Railway
-AUTO_MIN_PTS = int(os.environ.get("AUTO_MIN_PTS", "5"))  # 5 = только 🟢, 3 = 🟢+🟡
-MAX_POS = int(os.environ.get("MAX_POS", "4"))            # потолок одновременных позиций
-LEVERAGE = int(os.environ.get("LEVERAGE", "5"))          # маржа; нотионал всегда SIZE
+AUTO_TRADE = os.environ.get("AUTO_TRADE", "0") == "1"
+AUTO_MIN_PTS = int(os.environ.get("AUTO_MIN_PTS", "5"))
+MAX_POS = int(os.environ.get("MAX_POS", "6"))
+LEVERAGE = int(os.environ.get("LEVERAGE", "5"))
 auto_on = AUTO_TRADE
-opened_keys = set()   # защита от дублей при перезапуске
+opened_keys = set()
 
-# если подключишь Railway Volume и укажешь DATA_DIR=/data — статистика переживёт редеплой
 DATA_DIR = os.environ.get("DATA_DIR", ".").rstrip("/")
 DB = DATA_DIR + "/trades.json"
 
 tracked = {}
 users = set()
 sent_signals = {}
-history = {}   # {chat_id: [ {sym, side, result, pnl, entry, exit, fee, fund, src} ]}
+history = {}
 
 
 def has_keys():
@@ -89,7 +98,6 @@ _filters = {}
 
 
 def load_filters():
-    """шаг лота, шаг цены и мин. нотионал по каждому фьючерсному символу"""
     try:
         d = requests.get(FAPI + "/fapi/v1/exchangeInfo", timeout=25).json()
         for s in d.get("symbols", []):
@@ -121,19 +129,16 @@ def step_round(v, step):
 
 
 def auto_symbol(sym):
-    """торгуем только прямые SYM+USDT — у 1000-контрактов другой масштаб цен"""
     s = sym + "USDT"
     return s if s in _filters else None
 
 
 def place_cond(fs, side, typ, trig):
-    """условный ордер. Binance с 09.12.2025 требует /fapi/v1/algoOrder"""
     p = {"algoType": "CONDITIONAL", "symbol": fs, "side": side, "type": typ,
          "triggerPrice": trig, "closePosition": "true", "workingType": "MARK_PRICE"}
     try:
         return signed_post("/fapi/v1/algoOrder", p)
     except Exception as e:
-        # запасной путь на случай, если у биржи ещё старый режим
         if "-4120" in str(e):
             raise
         return signed_post("/fapi/v1/order", {"symbol": fs, "side": side, "type": typ,
@@ -142,15 +147,21 @@ def place_cond(fs, side, typ, trig):
                                               "timeInForce": "GTE_GTC"})
 
 
+def cancel_algo(fs):
+    """снять все условные ордера по символу (для перестановки стопа)"""
+    try:
+        signed_post("/fapi/v1/allOpenOrders", {"symbol": fs})
+    except Exception as e:
+        print("cancel_algo:", e)
+
+
 def close_now(fs, side, qty):
-    """аварийное закрытие: позиция без стопа недопустима"""
     opp = "SELL" if side == "BUY" else "BUY"
     return signed_post("/fapi/v1/order", {"symbol": fs, "side": opp, "type": "MARKET",
                                           "quantity": qty, "reduceOnly": "true"})
 
 
 def open_trade(chat_id, s):
-    """рыночный вход + TP и SL. Не встали оба ордера — позицию сразу закрываем."""
     fs = auto_symbol(s["sym"])
     if not fs:
         return False, "нет прямого фьючерса"
@@ -187,7 +198,6 @@ def open_trade(chat_id, s):
             errs.append(typ + ": " + str(e))
 
     if errs:
-        # позиция открыта, но не защищена — закрываем немедленно
         try:
             close_now(fs, side, qty)
             opened_keys.discard(key)
@@ -198,6 +208,30 @@ def open_trade(chat_id, s):
             return False, "не защищена, закрыть не удалось"
 
     return True, ("qty " + str(qty) + " · $" + str(round(qty * price)) + " · TP/SL стоят")
+
+
+def move_stop_be(s):
+    """бот сам двигает стоп в безубыток: отменяет старые условные, ставит новые"""
+    fs = s.get("bn_sym") or auto_symbol(s["sym"])
+    if not fs:
+        return False
+    f = _filters.get(fs)
+    if not f:
+        return False
+    cancel_algo(fs)
+    opp = "SELL" if s["side"] == "long" else "BUY"
+    be = step_round(s.get("bn_entry", s["entry"]), f["tick"])
+    tp = step_round(s["tp"], f["tick"])
+    ok = True
+    try:
+        place_cond(fs, opp, "STOP_MARKET", be)
+    except Exception as e:
+        print("move_stop SL:", e); ok = False
+    try:
+        place_cond(fs, opp, "TAKE_PROFIT_MARKET", tp)
+    except Exception as e:
+        print("move_stop TP:", e); ok = False
+    return ok
 
 
 def signed_get(path, params=None):
@@ -215,7 +249,6 @@ def signed_get(path, params=None):
 
 
 def binance_positions():
-    """{'SYMBOL': {'amt':..,'entry':..,'upnl':..}} только реально открытые"""
     d = signed_get("/fapi/v2/positionRisk")
     out = {}
     for x in d:
@@ -241,7 +274,6 @@ def binance_income(start_ms, symbol=None, end_ms=None):
 
 
 def stats_start_ms():
-    """STATS_START задаётся по Москве, Binance хочет миллисекунды UTC"""
     s = STATS_START.replace("T", " ").strip()
     for f in ("%Y-%m-%d %H:%M", "%Y-%m-%d"):
         try:
@@ -255,7 +287,6 @@ def stats_start_ms():
 
 
 def income_all(start_ms, symbol=None):
-    """Binance отдаёт максимум 7 дней за запрос — тянем кусками"""
     out = []
     week = 7 * 86400 * 1000
     cur = int(start_ms)
@@ -294,7 +325,6 @@ def split_income(rows):
 
 
 def fut_candidates(sym):
-    """на фьючах бывают 1000-контракты: SHIB -> 1000SHIBUSDT"""
     return [sym + "USDT", "1000" + sym + "USDT"]
 
 
@@ -386,6 +416,13 @@ def ema(closes, period):
     return float(e)
 
 
+def ma(closes, period):
+    """простая скользящая — для тренда монеты (MA99)"""
+    if len(closes) < period:
+        return None
+    return float(np.mean(closes[-period:]))
+
+
 def find_levels(kl, kind):
     lv = []
     for i in range(3, len(kl) - 3):
@@ -425,7 +462,6 @@ def detect_reversal(kl, side):
 
 
 def btc_regime():
-    """куда смотрит рынок: считаем по BTC 4ч против EMA50"""
     try:
         raw = get_klines("BTCUSDT", 120)
         now_ms = int(time.time() * 1000)
@@ -451,10 +487,20 @@ def top_coins():
     r = requests.get(url, timeout=25).json()
     usdt = [x for x in r if x["symbol"].endswith("USDT")]
     usdt.sort(key=lambda x: float(x["quoteVolume"]), reverse=True)
-    return [x["symbol"].replace("USDT", "") for x in usdt[:MAX_COINS]]
+    out = []
+    for x in usdt[:MAX_COINS + 20]:
+        sym = x["symbol"].replace("USDT", "")
+        if sym.upper() in BLACKLIST or x["symbol"].upper() in BLACKLIST:
+            continue
+        out.append(sym)
+        if len(out) >= MAX_COINS:
+            break
+    return out
 
 
 def analyze(sym):
+    if sym.upper() in BLACKLIST:
+        return None
     raw = get_klines(sym + "USDT")
     if len(raw) < 60:
         return None
@@ -479,8 +525,20 @@ def analyze(sym):
         return None
     e200 = ema(closes, min(200, len(closes)))
     rel = (price - e200) / e200 * 100 if e200 else 0
+
+    # ---- ФИЛЬТР ТРЕНДА МОНЕТЫ по MA99 ----
+    ma99 = ma(closes, min(99, len(closes)))
+    trend = "flat"
+    if ma99:
+        dev = (price - ma99) / ma99 * 100
+        if dev > MA_TREND_FLAT:
+            trend = "up"
+        elif dev < -MA_TREND_FLAT:
+            trend = "down"
+
     out = []
-    if r < RSI_LEVEL and rel >= -15:
+    # ЛОНГ от поддержки — только если тренд монеты НЕ вниз
+    if r < RSI_LEVEL and rel >= -15 and trend != "down":
         sups = [s for s in find_levels(kl, "sup") if s <= price * 1.002]
         if sups:
             lvl = min(sups, key=lambda s: abs(price - s))
@@ -494,8 +552,9 @@ def analyze(sym):
                         pat = detect_reversal(kl, "long") or "нет разворотной"
                         out.append({"side": "long", "sym": sym, "entry": price, "lvl": lvl,
                                     "sl": sl, "tp": price + risk * RR, "risk_pct": rp,
-                                    "rsi": r, "vr": vr, "pat": pat, "dist": dist})
-    if r > (100 - RSI_LEVEL) and rel <= 15:
+                                    "rsi": r, "vr": vr, "pat": pat, "dist": dist, "trend": trend})
+    # ШОРТ от сопротивления — только если тренд монеты НЕ вверх
+    if r > (100 - RSI_LEVEL) and rel <= 15 and trend != "up":
         ress = [s for s in find_levels(kl, "res") if s >= price * 0.998]
         if ress:
             lvl = min(ress, key=lambda s: abs(s - price))
@@ -509,7 +568,7 @@ def analyze(sym):
                         pat = detect_reversal(kl, "short") or "нет разворотной"
                         out.append({"side": "short", "sym": sym, "entry": price, "lvl": lvl,
                                     "sl": sl, "tp": price - risk * RR, "risk_pct": rp,
-                                    "rsi": r, "vr": vr, "pat": pat, "dist": dist})
+                                    "rsi": r, "vr": vr, "pat": pat, "dist": dist, "trend": trend})
     return out
 
 
@@ -531,18 +590,17 @@ def pnl_usd(s, price):
 
 
 def grade(s):
-    """оценка входа: считаем, сколько условий отработали идеально"""
     pts = 0
     if s["pat"] != "нет разворотной":
-        pts += 2                                  # разворотная свеча — главное
+        pts += 2
     if s["rsi"] <= 32 or s["rsi"] >= 68:
-        pts += 1                                  # RSI на самом краю
+        pts += 1
     if s["vr"] >= 1.5:
-        pts += 1                                  # объём заметно выше нормы
+        pts += 1
     if s["dist"] <= 0.4:
-        pts += 1                                  # вплотную к уровню
+        pts += 1
     if s["risk_pct"] <= 1.5:
-        pts += 1                                  # короткий стоп
+        pts += 1
     if pts >= 5:
         return pts, "🟢 ХОРОШАЯ ПАРА"
     if pts >= 3:
@@ -562,10 +620,11 @@ def card(s):
     vol_ok = "✅" if s["vr"] >= 1.5 else "⚠️"
     dst_ok = "✅" if s["dist"] <= 0.4 else "⚠️"
     rsk_ok = "✅" if s["risk_pct"] <= 1.5 else "⚠️"
+    tr = {"up": "📈 тренд вверх", "down": "📉 тренд вниз", "flat": "➖ тренд флэт"}.get(s.get("trend", "flat"), "")
     pts, lab = grade(s)
     return (
         "🎯 " + s["sym"] + " — " + side_t + " (4ч)\n"
-        + lab + "  (" + str(pts) + "/6)\n\n"
+        + lab + "  (" + str(pts) + "/6)   " + tr + "\n\n"
         + pat_ok + " Свеча: " + s["pat"] + "\n"
         + rsi_ok + " RSI: " + str(round(s["rsi"])) + "\n"
         + vol_ok + " Объём: ×" + format(s["vr"], ".1f") + "\n"
@@ -578,13 +637,12 @@ def card(s):
         "💵 На $" + str(SIZE) + ":\n"
         "   риск ≈ -$" + str(round(risk_usd + fees)) + "\n"
         "   профит ≈ +$" + str(round(prof_usd - fees)) + "\n\n"
-        "🛡 На +50% пути пришлю сигнал двинуть стоп в безубыток\n"
-        "⚙️ плечо 1х!"
+        "🛡 Стоп в безубыток бот двигает сам\n"
+        "⚙️ плечо " + str(LEVERAGE) + "x · нотионал $" + str(SIZE)
     )
 
 
 def close_trade(chat_id, s, price, result):
-    """расчётное закрытие (когда позиции на бирже не видно)"""
     p = pnl_usd(s, price) - SIZE * FEE / 100 * 2
     history.setdefault(chat_id, [])
     history[chat_id].append({"sym": s["sym"], "side": s["side"], "result": result,
@@ -595,7 +653,6 @@ def close_trade(chat_id, s, price, result):
 
 
 def close_trade_real(chat_id, s, inc, result):
-    """реальное закрытие по данным Binance"""
     net = inc["pnl"] + inc["fee"] + inc["fund"]
     history.setdefault(chat_id, [])
     history[chat_id].append({"sym": s["sym"], "side": s["side"], "result": result,
@@ -607,7 +664,6 @@ def close_trade_real(chat_id, s, inc, result):
 
 
 def classify(s, net):
-    """тейк / стоп / безубыток по реальному результату"""
     qty = s.get("bn_qty") or (SIZE / s["entry"])
     ent = s.get("bn_entry") or s["entry"]
     risk = qty * abs(ent - s["sl"])
@@ -625,8 +681,8 @@ def start(m):
     k = ("✅ Binance подключён — статистика с " + STATS_START + " МСК по реальным сделкам.") if has_keys() \
         else "⚠️ Binance не подключён — добавь ключи в Railway."
     bot.send_message(m.chat.id,
-        "Отскок от уровней 4ч 🎯\nСигналы только по ЗАКРЫТЫМ свечам.\n"
-        "ATR-стоп, тейк 1:3, безубыток на полпути.\n\n" + k, reply_markup=menu())
+        "Отскок от уровней 4ч 🎯\nВход по тренду монеты (MA99) + фильтр BTC.\n"
+        "ATR-стоп, тейк 1:3, стоп в безубыток автоматом.\n\n" + k, reply_markup=menu())
 
 
 @bot.message_handler(func=lambda m: m.text == "🔍 Найти отскоки")
@@ -688,6 +744,8 @@ def btn_stats(m):
     bot.send_message(m.chat.id, "Тяну реальные сделки с Binance...")
     try:
         rows = income_all(stats_start_ms())
+        # выкидываем игнор-символы (случайные ручные сделки, напр. BTC)
+        rows = [x for x in rows if (x.get("symbol") or "").upper() not in STATS_IGNORE]
         if not rows:
             bot.send_message(m.chat.id, "📊 С " + STATS_START + " МСК закрытых сделок нет.", reply_markup=menu())
             return
@@ -714,13 +772,13 @@ def btn_stats(m):
         avg_l = float(np.mean([abs(x) for x in losses])) if losses else 0.0
 
         try:
-            pos = binance_positions()
+            pos = {k: v for k, v in binance_positions().items() if k.upper() not in STATS_IGNORE}
         except Exception:
             pos = {}
         upnl = sum(v["upnl"] for v in pos.values())
 
         L = []
-        L.append("📊 ОТСКОК 1:3 · с " + STATS_START + " МСК")
+        L.append("📊 ОТСКОК 1:3 v2 · с " + STATS_START + " МСК")
         L.append(str(total) + " монет · " + str(tot["n"]) + " закрытий")
         L.append("")
         L.append("💵 Чистыми:  " + money(real))
@@ -767,11 +825,11 @@ def btn_auto(m):
         grd = "только 🟢 (5+/6)" if AUTO_MIN_PTS >= 5 else "🟢 и 🟡 (" + str(AUTO_MIN_PTS) + "+/6)"
         bot.send_message(m.chat.id,
             "🤖 АВТОТОРГОВЛЯ ВКЛЮЧЕНА\n\n"
-            "Вхожу: " + grd + "\n"
+            "Вхожу: " + grd + " по тренду монеты\n"
             "Размер: $" + str(SIZE) + " · плечо " + str(LEVERAGE) + "x\n"
             "Потолок: " + str(MAX_POS) + " позиций (сейчас " + str(pos) + ")\n"
-            "TP/SL ставлю ордерами сразу при входе\n\n"
-            "Фильтр BTC работает. Руками не трогай — иначе статистика опять поедет.",
+            "TP/SL ставлю ордерами, стоп в безубыток двигаю сам\n\n"
+            "Руками не трогай — статистика поедет.",
             reply_markup=menu())
     else:
         bot.send_message(m.chat.id, "🤖 Автоторговля ВЫКЛЮЧЕНА.\nОткрытые позиции не трогаю — их закроют TP/SL.", reply_markup=menu())
@@ -828,7 +886,6 @@ def do_scan(chat_id, manual=False):
                 pass
             time.sleep(0.12)
 
-        # фильтр по битку: не ловим нож против рынка
         cut = 0
         if mode == "bear":
             n0 = len(found)
@@ -839,13 +896,16 @@ def do_scan(chat_id, manual=False):
             found = [s for s in found if s["side"] == "long"]
             cut = n0 - len(found)
 
+        # ---- показываем только 🟢 ----
+        greens = [s for s in found if grade(s)[0] >= 5]
+        hidden = len(found) - len(greens)
+
         sent_signals.setdefault(chat_id, {})
-        # анти-дубль: монета уже в трекинге -> сигнал не шлём
         busy = {x["sym"] for x in tracked.get(chat_id, [])}
         skipped = 0
         fresh = []
         now = time.time()
-        for s in found:
+        for s in greens:
             if s["sym"] in busy:
                 skipped += 1
                 continue
@@ -853,41 +913,47 @@ def do_scan(chat_id, manual=False):
             if manual or (now - sent_signals[chat_id].get(key, 0) > 8 * 3600):
                 fresh.append(s)
                 sent_signals[chat_id][key] = now
+
         if mode == "bear":
             btc_t = "📉 BTC ниже EMA50 (" + format(dev, ".1f") + "%) — только шорты"
         elif mode == "bull":
             btc_t = "📈 BTC выше EMA50 (+" + format(dev, ".1f") + "%) — только лонги"
         else:
             btc_t = "➖ BTC у EMA50 (" + format(dev, ".1f") + "%) — обе стороны"
+
+        # автоторговля работает по ВСЕМ зелёным (не только "свежим"),
+        # чтобы вход не зависел от антиспама
+        if auto_on and has_keys():
+            avail = [s for s in greens if s["sym"] not in busy]
+            auto_enter(chat_id, avail)
+
         if not fresh:
             if manual:
                 extra = btc_t
+                if hidden:
+                    extra += "\n(" + str(hidden) + " не 🟢 — скрыто)"
                 if cut:
                     extra += "\n(" + str(cut) + " скрыто против BTC)"
                 if skipped:
                     extra += "\n(" + str(skipped) + " уже в трекинге)"
-                bot.send_message(chat_id, "Отскоков сейчас нет.\n" + extra, reply_markup=menu())
+                bot.send_message(chat_id, "🟢 Хороших пар сейчас нет.\n" + extra, reply_markup=menu())
             return
-        fresh.sort(key=lambda s: (-grade(s)[0], s["risk_pct"]))
-        g_cnt = {}
-        for s in fresh:
-            g_cnt[grade(s)[1][0]] = g_cnt.get(grade(s)[1][0], 0) + 1
-        head = ("Нашёл " + str(len(fresh)) + ": 🟢" + str(g_cnt.get("🟢", 0))
-                + " 🟡" + str(g_cnt.get("🟡", 0)) + " 🔴" + str(g_cnt.get("🔴", 0))
-                + "\n" + btc_t)
+
+        fresh.sort(key=lambda s: s["risk_pct"])
+        head = "🟢 Нашёл хороших пар: " + str(len(fresh)) + "\n" + btc_t
+        if hidden:
+            head += "\n(" + str(hidden) + " не 🟢 — скрыто)"
         if cut:
             head += "\n(" + str(cut) + " скрыто против BTC)"
         if skipped:
             head += "\n(" + str(skipped) + " уже в трекинге)"
         bot.send_message(chat_id, head)
-        if auto_on and has_keys():
-            auto_enter(chat_id, fresh)
 
         for s in fresh[:8]:
             ikb = types.InlineKeyboardMarkup()
             cb = "t:" + s["sym"] + ":" + s["side"] + ":" + format(s["entry"], ".6f") + ":" + format(s["sl"], ".6f") + ":" + format(s["tp"], ".6f")
             if len(cb) <= 64:
-                ikb.add(types.InlineKeyboardButton(grade(s)[1][0] + " Отслеживать " + s["sym"], callback_data=cb))
+                ikb.add(types.InlineKeyboardButton("➡️ Отслеживать " + s["sym"], callback_data=cb))
                 bot.send_message(chat_id, card(s), reply_markup=ikb)
             else:
                 bot.send_message(chat_id, card(s))
@@ -898,8 +964,7 @@ def do_scan(chat_id, manual=False):
             bot.send_message(chat_id, "Ошибка при поиске, попробуй ещё раз.", reply_markup=menu())
 
 
-def auto_enter(chat_id, fresh):
-    """открываем сами: только сильные сигналы, не больше MAX_POS позиций"""
+def auto_enter(chat_id, cands):
     try:
         pos = binance_positions()
     except Exception as e:
@@ -909,7 +974,7 @@ def auto_enter(chat_id, fresh):
     if free <= 0:
         bot.send_message(chat_id, "🤖 занято " + str(len(pos)) + "/" + str(MAX_POS) + " — не вхожу")
         return
-    for s in fresh:
+    for s in cands:
         if free <= 0:
             break
         if grade(s)[0] < AUTO_MIN_PTS:
@@ -934,9 +999,10 @@ def auto_enter(chat_id, fresh):
                                      "a_tp": False, "a_sl": False, "auto": True,
                                      "t0": int(time.time() * 1000)})
         save()
+        tr = {"up": "📈", "down": "📉", "flat": "➖"}.get(s.get("trend", "flat"), "")
         bot.send_message(chat_id,
             "🤖 ОТКРЫЛ " + s["sym"] + " " + ("ЛОНГ" if s["side"] == "long" else "ШОРТ")
-            + "  " + grade(s)[1] + "\n"
+            + "  " + grade(s)[1] + " " + tr + "\n"
             "📍 " + fmt(s["entry"]) + " · " + info + "\n"
             "🛑 " + fmt(s["sl"]) + "  🎯 " + fmt(s["tp"]) + "\n"
             "Руками не трогаем.", reply_markup=menu())
@@ -944,7 +1010,6 @@ def auto_enter(chat_id, fresh):
 
 
 def sync_binance():
-    """сверяем трекинг с реальными позициями на бирже"""
     if not has_keys() or not tracked:
         return False
     try:
@@ -977,7 +1042,6 @@ def sync_binance():
                         pass
             else:
                 if s.get("bn"):
-                    # позиция была, теперь её нет -> биржа закрыла
                     try:
                         rows = binance_income(s.get("bn_t", int(time.time() * 1000) - 86400000),
                                               s.get("bn_sym", s["sym"] + "USDT"))
@@ -1026,14 +1090,13 @@ def auto_loop():
 
                         if hit_tp:
                             if on_bn:
-                                # позицию ведёт биржа: только напоминаем, из трекинга не убираем
                                 if not s.get("a_tp"):
                                     s["a_tp"] = True
                                     changed = True
-                                    bot.send_message(chat_id, "🎯 ТЕЙК: " + s["sym"] + " дошёл до " + fmt(s["tp"]) + "!\nЗАКРЫВАЙ В ПЛЮС.\nКак закроешь — посчитаю реальный итог.", reply_markup=menu())
+                                    bot.send_message(chat_id, "🎯 ТЕЙК: " + s["sym"] + " дошёл до " + fmt(s["tp"]) + "!\nБиржа закроет по ордеру.", reply_markup=menu())
                             else:
                                 pl = close_trade(chat_id, s, s["tp"], "tp")
-                                bot.send_message(chat_id, "🎯 ТЕЙК: " + s["sym"] + " дошёл до " + fmt(s["tp"]) + "!\nПрофит ≈ " + money(pl) + "\nЗАКРЫВАЙ В ПЛЮС!", reply_markup=menu())
+                                bot.send_message(chat_id, "🎯 ТЕЙК: " + s["sym"] + " дошёл до " + fmt(s["tp"]) + "!\nПрофит ≈ " + money(pl), reply_markup=menu())
                                 lst.remove(s); changed = True
                             continue
 
@@ -1044,29 +1107,34 @@ def auto_loop():
                                     s["a_sl"] = True
                                     changed = True
                                     msg = ("🛡 БЕЗУБЫТОК: " + s["sym"] + " вернулся ко входу." ) if res == "be" \
-                                        else ("🛑 СТОП: " + s["sym"] + " пробил " + fmt(s["sl"]) + ".\nЗАКРЫВАЙ!")
-                                    bot.send_message(chat_id, msg + "\nКак закроешь — посчитаю реальный итог.", reply_markup=menu())
+                                        else ("🛑 СТОП: " + s["sym"] + " пробил " + fmt(s["sl"]) + ".")
+                                    bot.send_message(chat_id, msg + "\nБиржа закроет по ордеру.", reply_markup=menu())
                             else:
                                 pl = close_trade(chat_id, s, s["sl"], res)
                                 if res == "be":
                                     msg = "🛡 БЕЗУБЫТОК: " + s["sym"] + " вернулся ко входу. Вышел ~в ноль."
                                 else:
-                                    msg = "🛑 СТОП: " + s["sym"] + " пробил " + fmt(s["sl"]) + ".\nУбыток ≈ " + money(pl) + "\nЗАКРЫВАЙ!"
+                                    msg = "🛑 СТОП: " + s["sym"] + " пробил " + fmt(s["sl"]) + ".\nУбыток ≈ " + money(pl)
                                 bot.send_message(chat_id, msg, reply_markup=menu())
                                 lst.remove(s); changed = True
                             continue
 
+                        # ---- АВТО-БЕЗУБЫТОК: бот сам двигает стоп на бирже ----
                         if not s.get("be"):
                             half = s["entry"] + (s["tp"] - s["entry"]) * 0.5
                             reached = (p >= half) if s["side"] == "long" else (p <= half)
                             if reached:
-                                s["sl"] = s["entry"]
-                                s["be"] = True
-                                changed = True
-                                bot.send_message(chat_id,
-                                    "🛡 БЕЗУБЫТОК: " + s["sym"] + " прошёл половину пути!\n"
-                                    "Двигай стоп на вход: " + fmt(s["entry"]) + "\n"
-                                    "Дальше сделка бесплатная.", reply_markup=menu())
+                                moved = True
+                                if on_bn:
+                                    moved = move_stop_be(s)
+                                if moved:
+                                    s["sl"] = s.get("bn_entry", s["entry"])
+                                    s["be"] = True
+                                    changed = True
+                                    bot.send_message(chat_id,
+                                        "🛡 БЕЗУБЫТОК: " + s["sym"] + " прошёл половину пути.\n"
+                                        "Стоп передвинут на вход " + fmt(s["sl"]) + " автоматически.\n"
+                                        "Дальше сделка бесплатная.", reply_markup=menu())
                     except Exception:
                         pass
                     time.sleep(0.3)
@@ -1095,9 +1163,11 @@ if has_keys():
     except Exception as e:
         print("Binance ключи не работают:", e)
     print("автоторговля:", "ВКЛ" if auto_on else "выкл",
-          "| мин. оценка", AUTO_MIN_PTS, "| потолок", MAX_POS, "| плечо", LEVERAGE)
+          "| мин.оценка", AUTO_MIN_PTS, "| потолок", MAX_POS, "| плечо", LEVERAGE,
+          "| MA-фильтр ±" + str(MA_TREND_FLAT) + "%",
+          "| чёрный список:", ",".join(BLACKLIST) or "пусто")
 else:
     print("Binance ключи не заданы — работаю в расчётном режиме")
 threading.Thread(target=auto_loop, daemon=True).start()
-print("Бот отскоков запущен...")
+print("Бот отскоков v2 запущен...")
 bot.infinity_polling()
