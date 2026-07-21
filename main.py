@@ -35,6 +35,8 @@ MAX_COINS = 200
 FEE = 0.055
 BE_BAND = 5.0
 BTC_FLAT = 0.7
+# фильтр по тренду BTC: 0 = выкл (MA99 монеты решает всё), 1 = вкл
+BTC_FILTER = os.environ.get("BTC_FILTER", "0") == "1"
 
 # фильтр тренда самой монеты по MA99 (нейтральная зона ±%)
 MA_TREND_FLAT = float(os.environ.get("MA_TREND_FLAT", "0.3"))
@@ -881,14 +883,15 @@ def do_scan(chat_id, manual=False):
             time.sleep(0.12)
 
         cut = 0
-        if mode == "bear":
-            n0 = len(found)
-            found = [s for s in found if s["side"] == "short"]
-            cut = n0 - len(found)
-        elif mode == "bull":
-            n0 = len(found)
-            found = [s for s in found if s["side"] == "long"]
-            cut = n0 - len(found)
+        if BTC_FILTER:
+            if mode == "bear":
+                n0 = len(found)
+                found = [s for s in found if s["side"] == "short"]
+                cut = n0 - len(found)
+            elif mode == "bull":
+                n0 = len(found)
+                found = [s for s in found if s["side"] == "long"]
+                cut = n0 - len(found)
 
         # ---- показываем только 🟢 ----
         greens = [s for s in found if grade(s)[0] >= 5]
@@ -908,12 +911,15 @@ def do_scan(chat_id, manual=False):
                 fresh.append(s)
                 sent_signals[chat_id][key] = now
 
-        if mode == "bear":
-            btc_t = "📉 BTC ниже EMA50 (" + format(dev, ".1f") + "%) — только шорты"
-        elif mode == "bull":
-            btc_t = "📈 BTC выше EMA50 (+" + format(dev, ".1f") + "%) — только лонги"
+        if BTC_FILTER:
+            if mode == "bear":
+                btc_t = "📉 BTC ниже EMA50 (" + format(dev, ".1f") + "%) — только шорты"
+            elif mode == "bull":
+                btc_t = "📈 BTC выше EMA50 (+" + format(dev, ".1f") + "%) — только лонги"
+            else:
+                btc_t = "➖ BTC у EMA50 (" + format(dev, ".1f") + "%) — обе стороны"
         else:
-            btc_t = "➖ BTC у EMA50 (" + format(dev, ".1f") + "%) — обе стороны"
+            btc_t = "🎯 Тренд по MA99 каждой монеты (BTC-фильтр выкл)"
 
         # автоторговля работает по ВСЕМ зелёным (не только "свежим"),
         # чтобы вход не зависел от антиспама
