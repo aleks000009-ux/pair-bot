@@ -51,7 +51,7 @@ STATS_IGNORE = set(x.strip().upper() for x in os.environ.get(
 
 # ---------- АВТОТОРГОВЛЯ ----------
 AUTO_TRADE = os.environ.get("AUTO_TRADE", "0") == "1"
-AUTO_MIN_PTS = int(os.environ.get("AUTO_MIN_PTS", "5"))
+AUTO_MIN_PTS = int(os.environ.get("AUTO_MIN_PTS", "4"))
 MAX_POS = int(os.environ.get("MAX_POS", "6"))
 LEVERAGE = int(os.environ.get("LEVERAGE", "5"))
 auto_on = AUTO_TRADE
@@ -677,8 +677,10 @@ def start(m):
     k = ("✅ Binance подключён — статистика с " + STATS_START + " МСК по реальным сделкам.") if has_keys() \
         else "⚠️ Binance не подключён — добавь ключи в Railway."
     bot.send_message(m.chat.id,
-        "Отскок от уровней 4ч 🎯\nВход по тренду монеты (MA99) + фильтр BTC.\n"
-        "ATR-стоп, тейк 1:3, стоп в безубыток автоматом.\n\n" + k, reply_markup=menu())
+        "Отскок от уровней 4ч 🎯\n"
+        + ("Вход по тренду монеты (MA99) + фильтр BTC.\n" if BTC_FILTER
+           else "Вход по тренду каждой монеты (MA99). BTC-фильтр выкл.\n")
+        + "ATR-стоп, тейк 1:3, стоп в безубыток автоматом.\n\n" + k, reply_markup=menu())
 
 
 @bot.message_handler(func=lambda m: m.text == "🔍 Найти отскоки")
@@ -818,12 +820,14 @@ def btn_auto(m):
             pos = len(binance_positions())
         except Exception:
             pos = "?"
-        grd = "только 🟢 (5+/6)" if AUTO_MIN_PTS >= 5 else "🟢 и 🟡 (" + str(AUTO_MIN_PTS) + "+/6)"
+        grd = "только 🟢 (5-6/6)" if AUTO_MIN_PTS >= 5 else "🟢 и 🟡 (" + str(AUTO_MIN_PTS) + "+/6)"
+        btc_line = "BTC-фильтр: ВКЛ" if BTC_FILTER else "BTC-фильтр: выкл (тренд по MA99)"
         bot.send_message(m.chat.id,
             "🤖 АВТОТОРГОВЛЯ ВКЛЮЧЕНА\n\n"
             "Вхожу: " + grd + " по тренду монеты\n"
             "Размер: $" + str(SIZE) + " · плечо " + str(LEVERAGE) + "x\n"
             "Потолок: " + str(MAX_POS) + " позиций (сейчас " + str(pos) + ")\n"
+            + btc_line + "\n"
             "TP/SL ставлю ордерами, стоп в безубыток двигаю сам\n\n"
             "Руками не трогай — статистика поедет.",
             reply_markup=menu())
@@ -893,8 +897,8 @@ def do_scan(chat_id, manual=False):
                 found = [s for s in found if s["side"] == "long"]
                 cut = n0 - len(found)
 
-        # ---- показываем только 🟢 ----
-        greens = [s for s in found if grade(s)[0] >= 5]
+        # ---- показываем то, что автомат реально берёт (>= AUTO_MIN_PTS) ----
+        greens = [s for s in found if grade(s)[0] >= AUTO_MIN_PTS]
         hidden = len(found) - len(greens)
 
         sent_signals.setdefault(chat_id, {})
@@ -931,7 +935,7 @@ def do_scan(chat_id, manual=False):
             if manual:
                 extra = btc_t
                 if hidden:
-                    extra += "\n(" + str(hidden) + " не 🟢 — скрыто)"
+                    extra += "\n(" + str(hidden) + " слабых 🔴 — скрыто)"
                 if cut:
                     extra += "\n(" + str(cut) + " скрыто против BTC)"
                 if skipped:
@@ -940,9 +944,12 @@ def do_scan(chat_id, manual=False):
             return
 
         fresh.sort(key=lambda s: s["risk_pct"])
-        head = "🟢 Нашёл хороших пар: " + str(len(fresh)) + "\n" + btc_t
+        # считаем 🟢 и 🟡 в выдаче
+        n_green = sum(1 for s in fresh if grade(s)[0] >= 5)
+        n_yellow = len(fresh) - n_green
+        head = ("Нашёл: 🟢" + str(n_green) + " 🟡" + str(n_yellow) + "\n" + btc_t)
         if hidden:
-            head += "\n(" + str(hidden) + " не 🟢 — скрыто)"
+            head += "\n(" + str(hidden) + " слабых 🔴 — скрыто)"
         if cut:
             head += "\n(" + str(cut) + " скрыто против BTC)"
         if skipped:
