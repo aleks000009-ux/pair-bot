@@ -134,23 +134,17 @@ def auto_symbol(sym):
 
 
 def place_cond(fs, side, typ, trig):
+    """условный ордер через новый algoOrder (обязателен с 09.12.2025)"""
     p = {"algoType": "CONDITIONAL", "symbol": fs, "side": side, "type": typ,
-         "triggerPrice": trig, "closePosition": "true", "workingType": "MARK_PRICE"}
-    try:
-        return signed_post("/fapi/v1/algoOrder", p)
-    except Exception as e:
-        if "-4120" in str(e):
-            raise
-        return signed_post("/fapi/v1/order", {"symbol": fs, "side": side, "type": typ,
-                                              "stopPrice": trig, "closePosition": "true",
-                                              "workingType": "MARK_PRICE",
-                                              "timeInForce": "GTE_GTC"})
+         "triggerPrice": trig, "closePosition": "true",
+         "workingType": "MARK_PRICE", "timeInForce": "GTE_GTC"}
+    return signed_post("/fapi/v1/algoOrder", p)
 
 
 def cancel_algo(fs):
-    """снять все условные ордера по символу (для перестановки стопа)"""
+    """снять все algo-ордера по символу (новый эндпоинт)"""
     try:
-        signed_post("/fapi/v1/allOpenOrders", {"symbol": fs})
+        signed_post("/fapi/v1/algoOpenOrders", {"symbol": fs})
     except Exception as e:
         print("cancel_algo:", e)
 
