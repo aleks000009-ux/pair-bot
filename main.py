@@ -49,7 +49,8 @@ BTC_FILTER = os.environ.get("BTC_FILTER", "0") == "1"
 
 # фильтр тренда самой монеты по MA99 (нейтральная зона ±%)
 MA_TREND_FLAT = float(os.environ.get("MA_TREND_FLAT", "0.3"))
-MA_SLOPE_BARS = int(os.environ.get("MA_SLOPE_BARS", "6"))   # за сколько 4ч-свечей мерим наклон MA99
+MA_SLOPE_BARS = int(os.environ.get("MA_SLOPE_BARS", "6"))   # свечей для наклона MA99
+SCAN_EVERY = int(os.environ.get("SCAN_EVERY", "1800"))   # период автоскана, сек
 
 # мусорные/тестовые монеты — не торгуем и не показываем
 BLACKLIST = set(x.strip().upper() for x in os.environ.get(
@@ -65,6 +66,8 @@ AUTO_MIN_PTS = int(os.environ.get("AUTO_MIN_PTS", "4"))
 MAX_POS = int(os.environ.get("MAX_POS", "6"))
 LEVERAGE = int(os.environ.get("LEVERAGE", "5"))
 auto_on = AUTO_TRADE
+# кому слать автосканы. Задай CHAT_ID в Railway — иначе список теряется при редеплое
+CHAT_ID = os.environ.get("CHAT_ID", "").strip()
 opened_keys = set()
 
 DATA_DIR = os.environ.get("DATA_DIR", ".").rstrip("/")
@@ -72,6 +75,11 @@ DB = DATA_DIR + "/trades.json"
 
 tracked = {}
 users = set()
+if CHAT_ID:
+    try:
+        users.add(int(CHAT_ID))
+    except Exception:
+        print("CHAT_ID неверный:", CHAT_ID)
 sent_signals = {}
 _last_quiet = {}
 funnel = {}
@@ -1230,19 +1238,30 @@ def auto_loop():
 
             if changed:
                 save()
-            if time.time() - last > 1800:
+            if time.time() - last > SCAN_EVERY:
                 last = time.time()
+                if not users:
+                    print("автоскан пропущен: нет получателей (задай CHAT_ID в Railway)")
                 for uid in list(users):
                     try:
+                        print("автоскан для", uid)
                         do_scan(uid, manual=False)
-                    except Exception:
-                        pass
+                    except Exception as e:
+                        print("автоскан error:", e)
         except Exception as e:
             print("loop error:", e)
         time.sleep(90)
 
 
 load()
+if CHAT_ID:
+    try:
+        users.add(int(CHAT_ID))
+        save()
+    except Exception:
+        pass
+print("получателей автосканов:", len(users), "| CHAT_ID:", CHAT_ID or "НЕ ЗАДАН")
+
 if has_keys():
     sync_time()
     load_filters()
