@@ -50,7 +50,7 @@ STATS_IGNORE = set(x.strip().upper() for x in os.environ.get(
     "STATS_IGNORE", "BTCUSDT,ETHUSDT").split(",") if x.strip())
 
 # ---------- АВТОТОРГОВЛЯ ----------
-AUTO_TRADE = os.environ.get("AUTO_TRADE", "0") == "1"
+AUTO_TRADE = os.environ.get("AUTO_TRADE", "1") == "1"   # по умолчанию ВКЛ, чтобы не гасла после деплоя
 AUTO_MIN_PTS = int(os.environ.get("AUTO_MIN_PTS", "4"))
 MAX_POS = int(os.environ.get("MAX_POS", "6"))
 LEVERAGE = int(os.environ.get("LEVERAGE", "5"))
@@ -63,6 +63,7 @@ DB = DATA_DIR + "/trades.json"
 tracked = {}
 users = set()
 sent_signals = {}
+_last_quiet = {}
 history = {}
 
 
@@ -932,7 +933,10 @@ def do_scan(chat_id, manual=False):
             auto_enter(chat_id, avail)
 
         if not fresh:
-            if manual:
+            now_h = time.time()
+            quiet_ok = manual or (now_h - _last_quiet.get(chat_id, 0) > 7200)
+            if quiet_ok:
+                _last_quiet[chat_id] = now_h
                 extra = btc_t
                 if hidden:
                     extra += "\n(" + str(hidden) + " слабых 🔴 — скрыто)"
@@ -940,7 +944,9 @@ def do_scan(chat_id, manual=False):
                     extra += "\n(" + str(cut) + " скрыто против BTC)"
                 if skipped:
                     extra += "\n(" + str(skipped) + " уже в трекинге)"
-                bot.send_message(chat_id, "🟢 Хороших пар сейчас нет.\n" + extra, reply_markup=menu())
+                if not auto_on:
+                    extra += "\n⚠️ автоторговля ВЫКЛЮЧЕНА"
+                bot.send_message(chat_id, "Подходящих пар сейчас нет.\n" + extra, reply_markup=menu())
             return
 
         fresh.sort(key=lambda s: s["risk_pct"])
@@ -1176,5 +1182,5 @@ if has_keys():
 else:
     print("Binance ключи не заданы — работаю в расчётном режиме")
 threading.Thread(target=auto_loop, daemon=True).start()
-print("Бот отскоков v2 запущен...")
+print("Бот отскоков v2 запущен. Автоторговля:", "ВКЛ" if auto_on else "ВЫКЛ")
 bot.infinity_polling()
