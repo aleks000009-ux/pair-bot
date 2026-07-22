@@ -116,6 +116,20 @@ def signed_post(path, params=None):
     return d
 
 
+def signed_delete(path, params=None):
+    p = dict(params or {})
+    p["timestamp"] = int(time.time() * 1000) + _offset["ms"]
+    p["recvWindow"] = 10000
+    q = urllib.parse.urlencode(p)
+    sig = hmac.new(BINANCE_SECRET.encode(), q.encode(), hashlib.sha256).hexdigest()
+    r = requests.delete(FAPI + path + "?" + q + "&signature=" + sig,
+                        headers={"X-MBX-APIKEY": BINANCE_KEY}, timeout=20)
+    d = r.json()
+    if isinstance(d, dict) and "code" in d and "msg" in d and d.get("code") not in (200, -2011):
+        raise Exception("Binance: " + str(d.get("code")) + " " + str(d.get("msg")))
+    return d
+
+
 _filters = {}
 
 
@@ -164,11 +178,15 @@ def place_cond(fs, side, typ, trig):
 
 
 def cancel_algo(fs):
-    """снять все algo-ордера по символу (новый эндпоинт)"""
-    try:
-        signed_post("/fapi/v1/algoOpenOrders", {"symbol": fs})
-    except Exception as e:
-        print("cancel_algo:", e)
+    """снять все условные ордера по символу — Binance ждёт DELETE, не POST"""
+    ok = False
+    for path in ("/fapi/v1/algoOpenOrders", "/fapi/v1/allOpenOrders"):
+        try:
+            signed_delete(path, {"symbol": fs})
+            ok = True
+        except Exception as e:
+            print("cancel_algo", path, ":", str(e)[:90])
+    return ok
 
 
 def close_now(fs, side, qty):
@@ -234,7 +252,8 @@ def move_stop_be(s):
     f = _filters.get(fs)
     if not f:
         return False
-    cancel_algo(fs)
+    if not cancel_algo(fs):
+        print("move_stop_be: не удалось снять старые ордера", fs)
     opp = "SELL" if s["side"] == "long" else "BUY"
     be = step_round(s.get("bn_entry", s["entry"]), f["tick"])
     tp = step_round(s["tp"], f["tick"])
@@ -277,6 +296,83 @@ def binance_positions():
                                 "entry": float(x.get("entryPrice", 0) or 0),
                                 "upnl": float(x.get("unRealizedProfit", 0) or 0)}
     return out
+
+
+def algo_open_orders():
+    """открытые условные ордера -> {symbol: {'tp':цена,'sl':цена}}"""
+    out = {}
+    for path in ("/fapi/v1/algoOpenOrders", "/fapi/v1/openOrders"):
+        try:
+            d = signed_get(path)
+        except Exception:
+            continue
+        if not isinstance(d, list):
+            continue
+        for o in d:
+            sym = o.get("symbol")
+            if not sym:
+                continue
+            typ = (o.get("type") or o.get("algoType") or "").upper()
+            trg = o.get("triggerPrice") or o.get("stopPrice") or 0
+            try:
+                trg = float(trg)
+            except Exception:
+                continue
+            if trg <= 0:
+                continue
+            out.setdefault(sym, {})
+            if "TAKE_PROFIT" in typ:
+                out[sym]["tp"] = trg
+            elif "STOP" in typ:
+                out[sym]["sl"] = trg
+        if out:
+            break
+    return out
+
+
+def adopt_positions(chat_id):
+    """подхватываем позиции с биржи, если бот потерял память после редеплоя"""
+    if not has_keys() or not chat_id:
+        return 0
+    try:
+        pos = binance_positions()
+    except Exception as e:
+        print("adopt positions error:", e)
+        return 0
+    if not pos:
+        return 0
+    orders = algo_open_orders()
+    tracked.setdefault(chat_id, [])
+    known = {x.get("bn_sym") or (x["sym"] + "USDT") for x in tracked[chat_id]}
+    added = 0
+    for fs, v in pos.items():
+        if fs in known or fs.upper() in STATS_IGNORE:
+            continue
+        side = "long" if v["amt"] > 0 else "short"
+        entry = v["entry"] or 0
+        if entry <= 0:
+            continue
+        o = orders.get(fs, {})
+        tp = o.get("tp")
+        sl = o.get("sl")
+        if not tp or not sl:
+            # ордеров нет — считаем по стандарту стратегии (риск 1%, тейк 1:3)
+            risk = entry * 0.01
+            sl = entry + risk if side == "long" else entry - risk
+            tp = entry - risk * RR if side == "short" else entry + risk * RR
+        sym = fs[:-4] if fs.endswith("USDT") else fs
+        tracked[chat_id].append({"sym": sym, "side": side, "entry": entry,
+                                 "sl": float(sl), "tp": float(tp), "be": False,
+                                 "bn": True, "bn_sym": fs, "bn_qty": abs(v["amt"]),
+                                 "bn_entry": entry,
+                                 "bn_t": int(time.time() * 1000) - 86400000,
+                                 "a_tp": False, "a_sl": False, "auto": True,
+                                 "t0": int(time.time() * 1000)})
+        added += 1
+        print("подхватил с биржи:", fs, side, "вход", entry, "TP", tp, "SL", sl)
+    if added:
+        save()
+    return added
 
 
 def binance_income(start_ms, symbol=None, end_ms=None):
@@ -1107,7 +1203,13 @@ def auto_enter(chat_id, cands):
 
 
 def sync_binance():
-    if not has_keys() or not tracked:
+    if not has_keys():
+        return False
+    # если память пуста, а позиции на бирже есть — подхватываем их
+    for uid in list(users):
+        if not tracked.get(uid):
+            adopt_positions(uid)
+    if not tracked:
         return False
     try:
         pos = binance_positions()
@@ -1270,6 +1372,14 @@ if has_keys():
         print("Binance OK, открытых позиций:", len(p))
     except Exception as e:
         print("Binance ключи не работают:", e)
+    # подхватываем позиции, открытые до перезапуска
+    for _uid in list(users):
+        try:
+            _n = adopt_positions(_uid)
+            if _n:
+                print("восстановлено позиций с биржи:", _n)
+        except Exception as _e:
+            print("adopt при старте:", _e)
     print("автоторговля:", "ВКЛ" if auto_on else "выкл",
           "| мин.оценка", AUTO_MIN_PTS, "| потолок", MAX_POS, "| плечо", LEVERAGE,
           "| MA-фильтр ±" + str(MA_TREND_FLAT) + "%",
