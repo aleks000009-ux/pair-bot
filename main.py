@@ -49,6 +49,7 @@ BTC_FILTER = os.environ.get("BTC_FILTER", "0") == "1"
 
 # фильтр тренда самой монеты по MA99 (нейтральная зона ±%)
 MA_TREND_FLAT = float(os.environ.get("MA_TREND_FLAT", "0.3"))
+MA_SLOPE_BARS = int(os.environ.get("MA_SLOPE_BARS", "6"))   # за сколько 4ч-свечей мерим наклон MA99
 
 # мусорные/тестовые монеты — не торгуем и не показываем
 BLACKLIST = set(x.strip().upper() for x in os.environ.get(
@@ -557,14 +558,18 @@ def analyze(sym):
     rel = (price - e200) / e200 * 100 if e200 else 0
 
     fn("прошли объём")
-    # ---- ФИЛЬТР ТРЕНДА МОНЕТЫ по MA99 ----
-    ma99 = ma(closes, min(99, len(closes)))
+    # ---- ФИЛЬТР ТРЕНДА МОНЕТЫ: НАКЛОН MA99 ----
+    # тренд — это куда идёт средняя, а не где цена относительно неё.
+    # иначе фильтр душит сам отскок: RSI<40 всегда даёт цену ниже MA99.
+    per = min(99, len(closes))
+    ma_now = ma(closes, per)
+    ma_prev = ma(closes[:-MA_SLOPE_BARS], per) if len(closes) > per + MA_SLOPE_BARS else None
     trend = "flat"
-    if ma99:
-        dev = (price - ma99) / ma99 * 100
-        if dev > MA_TREND_FLAT:
+    if ma_now and ma_prev:
+        slope = (ma_now - ma_prev) / ma_prev * 100      # % за MA_SLOPE_BARS свечей
+        if slope > MA_TREND_FLAT:
             trend = "up"
-        elif dev < -MA_TREND_FLAT:
+        elif slope < -MA_TREND_FLAT:
             trend = "down"
 
     out = []
