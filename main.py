@@ -24,6 +24,14 @@ FAPI = os.environ.get("FAPI_BASE", "https://testnet.binancefuture.com").rstrip("
 STATS_START = os.environ.get("STATS_START", "2026-07-21 00:00").strip()
 MSK = timezone(timedelta(hours=3))
 
+# источники рыночных данных: если основной не отвечает — берём следующий
+DATA_HOSTS = [h.strip().rstrip("/") for h in os.environ.get(
+    "DATA_HOSTS",
+    "https://data-api.binance.vision,https://api.binance.com,"
+    "https://api1.binance.com,https://api2.binance.com,https://fapi.binance.com"
+).split(",") if h.strip()]
+_host_idx = {"i": 0}
+
 SIZE = 1000
 RSI_LEVEL = 40
 VOL_MULT = 1.1
@@ -358,9 +366,29 @@ def menu():
     return kb
 
 
+def _api_get(path, tries=None):
+    """GET по рыночным данным с перебором зеркал Binance"""
+    n = len(DATA_HOSTS)
+    order = [(_host_idx["i"] + k) % n for k in range(n)]
+    last = None
+    for k in order:
+        host = DATA_HOSTS[k]
+        p = path
+        if "fapi.binance.com" in host:
+            p = path.replace("/api/v3/", "/fapi/v1/")
+        try:
+            r = requests.get(host + p, timeout=15)
+            if r.status_code == 200:
+                _host_idx["i"] = k          # запоминаем рабочее зеркало
+                return r.json()
+            last = "HTTP " + str(r.status_code)
+        except Exception as e:
+            last = type(e).__name__
+    raise Exception("все источники недоступны (" + str(last) + ")")
+
+
 def get_klines(symbol, limit=250):
-    url = f"https://data-api.binance.vision/api/v3/klines?symbol={symbol}&interval=4h&limit={limit}"
-    r = requests.get(url, timeout=20).json()
+    r = _api_get(f"/api/v3/klines?symbol={symbol}&interval=4h&limit={limit}")
     if not isinstance(r, list) or len(r) < 3:
         raise Exception("нет данных " + symbol)
     return [{"o": float(c[1]), "h": float(c[2]), "l": float(c[3]),
@@ -368,9 +396,8 @@ def get_klines(symbol, limit=250):
 
 
 def get_price(symbol):
-    url = f"https://data-api.binance.vision/api/v3/ticker/price?symbol={symbol}"
-    r = requests.get(url, timeout=15).json()
-    if "price" not in r:
+    r = _api_get(f"/api/v3/ticker/price?symbol={symbol}")
+    if not isinstance(r, dict) or "price" not in r:
         raise Exception("нет цены " + symbol)
     return float(r["price"])
 
@@ -480,8 +507,7 @@ def btc_regime():
 
 
 def top_coins():
-    url = "https://data-api.binance.vision/api/v3/ticker/24hr"
-    r = requests.get(url, timeout=25).json()
+    r = _api_get("/api/v3/ticker/24hr")
     usdt = [x for x in r if x["symbol"].endswith("USDT")]
     usdt.sort(key=lambda x: float(x["quoteVolume"]), reverse=True)
     out = []
@@ -1181,6 +1207,23 @@ if has_keys():
           "| чёрный список:", ",".join(BLACKLIST) or "пусто")
 else:
     print("Binance ключи не заданы — работаю в расчётном режиме")
+# проверяем, какой источник рыночных данных живой
+_ok_host = None
+for _h in DATA_HOSTS:
+    try:
+        _p = "/api/v3/ticker/price?symbol=BTCUSDT"
+        if "fapi.binance.com" in _h:
+            _p = _p.replace("/api/v3/", "/fapi/v1/")
+        _r = requests.get(_h + _p, timeout=10)
+        if _r.status_code == 200:
+            _ok_host = _h
+            _host_idx["i"] = DATA_HOSTS.index(_h)
+            break
+        print("источник", _h, "-> HTTP", _r.status_code)
+    except Exception as _e:
+        print("источник", _h, "->", type(_e).__name__)
+print("рабочий источник данных:", _ok_host or "НИ ОДИН НЕ ОТВЕЧАЕТ!")
+
 threading.Thread(target=auto_loop, daemon=True).start()
 print("Бот отскоков v2 запущен. Автоторговля:", "ВКЛ" if auto_on else "ВЫКЛ")
 bot.infinity_polling()
