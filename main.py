@@ -33,10 +33,11 @@ DATA_HOSTS = [h.strip().rstrip("/") for h in os.environ.get(
 _host_idx = {"i": 0}
 
 SIZE = 1000
-RSI_LEVEL = 40
-VOL_MULT = 1.1
-MAX_DIST = 0.8
-MAX_RISK = 3.0
+RSI_LEVEL = float(os.environ.get("RSI_LEVEL", "40"))    # лонг при RSI<40, шорт при >60
+VOL_MULT = float(os.environ.get("VOL_MULT", "1.1"))     # объём к среднему
+MAX_DIST = float(os.environ.get("MAX_DIST", "0.8"))     # % до уровня — самое узкое место
+MAX_RISK = float(os.environ.get("MAX_RISK", "3.0"))     # макс. стоп, %
+EMA_BAND = float(os.environ.get("EMA_BAND", "15"))      # отклонение от EMA200, %
 RR = 3
 ATR_BUF = 0.5
 MAX_COINS = 200
@@ -72,6 +73,7 @@ tracked = {}
 users = set()
 sent_signals = {}
 _last_quiet = {}
+funnel = {}
 history = {}
 
 
@@ -521,9 +523,14 @@ def top_coins():
     return out
 
 
+def fn(step):
+    funnel[step] = funnel.get(step, 0) + 1
+
+
 def analyze(sym):
     if sym.upper() in BLACKLIST:
         return None
+    fn("всего")
     raw = get_klines(sym + "USDT")
     if len(raw) < 60:
         return None
@@ -539,7 +546,7 @@ def analyze(sym):
         return None
     vr = last["v"] / v20
     if vr < VOL_MULT:
-        return None
+        fn("объём"); return None
     r = rsi(closes)
     if r is None:
         return None
@@ -549,6 +556,7 @@ def analyze(sym):
     e200 = ema(closes, min(200, len(closes)))
     rel = (price - e200) / e200 * 100 if e200 else 0
 
+    fn("прошли объём")
     # ---- ФИЛЬТР ТРЕНДА МОНЕТЫ по MA99 ----
     ma99 = ma(closes, min(99, len(closes)))
     trend = "flat"
@@ -561,32 +569,50 @@ def analyze(sym):
 
     out = []
     # ЛОНГ от поддержки — только если тренд монеты НЕ вниз
-    if r < RSI_LEVEL and rel >= -15 and trend != "down":
+    if r < RSI_LEVEL and rel >= -EMA_BAND:
+        if trend == "down":
+            fn("тренд-против(L)")
+        else:
+            fn("RSI-ок(L)")
+    if r < RSI_LEVEL and rel >= -EMA_BAND and trend != "down":
         sups = [s for s in find_levels(kl, "sup") if s <= price * 1.002]
         if sups:
             lvl = min(sups, key=lambda s: abs(price - s))
             dist = abs(price - lvl) / lvl * 100
+            if dist > MAX_DIST:
+                fn("далеко от уровня(L)")
             if dist <= MAX_DIST and price >= lvl * 0.995:
                 sl = lvl - a * ATR_BUF
                 if sl < price:
                     risk = price - sl
                     rp = risk / price * 100
+                    if rp > MAX_RISK:
+                        fn("стоп широкий(L)")
                     if 0 < rp <= MAX_RISK:
                         pat = detect_reversal(kl, "long") or "нет разворотной"
                         out.append({"side": "long", "sym": sym, "entry": price, "lvl": lvl,
                                     "sl": sl, "tp": price + risk * RR, "risk_pct": rp,
                                     "rsi": r, "vr": vr, "pat": pat, "dist": dist, "trend": trend})
     # ШОРТ от сопротивления — только если тренд монеты НЕ вверх
-    if r > (100 - RSI_LEVEL) and rel <= 15 and trend != "up":
+    if r > (100 - RSI_LEVEL) and rel <= EMA_BAND:
+        if trend == "up":
+            fn("тренд-против(S)")
+        else:
+            fn("RSI-ок(S)")
+    if r > (100 - RSI_LEVEL) and rel <= EMA_BAND and trend != "up":
         ress = [s for s in find_levels(kl, "res") if s >= price * 0.998]
         if ress:
             lvl = min(ress, key=lambda s: abs(s - price))
             dist = abs(lvl - price) / lvl * 100
+            if dist > MAX_DIST:
+                fn("далеко от уровня(S)")
             if dist <= MAX_DIST and price <= lvl * 1.005:
                 sl = lvl + a * ATR_BUF
                 if sl > price:
                     risk = sl - price
                     rp = risk / price * 100
+                    if rp > MAX_RISK:
+                        fn("стоп широкий(S)")
                     if 0 < rp <= MAX_RISK:
                         pat = detect_reversal(kl, "short") or "нет разворотной"
                         out.append({"side": "short", "sym": sym, "entry": price, "lvl": lvl,
@@ -899,8 +925,24 @@ def cb_track(c):
         bot.answer_callback_query(c.id, "Ошибка")
 
 
+def funnel_text():
+    """что где отсеялось — понятно, какой фильтр душит"""
+    if not funnel:
+        return ""
+    order = ["всего", "объём", "прошли объём", "RSI-ок(L)", "RSI-ок(S)",
+             "тренд-против(L)", "тренд-против(S)",
+             "далеко от уровня(L)", "далеко от уровня(S)",
+             "стоп широкий(L)", "стоп широкий(S)"]
+    t = "\n📉 ГДЕ ОТСЕЯЛОСЬ:"
+    for k in order:
+        if funnel.get(k):
+            t += "\n  " + k + ": " + str(funnel[k])
+    return t
+
+
 def do_scan(chat_id, manual=False):
     try:
+        funnel.clear()
         mode, dev = btc_regime()
         coins = top_coins()
         found = []
@@ -972,6 +1014,7 @@ def do_scan(chat_id, manual=False):
                     extra += "\n(" + str(skipped) + " уже в трекинге)"
                 if not auto_on:
                     extra += "\n⚠️ автоторговля ВЫКЛЮЧЕНА"
+                extra += funnel_text()
                 bot.send_message(chat_id, "Подходящих пар сейчас нет.\n" + extra, reply_markup=menu())
             return
 
@@ -986,6 +1029,8 @@ def do_scan(chat_id, manual=False):
             head += "\n(" + str(cut) + " скрыто против BTC)"
         if skipped:
             head += "\n(" + str(skipped) + " уже в трекинге)"
+        if manual:
+            head += funnel_text()
         bot.send_message(chat_id, head)
 
         for s in fresh[:8]:
