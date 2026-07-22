@@ -1271,4 +1271,23 @@ print("рабочий источник данных:", _ok_host or "НИ ОДИ�
 
 threading.Thread(target=auto_loop, daemon=True).start()
 print("Бот отскоков v2 запущен. Автоторговля:", "ВКЛ" if auto_on else "ВЫКЛ")
-bot.infinity_polling()
+
+# снимаем вебхук и старые апдейты — иначе Telegram отдаёт 409 Conflict
+try:
+    bot.remove_webhook()
+    time.sleep(1)
+except Exception as e:
+    print("remove_webhook:", e)
+
+# 409 = где-то ещё живёт старый экземпляр; ждём и пробуем снова, не падая
+while True:
+    try:
+        bot.infinity_polling(skip_pending=True, timeout=30, long_polling_timeout=30)
+    except Exception as e:
+        msg = str(e)
+        if "409" in msg or "Conflict" in msg:
+            print("409: другой экземпляр ещё жив, жду 15с...")
+            time.sleep(15)
+        else:
+            print("polling error:", msg[:200])
+            time.sleep(5)
