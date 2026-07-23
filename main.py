@@ -436,6 +436,89 @@ def split_income(rows):
     return r
 
 
+def group_trades(rows):
+    """
+    Разбивает поток income на ОТДЕЛЬНЫЕ СДЕЛКИ.
+    Раньше группировка шла по монете: три входа в SOL считались за одну сделку.
+    Теперь граница сделки — момент закрытия (кластер записей REALIZED_PNL).
+    Комиссии и фандинг относим к тому закрытию, которое идёт после них.
+    """
+    CLUSTER_SEC = 120          # два филла одного выхода = одна сделка
+    by_sym = {}
+    for x in rows:
+        sym = x.get("symbol") or "—"
+        try:
+            x["_t"] = int(x.get("time", 0))
+            x["_v"] = float(x.get("income", 0))
+        except Exception:
+            continue
+        by_sym.setdefault(sym, []).append(x)
+
+    trades = []
+    for sym, lst in by_sym.items():
+        lst.sort(key=lambda z: z["_t"])
+        # 1) границы закрытий
+        closes = []
+        for x in lst:
+            if x.get("incomeType") != "REALIZED_PNL":
+                continue
+            t = x["_t"]
+            if closes and t - closes[-1][1] <= CLUSTER_SEC * 1000:
+                closes[-1][1] = t
+            else:
+                closes.append([t, t])
+        if not closes:
+            continue
+        # 2) раскидываем записи по закрытиям
+        buckets = [{"sym": sym, "t": c[1], "pnl": 0.0, "fee": 0.0,
+                    "fund": 0.0, "other": 0.0, "n": 0} for c in closes]
+        for x in lst:
+            t = x["_t"]
+            idx = None
+            for i, c in enumerate(closes):
+                if t <= c[1] + CLUSTER_SEC * 1000:
+                    idx = i
+                    break
+            if idx is None:
+                idx = len(closes) - 1
+            b = buckets[idx]
+            ty = x.get("incomeType", "")
+            if ty == "REALIZED_PNL":
+                b["pnl"] += x["_v"]; b["n"] += 1
+            elif ty == "COMMISSION":
+                b["fee"] += x["_v"]
+            elif ty == "FUNDING_FEE":
+                b["fund"] += x["_v"]
+            else:
+                b["other"] += x["_v"]
+        for b in buckets:
+            b["net"] = b["pnl"] + b["fee"] + b["fund"] + b["other"]
+            trades.append(b)
+
+    trades.sort(key=lambda z: z["t"])
+    return trades
+
+
+def last_trade_income(fs, since_ms):
+    """
+    PnL ТОЛЬКО последней закрытой сделки по монете.
+    Раньше складывался весь income за сутки: если по HBAR было три входа,
+    все три попадали в одно сообщение о закрытии (-$45 вместо -$15).
+    """
+    empty = {"pnl": 0.0, "fee": 0.0, "fund": 0.0, "other": 0.0, "n": 0}
+    try:
+        rows = binance_income(since_ms, fs)
+    except Exception as e:
+        print("income error:", e)
+        return empty
+    groups = group_trades(rows)
+    if not groups:
+        return empty
+    g = groups[-1]          # самая свежая группа = только что закрытая сделка
+    return {"pnl": g["pnl"], "fee": g["fee"], "fund": g["fund"],
+            "other": g["other"], "n": g["n"]}
+
+
 def fut_candidates(sym):
     return [sym + "USDT", "1000" + sym + "USDT"]
 
@@ -913,15 +996,10 @@ def btn_stats(m):
         tot = split_income(rows)
         real = tot["pnl"] + tot["fee"] + tot["fund"] + tot["other"]
 
-        by = {}
-        for x in rows:
-            by.setdefault(x.get("symbol") or "—", []).append(x)
-        trades = []
-        for sym, rr in by.items():
-            d = split_income(rr)
-            if d["n"] == 0:
-                continue
-            trades.append(d["pnl"] + d["fee"] + d["fund"])
+        # считаем по ОТДЕЛЬНЫМ СДЕЛКАМ, а не по монетам
+        tr = group_trades(rows)
+        trades = [x["net"] for x in tr]
+        n_syms = len({x["sym"] for x in tr})
 
         total = len(trades)
         wins = [x for x in trades if x > BE_BAND]
@@ -939,7 +1017,7 @@ def btn_stats(m):
 
         L = []
         L.append("📊 ОТСКОК 1:3 v2 · с " + STATS_START + " МСК")
-        L.append(str(total) + " монет · " + str(tot["n"]) + " закрытий")
+        L.append(str(total) + " сделок на " + str(n_syms) + " монетах")
         L.append("")
         L.append("💵 Чистыми:  " + money(real))
         if pos:
@@ -958,11 +1036,8 @@ def btn_stats(m):
         L.append("💸 Комиссии: " + money(tot["fee"]))
         L.append("💱 Фандинг: " + money(tot["fund"]))
         L.append("")
-        days = len({int(x.get("time", 0)) // 86400000 for x in rows
-                    if x.get("incomeType") == "REALIZED_PNL"})
-        cpc = (tot["n"] / total) if total else 0
+        days = len({x["t"] // 86400000 for x in tr})
         L.append("Выборка: " + str(total) + " сделок за " + str(days) + " дн.")
-        L.append("Закрытий на монету: " + format(cpc, ".1f"))
 
         bot.send_message(m.chat.id, "\n".join(L), reply_markup=menu())
     except Exception as e:
@@ -1241,13 +1316,9 @@ def sync_binance():
                         pass
             else:
                 if s.get("bn"):
-                    try:
-                        rows = binance_income(s.get("bn_t", int(time.time() * 1000) - 86400000),
-                                              s.get("bn_sym", s["sym"] + "USDT"))
-                        inc = split_income(rows)
-                    except Exception as e:
-                        print("income error:", e)
-                        inc = {"pnl": 0.0, "fee": 0.0, "fund": 0.0, "other": 0.0, "n": 0}
+                    inc = last_trade_income(
+                        s.get("bn_sym", s["sym"] + "USDT"),
+                        s.get("bn_t", int(time.time() * 1000) - 86400000))
                     net = inc["pnl"] + inc["fee"] + inc["fund"]
                     res = classify(s, net)
                     close_trade_real(chat_id, s, inc, res)
