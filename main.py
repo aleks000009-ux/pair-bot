@@ -363,6 +363,8 @@ def adopt_positions(chat_id):
         sym = fs[:-4] if fs.endswith("USDT") else fs
         tracked[chat_id].append({"sym": sym, "side": side, "entry": entry,
                                  "sl": float(sl), "tp": float(tp), "be": False,
+                                 "sl0": float(sl), "mfe": 0.0,
+                                 "r_usd": SIZE / entry * abs(entry - float(sl)),
                                  "bn": True, "bn_sym": fs, "bn_qty": abs(v["amt"]),
                                  "bn_entry": entry,
                                  "bn_t": int(time.time() * 1000) - 86400000,
@@ -551,7 +553,7 @@ def menu():
     kb = types.ReplyKeyboardMarkup(resize_keyboard=True)
     kb.row("🔍 Найти отскоки")
     kb.row("📋 Мои сделки", "📊 Статистика")
-    kb.row("🤖 Автоторговля")
+    kb.row("📐 Анализ", "🤖 Автоторговля")
     kb.row("🗑 Очистить")
     return kb
 
@@ -889,6 +891,7 @@ def close_trade(chat_id, s, price, result):
     history[chat_id].append({"sym": s["sym"], "side": s["side"], "result": result,
                              "pnl": round(p, 2), "entry": s["entry"], "exit": price,
                              "fee": round(-SIZE * FEE / 100 * 2, 2), "fund": 0.0,
+                             "mfe": s.get("mfe", 0.0), "r_usd": round(s.get("r_usd", 0), 2),
                              "src": "calc", "t": int(time.time())})
     return p
 
@@ -900,6 +903,7 @@ def close_trade_real(chat_id, s, inc, result):
                              "pnl": round(net, 2), "entry": s.get("bn_entry", s["entry"]),
                              "exit": 0, "gross": round(inc["pnl"], 2),
                              "fee": round(inc["fee"], 2), "fund": round(inc["fund"], 2),
+                             "mfe": s.get("mfe", 0.0), "r_usd": round(s.get("r_usd", 0), 2),
                              "src": "binance", "t": int(time.time())})
     return net
 
@@ -1045,6 +1049,64 @@ def btn_stats(m):
                          "\n\nПроверь ключи от testnet.binancefuture.com.", reply_markup=menu())
 
 
+@bot.message_handler(func=lambda m: m.text == "📐 Анализ")
+def btn_mfe(m):
+    """
+    Куда реально доходила цена до разворота.
+    Отвечает на вопрос "1:2 или 1:3" по фактам, а не на глаз.
+    """
+    h = [x for x in history.get(m.chat.id, []) if x.get("mfe") is not None]
+    if len(h) < 5:
+        bot.send_message(m.chat.id,
+            "📐 Пока мало данных: " + str(len(h)) + " сделок с замером.\n\n"
+            "Замер хода включается с этой версии — старые сделки его не имеют.\n"
+            "Нужно 15-20 новых закрытий, тогда покажу, где выгоднее ставить тейк.",
+            reply_markup=menu())
+        return
+
+    mfes = sorted(x.get("mfe", 0.0) for x in h)
+    n = len(mfes)
+    rs = [x.get("r_usd", 0) for x in h if x.get("r_usd")]
+    R = float(np.mean(rs)) if rs else 0.0
+    fee_1 = SIZE * FEE / 100 * 2      # комиссии за круг
+
+    L = ["📐 КУДА ДОХОДИЛА ЦЕНА", "", str(n) + " сделок с замером", ""]
+    L.append("Дошли до:")
+    for lvl in (0.5, 1.0, 1.5, 2.0, 2.5, 3.0):
+        c = sum(1 for v in mfes if v >= lvl)
+        L.append("  " + format(lvl, ".1f") + "R: " + str(c) + "  (" + format(c / n * 100, ".0f") + "%)")
+
+    # прикидываем, что дал бы каждый вариант тейка
+    L.append("")
+    L.append("Что дал бы тейк (за " + str(n) + " сделок):")
+    best, best_v = None, None
+    for rr in (1.5, 2.0, 2.5, 3.0):
+        tot = 0.0
+        wins = 0
+        for v in mfes:
+            if v >= rr:
+                tot += rr * R - fee_1
+                wins += 1
+            elif v >= rr * 0.5:
+                tot += -fee_1              # безубыток: вышли по нулю, заплатили комиссию
+            else:
+                tot += -R - fee_1          # стоп
+        L.append("  1:" + format(rr, ".1f").rstrip("0").rstrip(".")
+                 + "  " + money(tot) + "   побед " + format(wins / n * 100, ".0f") + "%")
+        if best_v is None or tot > best_v:
+            best, best_v = rr, tot
+
+    L.append("")
+    L.append("Сейчас стоит 1:" + str(RR) + ", лучше всего 1:"
+             + format(best, ".1f").rstrip("0").rstrip("."))
+    L.append("")
+    med = mfes[n // 2]
+    L.append("Половина сделок не доходит дальше " + format(med, ".1f") + "R")
+    L.append("(безубыток на 50% пути = " + format(RR * 0.5, ".1f") + "R)")
+
+    bot.send_message(m.chat.id, "\n".join(L), reply_markup=menu())
+
+
 @bot.message_handler(func=lambda m: m.text == "🤖 Автоторговля")
 def btn_auto(m):
     global auto_on
@@ -1090,6 +1152,8 @@ def cb_track(c):
             return
         tracked[c.message.chat.id].append({"sym": sym, "side": side, "entry": entry,
                                            "sl": sl, "tp": tp, "be": False,
+                                           "sl0": sl, "mfe": 0.0,
+                                           "r_usd": SIZE / entry * abs(entry - sl),
                                            "bn": False, "a_tp": False, "a_sl": False,
                                            "t0": int(time.time() * 1000)})
         save()
@@ -1264,6 +1328,8 @@ def auto_enter(chat_id, cands):
         if not any(x["sym"] == s["sym"] for x in tracked[chat_id]):
             tracked[chat_id].append({"sym": s["sym"], "side": s["side"], "entry": s["entry"],
                                      "sl": s["sl"], "tp": s["tp"], "be": False, "bn": False,
+                                     "sl0": s["sl"], "mfe": 0.0,
+                                     "r_usd": SIZE / s["entry"] * abs(s["entry"] - s["sl"]),
                                      "a_tp": False, "a_sl": False, "auto": True,
                                      "t0": int(time.time() * 1000)})
         save()
@@ -1354,6 +1420,18 @@ def auto_loop():
                 for s in list(lst):
                     try:
                         p = get_price(s["sym"] + "USDT")
+
+                        # ---- ЗАМЕР МАКСИМУМА ХОДА (в R) ----
+                        # нужен, чтобы потом честно ответить: где ставить тейк.
+                        # на торговлю никак не влияет, только записывает.
+                        r0 = abs(s["entry"] - s.get("sl0", s["sl"]))
+                        if r0 > 0:
+                            run = ((p - s["entry"]) / r0) if s["side"] == "long" \
+                                else ((s["entry"] - p) / r0)
+                            if run > s.get("mfe", 0.0):
+                                s["mfe"] = round(run, 2)
+                                changed = True
+
                         hit_tp = (p >= s["tp"]) if s["side"] == "long" else (p <= s["tp"])
                         hit_sl = (p <= s["sl"]) if s["side"] == "long" else (p >= s["sl"])
                         on_bn = s.get("bn")
