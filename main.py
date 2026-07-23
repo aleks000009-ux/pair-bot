@@ -102,46 +102,30 @@ def sync_time():
         print("time sync error:", e)
 
 
-# коды, которые считаем успехом при отмене: 200 и "такого ордера нет"
-OK_CODES = {"200", "-2011", "-2013"}
-
-
-def _sig_query(params):
+def signed_post(path, params=None):
     p = dict(params or {})
     p["timestamp"] = int(time.time() * 1000) + _offset["ms"]
     p["recvWindow"] = 10000
     q = urllib.parse.urlencode(p)
     sig = hmac.new(BINANCE_SECRET.encode(), q.encode(), hashlib.sha256).hexdigest()
-    return q + "&signature=" + sig
-
-
-def signed_post(path, params=None):
-    q = _sig_query(params)
-    r = requests.post(FAPI + path + "?" + q,
+    r = requests.post(FAPI + path + "?" + q + "&signature=" + sig,
                       headers={"X-MBX-APIKEY": BINANCE_KEY}, timeout=20)
     d = r.json()
-    if isinstance(d, dict) and "code" in d and "msg" in d and str(d.get("code")) != "200":
+    if isinstance(d, dict) and "code" in d and "msg" in d and d.get("code") != 200:
         raise Exception("Binance: " + str(d.get("code")) + " " + str(d.get("msg")))
     return d
 
 
 def signed_delete(path, params=None):
-    q = _sig_query(params)
-    r = requests.delete(FAPI + path + "?" + q,
+    p = dict(params or {})
+    p["timestamp"] = int(time.time() * 1000) + _offset["ms"]
+    p["recvWindow"] = 10000
+    q = urllib.parse.urlencode(p)
+    sig = hmac.new(BINANCE_SECRET.encode(), q.encode(), hashlib.sha256).hexdigest()
+    r = requests.delete(FAPI + path + "?" + q + "&signature=" + sig,
                         headers={"X-MBX-APIKEY": BINANCE_KEY}, timeout=20)
     d = r.json()
-    # Binance возвращает code то числом, то строкой — сравниваем как строки
-    if isinstance(d, dict) and "code" in d and "msg" in d and str(d.get("code")) not in OK_CODES:
-        raise Exception("Binance: " + str(d.get("code")) + " " + str(d.get("msg")))
-    return d
-
-
-def signed_get(path, params=None):
-    q = _sig_query(params)
-    r = requests.get(FAPI + path + "?" + q,
-                     headers={"X-MBX-APIKEY": BINANCE_KEY}, timeout=20)
-    d = r.json()
-    if isinstance(d, dict) and "code" in d and "msg" in d and str(d.get("code")) != "200":
+    if isinstance(d, dict) and "code" in d and "msg" in d and d.get("code") not in (200, -2011):
         raise Exception("Binance: " + str(d.get("code")) + " " + str(d.get("msg")))
     return d
 
@@ -193,68 +177,16 @@ def place_cond(fs, side, typ, trig):
     return signed_post("/fapi/v1/algoOrder", p)
 
 
-def open_algo_orders(fs=None):
-    """список живых условных ордеров. Правильный путь — GET /fapi/v1/openAlgoOrders"""
-    p = {"symbol": fs} if fs else {}
-    try:
-        d = signed_get("/fapi/v1/openAlgoOrders", p)
-    except Exception as e:
-        print("openAlgoOrders:", str(e)[:90])
-        return []
-    if isinstance(d, list):
-        return d
-    if isinstance(d, dict):
-        for k in ("orders", "data", "rows"):
-            if isinstance(d.get(k), list):
-                return d[k]
-    return []
-
-
-def cancel_algo(fs, only=None):
-    """
-    Снять условные ордера по символу. Отмена — DELETE по algoId.
-    only=None    — все
-    only="STOP"  — только стоп-лосс, тейк не трогаем
-
-    Возвращает:
-      "part" — снял точечно, остальные ордера на месте
-      "all"  — пришлось снести ВСЁ по символу (тейк тоже улетел, его надо вернуть)
-      ""     — не смог ничего
-    """
-    orders = open_algo_orders(fs)
-    if orders:
-        ok = True
-        touched = 0
-        skipped = 0
-        for o in orders:
-            typ = (o.get("type") or o.get("algoType") or "").upper()
-            if only == "STOP" and ("STOP" not in typ or "TAKE_PROFIT" in typ):
-                skipped += 1
-                continue
-            aid = o.get("algoId") or o.get("strategyId")
-            cid = o.get("clientAlgoId")
-            p = {"algoId": aid} if aid else ({"clientAlgoId": cid} if cid else None)
-            if not p:
-                skipped += 1
-                continue
-            try:
-                signed_delete("/fapi/v1/algoOrder", p)
-                touched += 1
-            except Exception as e:
-                print("cancel algoId", aid, ":", str(e)[:90])
-                ok = False
-        if touched and ok:
-            return "part" if skipped else "all"
-        if ok and not touched and only:
-            return "part"      # нечего было снимать — и ладно
-    # запасной вариант: сносим все условные по символу разом.
-    # тейк при этом тоже улетает — вызывающий обязан его вернуть.
-    try:
-        signed_delete("/fapi/v1/algoOpenOrders", {"symbol": fs})
-        return "all"
-    except Exception as e:
-        print("cancel_algo all", fs, ":", str(e)[:90])
-        return ""
+def cancel_algo(fs):
+    """снять все условные ордера по символу — Binance ждёт DELETE, не POST"""
+    ok = False
+    for path in ("/fapi/v1/algoOpenOrders", "/fapi/v1/allOpenOrders"):
+        try:
+            signed_delete(path, {"symbol": fs})
+            ok = True
+        except Exception as e:
+            print("cancel_algo", path, ":", str(e)[:90])
+    return ok
 
 
 def close_now(fs, side, qty):
@@ -286,12 +218,6 @@ def open_trade(chat_id, s):
     opp = "SELL" if side == "BUY" else "BUY"
     cid = "otsk" + str(abs(hash(key)) % 10**10)
 
-    # на всякий случай подчищаем хвосты от прошлых сделок по этой монете
-    try:
-        cancel_algo(fs)
-    except Exception:
-        pass
-
     signed_post("/fapi/v1/order", {"symbol": fs, "side": side, "type": "MARKET",
                                    "quantity": qty, "newClientOrderId": cid})
     opened_keys.add(key)
@@ -308,10 +234,6 @@ def open_trade(chat_id, s):
     if errs:
         try:
             close_now(fs, side, qty)
-            try:
-                cancel_algo(fs)   # чтобы не висел одинокий тейк без позиции
-            except Exception:
-                pass
             opened_keys.discard(key)
             return False, ("❗️ЗАКРЫЛ СРАЗУ — не встали защитные ордера:\n" + "\n".join(errs))
         except Exception as e2:
@@ -323,48 +245,42 @@ def open_trade(chat_id, s):
 
 
 def move_stop_be(s):
-    """
-    Двигаем в безубыток ТОЛЬКО стоп-лосс. Тейк по возможности не трогаем —
-    его повторная постановка даёт -4130 (такой ордер уже есть).
-    Если снять точечно не вышло и снесли всё — тейк обязательно возвращаем.
-    """
+    """бот сам двигает стоп в безубыток: отменяет старые условные, ставит новые"""
     fs = s.get("bn_sym") or auto_symbol(s["sym"])
     if not fs:
         return False
     f = _filters.get(fs)
     if not f:
         return False
-
-    mode = cancel_algo(fs, only="STOP")
-    if not mode:
-        print("move_stop_be: не снял старый стоп", fs)
-        return False
-
+    if not cancel_algo(fs):
+        print("move_stop_be: не удалось снять старые ордера", fs)
     opp = "SELL" if s["side"] == "long" else "BUY"
     be = step_round(s.get("bn_entry", s["entry"]), f["tick"])
     tp = step_round(s["tp"], f["tick"])
-
-    # если снесли всё — тейк вернуть ОБЯЗАТЕЛЬНО, иначе позиция без цели
-    tp_back = True
-    if mode == "all":
-        try:
-            place_cond(fs, opp, "TAKE_PROFIT_MARKET", tp)
-        except Exception as e:
-            print("move_stop: тейк не вернулся", fs, ":", str(e)[:120])
-            tp_back = False
-
+    ok = True
     try:
         place_cond(fs, opp, "STOP_MARKET", be)
-        return tp_back
     except Exception as e:
-        print("move_stop SL:", str(e)[:120])
-        # новый стоп не встал — возвращаем прежний, чтобы позиция не осталась голой
-        try:
-            place_cond(fs, opp, "STOP_MARKET", step_round(s["sl"], f["tick"]))
-            print("вернул прежний стоп", fs)
-        except Exception as e2:
-            print("НЕ ВЕРНУЛ СТОП", fs, ":", str(e2)[:120])
-        return False
+        print("move_stop SL:", e); ok = False
+    try:
+        place_cond(fs, opp, "TAKE_PROFIT_MARKET", tp)
+    except Exception as e:
+        print("move_stop TP:", e); ok = False
+    return ok
+
+
+def signed_get(path, params=None):
+    p = dict(params or {})
+    p["timestamp"] = int(time.time() * 1000) + _offset["ms"]
+    p["recvWindow"] = 10000
+    q = urllib.parse.urlencode(p)
+    sig = hmac.new(BINANCE_SECRET.encode(), q.encode(), hashlib.sha256).hexdigest()
+    url = FAPI + path + "?" + q + "&signature=" + sig
+    r = requests.get(url, headers={"X-MBX-APIKEY": BINANCE_KEY}, timeout=20)
+    d = r.json()
+    if isinstance(d, dict) and "code" in d and "msg" in d:
+        raise Exception("Binance: " + str(d.get("code")) + " " + str(d.get("msg")))
+    return d
 
 
 def binance_positions():
@@ -385,30 +301,32 @@ def binance_positions():
 def algo_open_orders():
     """открытые условные ордера -> {symbol: {'tp':цена,'sl':цена}}"""
     out = {}
-    rows = open_algo_orders()
-    if not rows:
+    for path in ("/fapi/v1/algoOpenOrders", "/fapi/v1/openOrders"):
         try:
-            d = signed_get("/fapi/v1/openOrders")
-            rows = d if isinstance(d, list) else []
-        except Exception:
-            rows = []
-    for o in rows:
-        sym = o.get("symbol")
-        if not sym:
-            continue
-        typ = (o.get("type") or o.get("algoType") or "").upper()
-        trg = o.get("triggerPrice") or o.get("stopPrice") or 0
-        try:
-            trg = float(trg)
+            d = signed_get(path)
         except Exception:
             continue
-        if trg <= 0:
+        if not isinstance(d, list):
             continue
-        out.setdefault(sym, {})
-        if "TAKE_PROFIT" in typ:
-            out[sym]["tp"] = trg
-        elif "STOP" in typ:
-            out[sym]["sl"] = trg
+        for o in d:
+            sym = o.get("symbol")
+            if not sym:
+                continue
+            typ = (o.get("type") or o.get("algoType") or "").upper()
+            trg = o.get("triggerPrice") or o.get("stopPrice") or 0
+            try:
+                trg = float(trg)
+            except Exception:
+                continue
+            if trg <= 0:
+                continue
+            out.setdefault(sym, {})
+            if "TAKE_PROFIT" in typ:
+                out[sym]["tp"] = trg
+            elif "STOP" in typ:
+                out[sym]["sl"] = trg
+        if out:
+            break
     return out
 
 
@@ -518,69 +436,6 @@ def split_income(rows):
     return r
 
 
-def group_trades(rows):
-    """
-    Разбиваем поток income на ОТДЕЛЬНЫЕ СДЕЛКИ.
-    Раньше группировали по монете — три сделки по SOL считались за одну.
-    Теперь: закрытие = кластер записей REALIZED_PNL в пределах CLUSTER_SEC.
-    Комиссии и фандинг вешаем на то закрытие, которое идёт после них.
-    """
-    CLUSTER_SEC = 120
-    by_sym = {}
-    for x in rows:
-        sym = x.get("symbol") or "—"
-        try:
-            x["_t"] = int(x.get("time", 0))
-            x["_v"] = float(x.get("income", 0))
-        except Exception:
-            continue
-        by_sym.setdefault(sym, []).append(x)
-
-    trades = []
-    for sym, lst in by_sym.items():
-        lst.sort(key=lambda z: z["_t"])
-        # 1) находим границы закрытий
-        closes = []          # [(t_начало_кластера, t_конца_кластера)]
-        for x in lst:
-            if x.get("incomeType") != "REALIZED_PNL":
-                continue
-            t = x["_t"]
-            if closes and t - closes[-1][1] <= CLUSTER_SEC * 1000:
-                closes[-1][1] = t
-            else:
-                closes.append([t, t])
-        if not closes:
-            continue
-        # 2) раскидываем все записи по этим закрытиям
-        buckets = [{"sym": sym, "t": c[1], "pnl": 0.0, "fee": 0.0,
-                    "fund": 0.0, "other": 0.0, "n": 0} for c in closes]
-        for x in lst:
-            t = x["_t"]
-            idx = None
-            for i, c in enumerate(closes):
-                if t <= c[1] + CLUSTER_SEC * 1000:
-                    idx = i
-                    break
-            if idx is None:
-                idx = len(closes) - 1      # хвост после последнего закрытия
-            b = buckets[idx]
-            ty = x.get("incomeType", "")
-            if ty == "REALIZED_PNL":
-                b["pnl"] += x["_v"]; b["n"] += 1
-            elif ty == "COMMISSION":
-                b["fee"] += x["_v"]
-            elif ty == "FUNDING_FEE":
-                b["fund"] += x["_v"]
-            else:
-                b["other"] += x["_v"]
-        for b in buckets:
-            b["net"] = b["pnl"] + b["fee"] + b["fund"] + b["other"]
-            trades.append(b)
-
-    trades.sort(key=lambda z: z["t"])
-    return trades
-
-
 def fut_candidates(sym):
     return [sym + "USDT", "1000" + sym + "USDT"]
 
@@ -613,7 +468,7 @@ def menu():
     kb = types.ReplyKeyboardMarkup(resize_keyboard=True)
     kb.row("🔍 Найти отскоки")
     kb.row("📋 Мои сделки", "📊 Статистика")
-    kb.row("🧾 Журнал", "🤖 Автоторговля")
+    kb.row("🤖 Автоторговля")
     kb.row("🗑 Очистить")
     return kb
 
@@ -1058,18 +913,23 @@ def btn_stats(m):
         tot = split_income(rows)
         real = tot["pnl"] + tot["fee"] + tot["fund"] + tot["other"]
 
-        # каждая сделка отдельно (раньше три сделки по одной монете = одна строка)
-        tr = group_trades(rows)
-        vals = [x["net"] for x in tr]
+        by = {}
+        for x in rows:
+            by.setdefault(x.get("symbol") or "—", []).append(x)
+        trades = []
+        for sym, rr in by.items():
+            d = split_income(rr)
+            if d["n"] == 0:
+                continue
+            trades.append(d["pnl"] + d["fee"] + d["fund"])
 
-        total = len(vals)
-        wins = [x for x in vals if x > BE_BAND]
-        losses = [x for x in vals if x < -BE_BAND]
-        bes = [x for x in vals if abs(x) <= BE_BAND]
+        total = len(trades)
+        wins = [x for x in trades if x > BE_BAND]
+        losses = [x for x in trades if x < -BE_BAND]
+        bes = [x for x in trades if abs(x) <= BE_BAND]
         wr = (len(wins) / total * 100) if total else 0
         avg_w = float(np.mean(wins)) if wins else 0.0
         avg_l = float(np.mean([abs(x) for x in losses])) if losses else 0.0
-        n_syms = len({x["sym"] for x in tr})
 
         try:
             pos = {k: v for k, v in binance_positions().items() if k.upper() not in STATS_IGNORE}
@@ -1079,7 +939,7 @@ def btn_stats(m):
 
         L = []
         L.append("📊 ОТСКОК 1:3 v2 · с " + STATS_START + " МСК")
-        L.append(str(total) + " сделок на " + str(n_syms) + " монетах")
+        L.append(str(total) + " монет · " + str(tot["n"]) + " закрытий")
         L.append("")
         L.append("💵 Чистыми:  " + money(real))
         if pos:
@@ -1098,51 +958,16 @@ def btn_stats(m):
         L.append("💸 Комиссии: " + money(tot["fee"]))
         L.append("💱 Фандинг: " + money(tot["fund"]))
         L.append("")
-        days = len({x["t"] // 86400000 for x in tr})
+        days = len({int(x.get("time", 0)) // 86400000 for x in rows
+                    if x.get("incomeType") == "REALIZED_PNL"})
+        cpc = (tot["n"] / total) if total else 0
         L.append("Выборка: " + str(total) + " сделок за " + str(days) + " дн.")
-        if total < 15:
-            L.append("⏳ Мало данных. Выводы делать рано —")
-            L.append("нужно 15-20 сделок.")
-        else:
-            # сколько нужно попаданий, чтобы стратегия была в плюс
-            need = (avg_l / (avg_w + avg_l) * 100) if (avg_w + avg_l) > 0 else 0
-            L.append("Порог безубытка: " + format(need, ".0f") + "% побед")
+        L.append("Закрытий на монету: " + format(cpc, ".1f"))
 
         bot.send_message(m.chat.id, "\n".join(L), reply_markup=menu())
     except Exception as e:
         bot.send_message(m.chat.id, "Ошибка Binance: " + str(e) +
                          "\n\nПроверь ключи от testnet.binancefuture.com.", reply_markup=menu())
-
-
-@bot.message_handler(func=lambda m: m.text == "🧾 Журнал")
-def btn_journal(m):
-    """список закрытых сделок — видно, что именно попало в статистику"""
-    if not has_keys():
-        bot.send_message(m.chat.id, "⚠️ Binance не подключён.", reply_markup=menu())
-        return
-    bot.send_message(m.chat.id, "Собираю журнал...")
-    try:
-        rows = income_all(stats_start_ms())
-        rows = [x for x in rows if (x.get("symbol") or "").upper() not in STATS_IGNORE]
-        tr = group_trades(rows)
-        if not tr:
-            bot.send_message(m.chat.id, "Закрытых сделок пока нет.", reply_markup=menu())
-            return
-        L = ["🧾 ЗАКРЫТЫЕ СДЕЛКИ (" + str(len(tr)) + ")", ""]
-        run = 0.0
-        for i, t in enumerate(tr[-30:], 1):
-            run += t["net"]
-            d = datetime.fromtimestamp(t["t"] / 1000, MSK).strftime("%d.%m %H:%M")
-            ic = "🟢" if t["net"] > BE_BAND else ("🔴" if t["net"] < -BE_BAND else "🛡")
-            sym = t["sym"].replace("USDT", "")
-            L.append(ic + " " + d + "  " + sym + "  " + money(t["net"]))
-        L.append("")
-        L.append("Сумма показанных: " + money(run))
-        if len(tr) > 30:
-            L.append("(показал последние 30 из " + str(len(tr)) + ")")
-        bot.send_message(m.chat.id, "\n".join(L), reply_markup=menu())
-    except Exception as e:
-        bot.send_message(m.chat.id, "Ошибка: " + str(e), reply_markup=menu())
 
 
 @bot.message_handler(func=lambda m: m.text == "🤖 Автоторговля")
@@ -1416,19 +1241,13 @@ def sync_binance():
                         pass
             else:
                 if s.get("bn"):
-                    fs_closed = s.get("bn_sym", s["sym"] + "USDT")
                     try:
                         rows = binance_income(s.get("bn_t", int(time.time() * 1000) - 86400000),
-                                              fs_closed)
+                                              s.get("bn_sym", s["sym"] + "USDT"))
                         inc = split_income(rows)
                     except Exception as e:
                         print("income error:", e)
                         inc = {"pnl": 0.0, "fee": 0.0, "fund": 0.0, "other": 0.0, "n": 0}
-                    # позиция закрыта — убираем осиротевшие условные ордера
-                    try:
-                        cancel_algo(fs_closed)
-                    except Exception:
-                        pass
                     net = inc["pnl"] + inc["fee"] + inc["fund"]
                     res = classify(s, net)
                     close_trade_real(chat_id, s, inc, res)
@@ -1500,8 +1319,7 @@ def auto_loop():
                             continue
 
                         # ---- АВТО-БЕЗУБЫТОК: бот сам двигает стоп на бирже ----
-                        # если 3 попытки подряд не прошли — перестаём долбиться и говорим об этом
-                        if not s.get("be") and not s.get("be_off"):
+                        if not s.get("be"):
                             half = s["entry"] + (s["tp"] - s["entry"]) * 0.5
                             reached = (p >= half) if s["side"] == "long" else (p <= half)
                             if reached:
@@ -1511,21 +1329,11 @@ def auto_loop():
                                 if moved:
                                     s["sl"] = s.get("bn_entry", s["entry"])
                                     s["be"] = True
-                                    s["be_try"] = 0
                                     changed = True
                                     bot.send_message(chat_id,
                                         "🛡 БЕЗУБЫТОК: " + s["sym"] + " прошёл половину пути.\n"
                                         "Стоп передвинут на вход " + fmt(s["sl"]) + " автоматически.\n"
                                         "Дальше сделка бесплатная.", reply_markup=menu())
-                                else:
-                                    s["be_try"] = s.get("be_try", 0) + 1
-                                    changed = True
-                                    if s["be_try"] >= 3:
-                                        s["be_off"] = True
-                                        bot.send_message(chat_id,
-                                            "⚠️ " + s["sym"] + ": не смог передвинуть стоп в безубыток.\n"
-                                            "Прежний стоп " + fmt(s["sl"]) + " и тейк на бирже стоят — позиция защищена.\n"
-                                            "Больше не пробую, чтобы не спамить.", reply_markup=menu())
                     except Exception:
                         pass
                     time.sleep(0.3)
