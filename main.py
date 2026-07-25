@@ -36,12 +36,14 @@ SIZE = 1000
 # --- ПРОБОЙ: старший ТФ 4ч задаёт тренд и уровни, торговый 1ч ищет вход ---
 RSI_MAX = float(os.environ.get("RSI_MAX", "72"))        # не входим в лонг если RSI>72 (перекуплен)
 RSI_MIN = float(os.environ.get("RSI_MIN", "28"))        # не входим в шорт если RSI<28 (перепродан)
-VOL_MULT = float(os.environ.get("VOL_MULT", "1.2"))     # объём пробойной свечи к среднему
+VOL_MULT = float(os.environ.get("VOL_MULT", "1.5"))     # объём пробойной свечи к среднему
 MAX_RISK = float(os.environ.get("MAX_RISK", "3.0"))     # макс. стоп, %
 ATR_STOP = float(os.environ.get("ATR_STOP", "2.0"))     # стоп = ATR_STOP × ATR(1ч)
 ATR_MIN = float(os.environ.get("ATR_MIN", "0.5"))       # рынок "спит" если ATR < этого % от цены
 LVL_BARS = int(os.environ.get("LVL_BARS", "15"))        # уровень = хай/лоу N свечей 4ч
-BRK_BUF = float(os.environ.get("BRK_BUF", "0.03"))      # запас пробоя, % (чтобы не ловить касание)
+BRK_BUF = float(os.environ.get("BRK_BUF", "0.15"))      # запас пробоя, % (фильтр шума и фитилей)
+MAX_SLIP = float(os.environ.get("MAX_SLIP", "0.3"))     # если цена ушла от закрытия свечи >этого % — вход пропускаем
+FAKEOUT_BARS = int(os.environ.get("FAKEOUT_BARS", "3")) # свечей 1ч назад проверяем на ложный пробой
 RR = int(os.environ.get("RR", "3"))
 MAX_COINS = 200
 FEE = 0.055
@@ -782,6 +784,12 @@ def analyze(sym):
     brk = kl1[-1]                                 # последняя ЗАКРЫТАЯ 1ч свеча
     price = get_price(sym + "USDT")
 
+    # защита от проскальзывания: если рынок убежал от закрытия свечи —
+    # реальный риск будет больше расчётного, вход пропускаем
+    slip = abs(price - brk["c"]) / brk["c"] * 100
+    if slip > MAX_SLIP:
+        fn("убежала цена"); return None
+
     a1 = atr(kl1)
     if not a1:
         return None
@@ -793,6 +801,12 @@ def analyze(sym):
         return None
     vr = brk["v"] / v20
 
+    # антификаут: не входим, если в последние FAKEOUT_BARS свечей
+    # цена уже была за уровнем и вернулась (ложный пробой этого же уровня)
+    recent = kl1[-(FAKEOUT_BARS + 1):-1] if len(kl1) > FAKEOUT_BARS + 1 else []
+    fakeout_up = any(k["c"] > res_lvl for k in recent)
+    fakeout_dn = any(k["c"] < sup_lvl for k in recent)
+
     out = []
 
     # ---- ЛОНГ: аптренд + пробой сопротивления вверх ----
@@ -800,20 +814,23 @@ def analyze(sym):
         broke = brk["c"] > res_lvl * (1 + BRK_BUF / 100)
         if broke:
             fn("пробой вверх")
-            if vr < VOL_MULT:
+            if fakeout_up:
+                fn("ложный пробой(L)")
+            elif vr < VOL_MULT:
                 fn("нет объёма(L)")
             elif r1 > RSI_MAX:
                 fn("перекуплен(L)")
             else:
+                # РИСК СЧИТАЕМ ОТ ЗАКРЫТИЯ ПРОБОЙНОЙ СВЕЧИ, не от текущей цены
                 sl = brk["c"] - a1 * ATR_STOP
                 if sl < price:
-                    risk = price - sl
-                    rp = risk / price * 100
+                    risk = brk["c"] - sl
+                    rp = risk / brk["c"] * 100
                     if rp > MAX_RISK:
                         fn("стоп широкий(L)")
                     elif 0 < rp <= MAX_RISK:
                         out.append({"side": "long", "sym": sym, "entry": price,
-                                    "lvl": res_lvl, "sl": sl, "tp": price + risk * RR,
+                                    "lvl": res_lvl, "sl": sl, "tp": brk["c"] + risk * RR,
                                     "risk_pct": rp, "rsi": r1, "vr": vr,
                                     "pat": "⬆️ Пробой", "dist": 0.0, "trend": regime})
 
@@ -822,20 +839,22 @@ def analyze(sym):
         broke = brk["c"] < sup_lvl * (1 - BRK_BUF / 100)
         if broke:
             fn("пробой вниз")
-            if vr < VOL_MULT:
+            if fakeout_dn:
+                fn("ложный пробой(S)")
+            elif vr < VOL_MULT:
                 fn("нет объёма(S)")
             elif r1 < RSI_MIN:
                 fn("перепродан(S)")
             else:
                 sl = brk["c"] + a1 * ATR_STOP
                 if sl > price:
-                    risk = sl - price
-                    rp = risk / price * 100
+                    risk = sl - brk["c"]
+                    rp = risk / brk["c"] * 100
                     if rp > MAX_RISK:
                         fn("стоп широкий(S)")
                     elif 0 < rp <= MAX_RISK:
                         out.append({"side": "short", "sym": sym, "entry": price,
-                                    "lvl": sup_lvl, "sl": sl, "tp": price - risk * RR,
+                                    "lvl": sup_lvl, "sl": sl, "tp": brk["c"] - risk * RR,
                                     "risk_pct": rp, "rsi": r1, "vr": vr,
                                     "pat": "⬇️ Пробой", "dist": 0.0, "trend": regime})
     return out
@@ -1203,8 +1222,9 @@ def funnel_text():
     """что где отсеялось — понятно, какой фильтр душит"""
     if not funnel:
         return ""
-    order = ["всего", "сон EMA", "низкий ATR", "режим ок",
+    order = ["всего", "сон EMA", "низкий ATR", "режим ок", "убежала цена",
              "пробой вверх", "пробой вниз",
+             "ложный пробой(L)", "ложный пробой(S)",
              "нет объёма(L)", "нет объёма(S)",
              "перекуплен(L)", "перепродан(S)",
              "стоп широкий(L)", "стоп широкий(S)"]
