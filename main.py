@@ -33,17 +33,25 @@ DATA_HOSTS = [h.strip().rstrip("/") for h in os.environ.get(
 _host_idx = {"i": 0}
 
 SIZE = 1000
-RSI_LEVEL = float(os.environ.get("RSI_LEVEL", "40"))    # лонг при RSI<40, шорт при >60
-VOL_MULT = float(os.environ.get("VOL_MULT", "1.1"))     # объём к среднему
-MAX_DIST = float(os.environ.get("MAX_DIST", "0.8"))     # % до уровня — самое узкое место
+# --- ПРОБОЙ: старший ТФ 4ч задаёт тренд и уровни, торговый 1ч ищет вход ---
+RSI_MAX = float(os.environ.get("RSI_MAX", "72"))        # не входим в лонг если RSI>72 (перекуплен)
+RSI_MIN = float(os.environ.get("RSI_MIN", "28"))        # не входим в шорт если RSI<28 (перепродан)
+VOL_MULT = float(os.environ.get("VOL_MULT", "1.2"))     # объём пробойной свечи к среднему
 MAX_RISK = float(os.environ.get("MAX_RISK", "3.0"))     # макс. стоп, %
-EMA_BAND = float(os.environ.get("EMA_BAND", "15"))      # отклонение от EMA200, %
-RR = 3
-ATR_BUF = 0.5
+ATR_STOP = float(os.environ.get("ATR_STOP", "2.0"))     # стоп = ATR_STOP × ATR(1ч)
+ATR_MIN = float(os.environ.get("ATR_MIN", "0.5"))       # рынок "спит" если ATR < этого % от цены
+LVL_BARS = int(os.environ.get("LVL_BARS", "15"))        # уровень = хай/лоу N свечей 4ч
+BRK_BUF = float(os.environ.get("BRK_BUF", "0.03"))      # запас пробоя, % (чтобы не ловить касание)
+RR = int(os.environ.get("RR", "3"))
 MAX_COINS = 200
 FEE = 0.055
 BE_BAND = 5.0
 BTC_FLAT = 0.7
+# старые параметры отскока — оставлены, чтобы ничего не падало, в пробое не используются
+RSI_LEVEL = float(os.environ.get("RSI_LEVEL", "40"))
+MAX_DIST = float(os.environ.get("MAX_DIST", "0.8"))
+EMA_BAND = float(os.environ.get("EMA_BAND", "15"))
+ATR_BUF = 0.5
 # фильтр по тренду BTC: 0 = выкл (MA99 монеты решает всё), 1 = вкл
 BTC_FILTER = os.environ.get("BTC_FILTER", "0") == "1"
 
@@ -551,7 +559,7 @@ def load():
 
 def menu():
     kb = types.ReplyKeyboardMarkup(resize_keyboard=True)
-    kb.row("🔍 Найти отскоки")
+    kb.row("🔍 Найти пробои")
     kb.row("📋 Мои сделки", "📊 Статистика")
     kb.row("📐 Анализ", "🤖 Автоторговля")
     kb.row("🗑 Очистить")
@@ -579,12 +587,17 @@ def _api_get(path, tries=None):
     raise Exception("все источники недоступны (" + str(last) + ")")
 
 
-def get_klines(symbol, limit=250):
-    r = _api_get(f"/api/v3/klines?symbol={symbol}&interval=4h&limit={limit}")
+def get_klines_tf(symbol, interval, limit=250):
+    """свечи любого таймфрейма (для пробоя нужны и 4ч, и 1ч)"""
+    r = _api_get(f"/api/v3/klines?symbol={symbol}&interval={interval}&limit={limit}")
     if not isinstance(r, list) or len(r) < 3:
         raise Exception("нет данных " + symbol)
     return [{"o": float(c[1]), "h": float(c[2]), "l": float(c[3]),
              "c": float(c[4]), "v": float(c[5]), "close_t": int(c[6])} for c in r]
+
+
+def get_klines(symbol, limit=250):
+    return get_klines_tf(symbol, "4h", limit)
 
 
 def get_price(symbol):
@@ -718,100 +731,113 @@ def fn(step):
 
 
 def analyze(sym):
+    """
+    ПРОБОЙ. Старший ТФ 4ч: тренд (EMA50/200) + уровни (хай/лоу N свечей).
+    Торговый ТФ 1ч: вход по ЗАКРЫТОЙ свече, пробившей уровень, с объёмом.
+    Лонг только в аптренде, шорт только в даунтренде. Между EMA — сон.
+    """
     if sym.upper() in BLACKLIST:
         return None
     fn("всего")
-    raw = get_klines(sym + "USDT")
-    if len(raw) < 60:
+
+    # --- СТАРШИЙ ТФ 4ч: направление и уровни ---
+    raw4 = get_klines(sym + "USDT", 250)          # 4ч по умолчанию
+    if len(raw4) < 210:
         return None
     now_ms = int(time.time() * 1000)
-    kl = raw[:-1] if raw[-1]["close_t"] > now_ms else raw
-    if len(kl) < 60:
+    kl4 = raw4[:-1] if raw4[-1]["close_t"] > now_ms else raw4
+    closes4 = [k["c"] for k in kl4]
+    e50 = ema(closes4, 50)
+    e200 = ema(closes4, 200)
+    if not e50 or not e200:
         return None
-    closes = [k["c"] for k in kl]
-    last = kl[-1]
+    p4 = closes4[-1]
+
+    # режим по EMA: выше обеих — up, ниже обеих — down, между — сон
+    if p4 > e50 and p4 > e200:
+        regime = "up"
+    elif p4 < e50 and p4 < e200:
+        regime = "down"
+    else:
+        fn("сон EMA"); return None
+
+    # волатильность старшего ТФ: слишком тихо — не торгуем
+    a4 = atr(kl4)
+    if not a4 or a4 / p4 * 100 < ATR_MIN:
+        fn("низкий ATR"); return None
+    fn("режим ок")
+
+    # уровни = экстремумы последних LVL_BARS ЗАКРЫТЫХ свечей 4ч
+    seg = kl4[-(LVL_BARS + 1):-1] if len(kl4) > LVL_BARS + 1 else kl4[:-1]
+    res_lvl = max(k["h"] for k in seg)            # сопротивление
+    sup_lvl = min(k["l"] for k in seg)            # поддержка
+
+    # --- ТОРГОВЫЙ ТФ 1ч: ищем закрытие за уровнем ---
+    raw1 = get_klines_tf(sym + "USDT", "1h", 60)
+    if not raw1 or len(raw1) < 25:
+        return None
+    kl1 = raw1[:-1] if raw1[-1]["close_t"] > now_ms else raw1
+    if len(kl1) < 25:
+        return None
+    brk = kl1[-1]                                 # последняя ЗАКРЫТАЯ 1ч свеча
     price = get_price(sym + "USDT")
-    v20 = np.mean([k["v"] for k in kl[-21:-1]])
+
+    a1 = atr(kl1)
+    if not a1:
+        return None
+    r1 = rsi([k["c"] for k in kl1])
+    if r1 is None:
+        return None
+    v20 = np.mean([k["v"] for k in kl1[-21:-1]])
     if v20 <= 0:
         return None
-    vr = last["v"] / v20
-    if vr < VOL_MULT:
-        fn("объём"); return None
-    r = rsi(closes)
-    if r is None:
-        return None
-    a = atr(kl)
-    if not a:
-        return None
-    e200 = ema(closes, min(200, len(closes)))
-    rel = (price - e200) / e200 * 100 if e200 else 0
-
-    fn("прошли объём")
-    # ---- ФИЛЬТР ТРЕНДА МОНЕТЫ: НАКЛОН MA99 ----
-    # тренд — это куда идёт средняя, а не где цена относительно неё.
-    # иначе фильтр душит сам отскок: RSI<40 всегда даёт цену ниже MA99.
-    per = min(99, len(closes))
-    ma_now = ma(closes, per)
-    ma_prev = ma(closes[:-MA_SLOPE_BARS], per) if len(closes) > per + MA_SLOPE_BARS else None
-    trend = "flat"
-    if ma_now and ma_prev:
-        slope = (ma_now - ma_prev) / ma_prev * 100      # % за MA_SLOPE_BARS свечей
-        if slope > MA_TREND_FLAT:
-            trend = "up"
-        elif slope < -MA_TREND_FLAT:
-            trend = "down"
+    vr = brk["v"] / v20
 
     out = []
-    # ЛОНГ от поддержки — только если тренд монеты НЕ вниз
-    if r < RSI_LEVEL and rel >= -EMA_BAND:
-        if trend == "down":
-            fn("тренд-против(L)")
-        else:
-            fn("RSI-ок(L)")
-    if r < RSI_LEVEL and rel >= -EMA_BAND and trend != "down":
-        sups = [s for s in find_levels(kl, "sup") if s <= price * 1.002]
-        if sups:
-            lvl = min(sups, key=lambda s: abs(price - s))
-            dist = abs(price - lvl) / lvl * 100
-            if dist > MAX_DIST:
-                fn("далеко от уровня(L)")
-            if dist <= MAX_DIST and price >= lvl * 0.995:
-                sl = lvl - a * ATR_BUF
+
+    # ---- ЛОНГ: аптренд + пробой сопротивления вверх ----
+    if regime == "up":
+        broke = brk["c"] > res_lvl * (1 + BRK_BUF / 100)
+        if broke:
+            fn("пробой вверх")
+            if vr < VOL_MULT:
+                fn("нет объёма(L)")
+            elif r1 > RSI_MAX:
+                fn("перекуплен(L)")
+            else:
+                sl = brk["c"] - a1 * ATR_STOP
                 if sl < price:
                     risk = price - sl
                     rp = risk / price * 100
                     if rp > MAX_RISK:
                         fn("стоп широкий(L)")
-                    if 0 < rp <= MAX_RISK:
-                        pat = detect_reversal(kl, "long") or "нет разворотной"
-                        out.append({"side": "long", "sym": sym, "entry": price, "lvl": lvl,
-                                    "sl": sl, "tp": price + risk * RR, "risk_pct": rp,
-                                    "rsi": r, "vr": vr, "pat": pat, "dist": dist, "trend": trend})
-    # ШОРТ от сопротивления — только если тренд монеты НЕ вверх
-    if r > (100 - RSI_LEVEL) and rel <= EMA_BAND:
-        if trend == "up":
-            fn("тренд-против(S)")
-        else:
-            fn("RSI-ок(S)")
-    if r > (100 - RSI_LEVEL) and rel <= EMA_BAND and trend != "up":
-        ress = [s for s in find_levels(kl, "res") if s >= price * 0.998]
-        if ress:
-            lvl = min(ress, key=lambda s: abs(s - price))
-            dist = abs(lvl - price) / lvl * 100
-            if dist > MAX_DIST:
-                fn("далеко от уровня(S)")
-            if dist <= MAX_DIST and price <= lvl * 1.005:
-                sl = lvl + a * ATR_BUF
+                    elif 0 < rp <= MAX_RISK:
+                        out.append({"side": "long", "sym": sym, "entry": price,
+                                    "lvl": res_lvl, "sl": sl, "tp": price + risk * RR,
+                                    "risk_pct": rp, "rsi": r1, "vr": vr,
+                                    "pat": "⬆️ Пробой", "dist": 0.0, "trend": regime})
+
+    # ---- ШОРТ: даунтренд + пробой поддержки вниз ----
+    if regime == "down":
+        broke = brk["c"] < sup_lvl * (1 - BRK_BUF / 100)
+        if broke:
+            fn("пробой вниз")
+            if vr < VOL_MULT:
+                fn("нет объёма(S)")
+            elif r1 < RSI_MIN:
+                fn("перепродан(S)")
+            else:
+                sl = brk["c"] + a1 * ATR_STOP
                 if sl > price:
                     risk = sl - price
                     rp = risk / price * 100
                     if rp > MAX_RISK:
                         fn("стоп широкий(S)")
-                    if 0 < rp <= MAX_RISK:
-                        pat = detect_reversal(kl, "short") or "нет разворотной"
-                        out.append({"side": "short", "sym": sym, "entry": price, "lvl": lvl,
-                                    "sl": sl, "tp": price - risk * RR, "risk_pct": rp,
-                                    "rsi": r, "vr": vr, "pat": pat, "dist": dist, "trend": trend})
+                    elif 0 < rp <= MAX_RISK:
+                        out.append({"side": "short", "sym": sym, "entry": price,
+                                    "lvl": sup_lvl, "sl": sl, "tp": price - risk * RR,
+                                    "risk_pct": rp, "rsi": r1, "vr": vr,
+                                    "pat": "⬇️ Пробой", "dist": 0.0, "trend": regime})
     return out
 
 
@@ -833,22 +859,28 @@ def pnl_usd(s, price):
 
 
 def grade(s):
+    # оценка силы пробоя (6 баллов)
     pts = 0
-    if s["pat"] != "нет разворотной":
-        pts += 2
-    if s["rsi"] <= 32 or s["rsi"] >= 68:
+    if s["vr"] >= 2.0:
+        pts += 2                       # мощный объём — главный признак настоящего пробоя
+    elif s["vr"] >= 1.5:
         pts += 1
-    if s["vr"] >= 1.5:
+    # импульс RSI в сторону пробоя, но не в крайности
+    if s["side"] == "long" and 55 <= s["rsi"] <= RSI_MAX:
         pts += 1
-    if s["dist"] <= 0.4:
+    if s["side"] == "short" and RSI_MIN <= s["rsi"] <= 45:
         pts += 1
     if s["risk_pct"] <= 1.5:
         pts += 1
+    if s["risk_pct"] <= 2.5:
+        pts += 1
+    if s["vr"] >= 3.0:
+        pts += 1                       # взрывной объём
     if pts >= 5:
-        return pts, "🟢 ХОРОШАЯ ПАРА"
+        return pts, "🟢 СИЛЬНЫЙ ПРОБОЙ"
     if pts >= 3:
-        return pts, "🟡 СРЕДНЯЯ ПАРА"
-    return pts, "🔴 СЛАБАЯ ПАРА"
+        return pts, "🟡 СРЕДНИЙ ПРОБОЙ"
+    return pts, "🔴 СЛАБЫЙ ПРОБОЙ"
 
 
 def card(s):
@@ -856,27 +888,22 @@ def card(s):
     risk_usd = qty * abs(s["entry"] - s["sl"])
     prof_usd = risk_usd * RR
     fees = SIZE * FEE / 100 * 2
-    side_t = "🟢 ЛОНГ от поддержки" if s["side"] == "long" else "🔴 ШОРТ от сопротивления"
-    lvl_t = "Поддержка" if s["side"] == "long" else "Сопротивление"
-    pat_ok = "✅" if s["pat"] != "нет разворотной" else "⚠️"
-    rsi_ok = "✅" if (s["rsi"] <= 32 or s["rsi"] >= 68) else "⚠️"
+    side_t = "🟢 ЛОНГ · пробой вверх" if s["side"] == "long" else "🔴 ШОРТ · пробой вниз"
+    lvl_t = "Пробил сопротивление" if s["side"] == "long" else "Пробил поддержку"
     vol_ok = "✅" if s["vr"] >= 1.5 else "⚠️"
-    dst_ok = "✅" if s["dist"] <= 0.4 else "⚠️"
-    rsk_ok = "✅" if s["risk_pct"] <= 1.5 else "⚠️"
-    tr = {"up": "📈 тренд вверх", "down": "📉 тренд вниз", "flat": "➖ тренд флэт"}.get(s.get("trend", "flat"), "")
+    rsk_ok = "✅" if s["risk_pct"] <= 2.0 else "⚠️"
+    tr = {"up": "📈 аптренд 4ч", "down": "📉 даунтренд 4ч"}.get(s.get("trend", ""), "")
     pts, lab = grade(s)
     return (
-        "🎯 " + s["sym"] + " — " + side_t + " (4ч)\n"
+        "🚀 " + s["sym"] + " — " + side_t + "\n"
         + lab + "  (" + str(pts) + "/6)   " + tr + "\n\n"
-        + pat_ok + " Свеча: " + s["pat"] + "\n"
-        + rsi_ok + " RSI: " + str(round(s["rsi"])) + "\n"
-        + vol_ok + " Объём: ×" + format(s["vr"], ".1f") + "\n"
-        + dst_ok + " У уровня: " + format(s["dist"], ".2f") + "%\n"
+        + vol_ok + " Объём пробоя: ×" + format(s["vr"], ".1f") + "\n"
+        + "📊 RSI 1ч: " + str(round(s["rsi"])) + "\n"
         + rsk_ok + " Стоп: " + format(s["risk_pct"], ".2f") + "%\n\n"
         "📍 Вход: " + fmt(s["entry"]) + "\n"
         "📊 " + lvl_t + ": " + fmt(s["lvl"]) + "\n"
-        "🛑 Стоп: " + fmt(s["sl"]) + "\n"
-        "🎯 Тейк: " + fmt(s["tp"]) + "  (1:3)\n\n"
+        "🛑 Стоп: " + fmt(s["sl"]) + "  (" + str(ATR_STOP) + "×ATR)\n"
+        "🎯 Тейк: " + fmt(s["tp"]) + "  (1:" + str(RR) + ")\n\n"
         "💵 На $" + str(SIZE) + ":\n"
         "   риск ≈ -$" + str(round(risk_usd + fees)) + "\n"
         "   профит ≈ +$" + str(round(prof_usd - fees)) + "\n\n"
@@ -926,17 +953,16 @@ def start(m):
     k = ("✅ Binance подключён — статистика с " + STATS_START + " МСК по реальным сделкам.") if has_keys() \
         else "⚠️ Binance не подключён — добавь ключи в Railway."
     bot.send_message(m.chat.id,
-        "Отскок от уровней 4ч 🎯\n"
-        + ("Вход по тренду монеты (MA99) + фильтр BTC.\n" if BTC_FILTER
-           else "Вход по тренду каждой монеты (MA99). BTC-фильтр выкл.\n")
-        + "ATR-стоп, тейк 1:3, стоп в безубыток автоматом.\n\n" + k, reply_markup=menu())
+        "Пробой уровней 🚀\n"
+        "Тренд по 4ч (EMA50/200), вход по закрытию 1ч за уровнем.\n"
+        "Объём + ATR-стоп, тейк 1:" + str(RR) + ", стоп в безубыток автоматом.\n\n" + k, reply_markup=menu())
 
 
-@bot.message_handler(func=lambda m: m.text == "🔍 Найти отскоки")
+@bot.message_handler(func=lambda m: m.text == "🔍 Найти пробои")
 def btn_scan(m):
     users.add(m.chat.id)
     save()
-    bot.send_message(m.chat.id, "Сканирую топ-200 монет на 4ч... жди 5-8 мин")
+    bot.send_message(m.chat.id, "Сканирую топ-200 монет: тренд 4ч, пробой 1ч... жди 5-8 мин")
     do_scan(m.chat.id, manual=True)
 
 
@@ -1020,7 +1046,7 @@ def btn_stats(m):
         upnl = sum(v["upnl"] for v in pos.values())
 
         L = []
-        L.append("📊 ОТСКОК 1:3 v2 · с " + STATS_START + " МСК")
+        L.append("📊 ПРОБОЙ 1:" + str(RR) + " · с " + STATS_START + " МСК")
         L.append(str(total) + " сделок на " + str(n_syms) + " монетах")
         L.append("")
         L.append("💵 Чистыми:  " + money(real))
@@ -1120,7 +1146,7 @@ def btn_auto(m):
         except Exception:
             pos = "?"
         grd = "только 🟢 (5-6/6)" if AUTO_MIN_PTS >= 5 else "🟢 и 🟡 (" + str(AUTO_MIN_PTS) + "+/6)"
-        btc_line = "BTC-фильтр: ВКЛ" if BTC_FILTER else "BTC-фильтр: выкл (тренд по MA99)"
+        btc_line = "BTC-фильтр: ВКЛ" if BTC_FILTER else "BTC-фильтр: выкл (тренд по 4ч)"
         bot.send_message(m.chat.id,
             "🤖 АВТОТОРГОВЛЯ ВКЛЮЧЕНА\n\n"
             "Вхожу: " + grd + " по тренду монеты\n"
@@ -1177,9 +1203,10 @@ def funnel_text():
     """что где отсеялось — понятно, какой фильтр душит"""
     if not funnel:
         return ""
-    order = ["всего", "объём", "прошли объём", "RSI-ок(L)", "RSI-ок(S)",
-             "тренд-против(L)", "тренд-против(S)",
-             "далеко от уровня(L)", "далеко от уровня(S)",
+    order = ["всего", "сон EMA", "низкий ATR", "режим ок",
+             "пробой вверх", "пробой вниз",
+             "нет объёма(L)", "нет объёма(S)",
+             "перекуплен(L)", "перепродан(S)",
              "стоп широкий(L)", "стоп широкий(S)"]
     t = "\n📉 ГДЕ ОТСЕЯЛОСЬ:"
     for k in order:
@@ -1240,7 +1267,7 @@ def do_scan(chat_id, manual=False):
             else:
                 btc_t = "➖ BTC у EMA50 (" + format(dev, ".1f") + "%) — обе стороны"
         else:
-            btc_t = "🎯 Тренд по MA99 каждой монеты (BTC-фильтр выкл)"
+            btc_t = "🚀 Пробой по тренду 4ч каждой монеты (BTC-фильтр выкл)"
 
         # автоторговля работает по ВСЕМ зелёным (не только "свежим"),
         # чтобы вход не зависел от антиспама
@@ -1529,9 +1556,9 @@ if has_keys():
                 print("восстановлено позиций с биржи:", _n)
         except Exception as _e:
             print("adopt при старте:", _e)
-    print("автоторговля:", "ВКЛ" if auto_on else "выкл",
+    print("ПРОБОЙ | автоторговля:", "ВКЛ" if auto_on else "выкл",
           "| мин.оценка", AUTO_MIN_PTS, "| потолок", MAX_POS, "| плечо", LEVERAGE,
-          "| MA-фильтр ±" + str(MA_TREND_FLAT) + "%",
+          "| уровень", str(LVL_BARS) + " свечей 4ч | стоп", str(ATR_STOP) + "×ATR | RR 1:" + str(RR),
           "| чёрный список:", ",".join(BLACKLIST) or "пусто")
 else:
     print("Binance ключи не заданы — работаю в расчётном режиме")
@@ -1553,7 +1580,7 @@ for _h in DATA_HOSTS:
 print("рабочий источник данных:", _ok_host or "НИ ОДИН НЕ ОТВЕЧАЕТ!")
 
 threading.Thread(target=auto_loop, daemon=True).start()
-print("Бот отскоков v2 запущен. Автоторговля:", "ВКЛ" if auto_on else "ВЫКЛ")
+print("Бот пробоя запущен. Автоторговля:", "ВКЛ" if auto_on else "ВЫКЛ")
 
 # снимаем вебхук и старые апдейты — иначе Telegram отдаёт 409 Conflict
 try:
