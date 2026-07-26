@@ -283,16 +283,43 @@ def income_all(start_ms, symbol=None):
     cur = int(start_ms)
     end = int(time.time() * 1000) + 60000
     guard = 0
-    while cur < end and guard < 30:
+    while cur < end and guard < 60:
         guard += 1
         stop = min(cur + week, end)
-        try:
-            out.extend(binance_income(cur, symbol, stop))
-        except Exception as e:
-            print("income chunk error:", e)
+        # пагинация ВНУТРИ недели: если вернулось ровно 1000 (лимит) —
+        # значит записей больше, тянем дальше от времени последней
+        sub = cur
+        inner = 0
+        while inner < 20:
+            inner += 1
+            try:
+                rows = binance_income(sub, symbol, stop)
+            except Exception as e:
+                print("income chunk error:", e)
+                break
+            if not rows:
+                break
+            out.extend(rows)
+            if len(rows) < 1000:
+                break                     # неделя вычерпана
+            # сдвигаемся к времени последней записи +1мс
+            last_t = max(int(x.get("time", sub)) for x in rows)
+            if last_t <= sub:
+                break
+            sub = last_t + 1
+            time.sleep(0.15)
         cur = stop
         time.sleep(0.2)
-    return out
+    # дедуп по (time, incomeType, symbol, income) — пагинация может дать нахлёст
+    seen = set()
+    uniq = []
+    for x in out:
+        k = (x.get("time"), x.get("incomeType"), x.get("symbol"), x.get("income"), x.get("tranId"))
+        if k in seen:
+            continue
+        seen.add(k)
+        uniq.append(x)
+    return uniq
 
 
 def split_income(rows):
@@ -583,9 +610,6 @@ def correlation(ca, cb):
     return float(np.corrcoef(da, db)[0, 1])
 
 
-_price_cache = {}
-
-
 def is_cointegrated(ca, cb):
     """
     Проверка коинтеграции пары (упрощённый Энгл-Грейнджер).
@@ -820,22 +844,34 @@ def open_pair(chat_id, p):
 
 
 def close_pair(s, reason):
-    """закрываем обе ноги пары рыночными reduceOnly + снимаем аварийные стопы"""
-    ok = True
-    # сначала снимаем аварийные стопы, чтобы не сработали по закрытой ноге
+    """
+    Закрываем обе ноги. Снимаем аварийные стопы, затем закрываем по РЕАЛЬНОМУ
+    размеру с биржи (не по сохранённому qty). Если ноги уже нет на бирже
+    (amt==0) — считаем её закрытой, а не шлём reduceOnly на пустую позицию.
+    """
     for fs in (s["fa"], s["fb"]):
         try:
             cancel_algo(fs)
         except Exception as e:
             print("cancel emerg", fs, ":", str(e)[:60])
     try:
-        close_now(s["fa"], "BUY", s["bn_qa"])     # закрыть лонг слабой
-    except Exception as e:
-        print("close leg A:", e); ok = False
-    try:
-        close_now(s["fb"], "SELL", s["bn_qb"])    # закрыть шорт сильной
-    except Exception as e:
-        print("close leg B:", e); ok = False
+        pos = binance_positions()
+    except Exception:
+        pos = {}
+    ok = True
+    for fs, side, saved in ((s["fa"], "BUY", s.get("bn_qa", 0)),
+                            (s["fb"], "SELL", s.get("bn_qb", 0))):
+        amt = abs(pos.get(fs, {}).get("amt", 0))
+        if amt <= 0:
+            continue                      # ноги уже нет — успех, ничего не шлём
+        try:
+            close_now(fs, side, amt)
+        except Exception as e:
+            msg = str(e)
+            # позиция уже закрыта встречно — это не ошибка
+            if "-2022" in msg or "ReduceOnly" in msg or "-4046" in msg:
+                continue
+            print("close leg", fs, ":", msg[:80]); ok = False
     opened_keys.discard(s["fa"] + "_" + s["fb"])
     return ok
 
@@ -884,7 +920,6 @@ def btn_list(m):
         try:
             z = live_z(s)
             zt = format(z, "+.2f") if z is not None else "?"
-            held = (time.time() - s.get("t0", time.time()) / 1) / 3600
             held_h = (time.time() - s.get("t0_s", time.time())) / 3600
             txt = (
                 "🔗 " + s["a"] + " / " + s["b"] + "\n\n"
@@ -916,7 +951,7 @@ def btn_stats(m):
         real = tot["pnl"] + tot["fee"] + tot["fund"] + tot["other"]
         # для пар считаем закрытия по кластерам (нога A и нога B закрываются вместе)
         tr = group_trades(rows)
-        # пара = два закрытия рядом по времени; но для простоты统计 берём разбивку по монетам
+        # пара = два закрытия рядом по времени; но для простоты статистики берём разбивку по монетам
         vals = [x["net"] for x in tr]
         total = len(vals)
         wins = [x for x in vals if x > BE_BAND]
@@ -1115,6 +1150,7 @@ def record_pair_close(chat_id, s, reason_ic, reason_txt):
         "pnl": round(net, 2), "gross": round(gross, 2),
         "fee": round(fee, 2), "fund": round(fund, 2),
         "src": "binance", "t": int(time.time())})
+    save()
     try:
         bot.send_message(chat_id,
             reason_ic + " ПАРА ЗАКРЫТА: " + s["a"] + " / " + s["b"] + "\n"
@@ -1154,7 +1190,18 @@ def auto_loop():
                         elif held_h >= MAX_HOLD_H:
                             reason = ("⏱", "вышло время " + format(held_h, ".0f") + "ч, z=" + format(z, "+.2f"))
                         if reason:
-                            if close_pair(s, reason[1]):
+                            closed_ok = close_pair(s, reason[1])
+                            # подстраховка: если обе ноги на бирже уже нулевые —
+                            # пара фактически закрыта, убираем из трекинга
+                            if not closed_ok:
+                                try:
+                                    pos = binance_positions()
+                                    gone = (abs(pos.get(s["fa"], {}).get("amt", 0)) <= 0 and
+                                            abs(pos.get(s["fb"], {}).get("amt", 0)) <= 0)
+                                except Exception:
+                                    gone = False
+                                closed_ok = gone
+                            if closed_ok:
                                 record_pair_close(chat_id, s, reason[0], reason[1])
                                 lst.remove(s)
                                 changed = True
