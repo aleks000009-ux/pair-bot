@@ -503,15 +503,28 @@ def top_coins():
     usdt = [x for x in r if x["symbol"].endswith("USDT")]
     usdt.sort(key=lambda x: float(x["quoteVolume"]), reverse=True)
     out = []
-    for x in usdt[:CAND_COINS + 30]:
+    # берём широкий пул: до 120 монет по обороту. Фьючерсный фильтр применим мягко —
+    # если _filters пуст (не загрузился) или монеты нет, всё равно пробуем.
+    for x in usdt[:120]:
         sym = x["symbol"].replace("USDT", "")
         if sym.upper() in BLACKLIST or x["symbol"].upper() in BLACKLIST:
             continue
-        if sym + "USDT" not in _filters:      # только те, что реально торгуются фьючерсом
+        # если фильтры загружены — предпочитаем торгуемые фьючерсом, но не жёстко
+        if _filters and (sym + "USDT") not in _filters:
             continue
         out.append(sym)
         if len(out) >= CAND_COINS:
             break
+    # если после фьючерсного фильтра почти пусто — берём топ по обороту без него
+    if len(out) < 10:
+        out = []
+        for x in usdt[:CAND_COINS + 10]:
+            sym = x["symbol"].replace("USDT", "")
+            if sym.upper() in BLACKLIST or x["symbol"].upper() in BLACKLIST:
+                continue
+            out.append(sym)
+            if len(out) >= CAND_COINS:
+                break
     return out
 
 
@@ -521,7 +534,8 @@ def closes_tf(sym, limit):
         kl = get_klines_tf(sym + "USDT", TF, limit)
     except Exception:
         return None
-    if not kl or len(kl) < limit // 2:
+    # достаточно данных для расчёта z-score (окно ZWIN + запас), а не половины запроса
+    if not kl or len(kl) < ZWIN + 5:
         return None
     now_ms = int(time.time() * 1000)
     if kl[-1]["close_t"] > now_ms:      # выкидываем незакрытую свечу
@@ -640,14 +654,15 @@ def scan_pairs():
     """
     funnel.clear()
     coins = top_coins()[:CAND_COINS]
-    # тянем закрытия один раз на монету
+    funnel["монет в пуле"] = len(coins)
+    # тянем закрытия один раз на монете
     data = {}
     need = max(ZWIN, CORR_WIN) + 5
     for c in coins:
         if c.upper() in BLACKLIST:
             continue
         cl = closes_tf(c, need)
-        if cl and len(cl) >= need:
+        if cl and len(cl) >= ZWIN + 5:
             data[c] = cl
         time.sleep(0.05)
     syms = list(data.keys())
@@ -971,7 +986,7 @@ def btn_clear(m):
 def funnel_text():
     if not funnel:
         return ""
-    order = ["монет с данными", "пар проверено", "коррелируют",
+    order = ["монет в пуле", "монет с данными", "пар проверено", "коррелируют",
              "не коинтегрированы", "коинтегрированы", "z мал", "готовы к входу"]
     t = "\n📉 ВОРОНКА:"
     for k in order:
