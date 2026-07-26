@@ -666,7 +666,7 @@ def scan_pairs():
             data[c] = cl
         time.sleep(0.05)
     syms = list(data.keys())
-    fn("монет с данными")
+    funnel["монет с данными"] = len(syms)
     found = []
     seen = 0
     for i in range(len(syms)):
