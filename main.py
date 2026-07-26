@@ -918,16 +918,49 @@ def btn_list(m):
         return
     for s in list(t):
         try:
-            z = live_z(s)
-            zt = format(z, "+.2f") if z is not None else "?"
+            z = s.get("z_last")
+            if z is None:
+                z = live_z(s)
+            if z is None:
+                bot.send_message(m.chat.id, "🔗 " + s["a"] + "/" + s["b"] + ": нет данных по z")
+                continue
+            az = abs(z)
+            z0 = s.get("z0", 0)
+
+            prev = s.get("z_prev")
+            if prev is None:
+                arrow, dir_t = "•", "первый замер"
+            elif abs(z) < abs(prev) - 0.02:
+                arrow, dir_t = "↘️", "сходится"
+            elif abs(z) > abs(prev) + 0.02:
+                arrow, dir_t = "↗️", "расходится"
+            else:
+                arrow, dir_t = "→", "на месте"
+
+            to_exit = az - Z_EXIT
+            to_stop = Z_STOP - az
+            full = abs(z0) - Z_EXIT
+            done = abs(z0) - az
+            prog = max(0, min(100, done / full * 100)) if full > 0 else 0
             held_h = (time.time() - s.get("t0_s", time.time())) / 3600
+
+            if az <= Z_EXIT + 0.2:
+                mark = "🟢 почти выход"
+            elif az >= Z_STOP - 0.3:
+                mark = "🔴 близко к стопу"
+            else:
+                mark = "🟡 в работе"
+
             txt = (
-                "🔗 " + s["a"] + " / " + s["b"] + "\n\n"
-                "🔴 ШОРТ " + s["strong"] + "\n"
-                "🟢 ЛОНГ " + s["weak"] + "\n\n"
-                "📊 z сейчас: " + zt + "  (вход был " + format(s["z0"], "+.2f") + ")\n"
-                "🎯 выход при |z|≤" + str(Z_EXIT) + " · стоп при |z|≥" + str(Z_STOP) + "\n"
-                "⏱ в позиции " + format(held_h, ".1f") + " ч"
+                "🔗 " + s["a"] + " / " + s["b"] + "   " + mark + "\n\n"
+                "🔴 ШОРТ " + s["strong"] + "   🟢 ЛОНГ " + s["weak"] + "\n\n"
+                "z: " + format(z, "+.2f") + "   " + arrow + " " + dir_t + "\n"
+                "до выхода: " + format(max(0, to_exit), ".2f")
+                + "   (пройдено " + format(prog, ".0f") + "%)\n"
+                "до стопа:  " + format(max(0, to_stop), ".2f") + "\n\n"
+                "вошли при z " + format(z0, "+.2f")
+                + " · corr " + format(s.get("corr", 0), ".2f") + "\n"
+                "⏱ в позиции " + format(held_h, ".1f") + " ч из " + str(int(MAX_HOLD_H))
             )
             bot.send_message(m.chat.id, txt, reply_markup=menu())
         except Exception as e:
@@ -1181,6 +1214,10 @@ def auto_loop():
                         z = live_z(s)
                         if z is None:
                             continue
+                        # запоминаем предыдущий z для стрелки направления
+                        s["z_prev"] = s.get("z_last")
+                        s["z_last"] = round(z, 2)
+                        changed = True
                         held_h = (time.time() - s.get("t0_s", time.time())) / 3600
                         reason = None
                         if abs(z) <= Z_EXIT:
