@@ -663,11 +663,11 @@ def is_cointegrated(ca, cb):
     T_CRIT = float(os.environ.get("COINT_T", "-3.0"))
     if t_stat > T_CRIT:
         return False, None
-      half_life = -np.log(2) / k
+    half_life = -np.log(2) / k
     HL_MAX = float(os.environ.get("HALFLIFE_MAX", "120"))   # свечей; дольше — не берём
     HL_MIN = float(os.environ.get("MIN_HALFLIFE", "0"))     # свечей; слишком быстрый возврат — шум
     if half_life <= 0 or half_life > HL_MAX or half_life < HL_MIN:
-        return False, half_life
+    return False, half_life
     return True, float(half_life)
 
 
