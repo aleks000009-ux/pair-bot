@@ -667,7 +667,7 @@ def is_cointegrated(ca, cb):
     HL_MAX = float(os.environ.get("HALFLIFE_MAX", "120"))   # свечей; дольше — не берём
     HL_MIN = float(os.environ.get("MIN_HALFLIFE", "0"))     # свечей; слишком быстрый возврат — шум
     if half_life <= 0 or half_life > HL_MAX or half_life < HL_MIN:
-    return False, half_life
+        return False, half_life
     return True, float(half_life)
 
 
