@@ -439,6 +439,7 @@ def save():
         with open(DB, "w") as f:
             json.dump({"tracked": {str(k): v for k, v in tracked.items()},
                        "users": list(users),
+                       "opened_keys": list(opened_keys),
                        "history": {str(k): v for k, v in history.items()}}, f)
     except Exception as e:
         print("save error:", e)
@@ -452,6 +453,8 @@ def load():
         tracked = {int(k): v for k, v in d.get("tracked", {}).items()}
         users = set(d.get("users", []))
         history = {int(k): v for k, v in d.get("history", {}).items()}
+        opened_keys.clear()
+        opened_keys.update(d.get("opened_keys", []))
         print("загружено: сделок", sum(len(v) for v in tracked.values()),
               "| история", sum(len(v) for v in history.values()))
     except Exception:
@@ -634,106 +637,6 @@ def closes_tf(sym, limit):
     return [k["c"] for k in kl]
 
 
-def zscore(spread):
-    """z последнего значения спреда по окну ZWIN"""
-    a = np.array(spread[-ZWIN:], dtype=float)
-    if len(a) < ZWIN:
-        return None, None, None
-    m = a.mean()
-    sd = a.std()
-    if sd <= 0:
-        return None, None, None
-    z = (a[-1] - m) / sd
-    return float(z), float(m), float(sd)
-
-
-def pair_spread(ca, cb):
-    """
-    Лог-спред двух рядов цен: ln(A) - ln(B).
-    Логарифм чтобы масштаб монет не искажал спред (BTC $60000 vs DOGE $0.1).
-    """
-    n = min(len(ca), len(cb))
-    if n < ZWIN + 5:
-        return None
-    a = np.log(np.array(ca[-n:], dtype=float))
-    b = np.log(np.array(cb[-n:], dtype=float))
-    return (a - b).tolist()
-
-
-def correlation(ca, cb):
-    n = min(len(ca), len(cb), CORR_WIN)
-    if n < 50:
-        return 0.0
-    a = np.array(ca[-n:], dtype=float)
-    b = np.array(cb[-n:], dtype=float)
-    # корреляция дневных изменений, а не самих цен (чтобы тренд не завышал corr)
-    da = np.diff(a) / a[:-1]
-    db = np.diff(b) / b[:-1]
-    if da.std() == 0 or db.std() == 0:
-        return 0.0
-    return float(np.corrcoef(da, db)[0, 1])
-
-
-def is_cointegrated(ca, cb):
-    """
-    Проверка коинтеграции пары (упрощённый Энгл-Грейнджер).
-    Корреляция ловит совместное движение с рынком (ложные пары),
-    коинтеграция — что СПРЕД реально возвращается к среднему.
-
-    Логика: строим лог-спред, проверяем его на стационарность
-    через тест "возврата к среднему" (regression ΔS на S[-1]):
-    если коэффициент β в ΔS = α + β·S[-1] значимо отрицателен —
-    спред тянет обратно к среднему, пара коинтегрирована.
-    Возвращаем (ok, half_life) — период полураспада отклонения в свечах.
-    """
-    n = min(len(ca), len(cb), CORR_WIN)
-    if n < 60:
-        return False, None
-    a = np.log(np.array(ca[-n:], dtype=float))
-    b = np.log(np.array(cb[-n:], dtype=float))
-    # хедж-коэффициент через МНК: a = α + β·b, спред = a - β·b
-    B = np.vstack([b, np.ones(len(b))]).T
-    try:
-        beta, alpha = np.linalg.lstsq(B, a, rcond=None)[0]
-    except Exception:
-        return False, None
-    spread = a - (beta * b + alpha)
-    # тест возврата к среднему: ΔS[t] = c + k·S[t-1]
-    s_lag = spread[:-1]
-    ds = np.diff(spread)
-    if s_lag.std() == 0:
-        return False, None
-    X = np.vstack([s_lag, np.ones(len(s_lag))]).T
-    try:
-        coef, res, *_ = np.linalg.lstsq(X, ds, rcond=None)
-        k, c = coef[0], coef[1]
-    except Exception:
-        return False, None
-    if k >= -1e-4:
-        return False, None
-    # t-статистика коэффициента k: насколько уверенно возврат к среднему,
-    # а не случайность. Это и есть суть теста Дики-Фуллера.
-    resid = ds - (k * s_lag + c)
-    dof = len(s_lag) - 2
-    if dof <= 0:
-        return False, None
-    sigma2 = float(resid @ resid) / dof
-    sxx = float(((s_lag - s_lag.mean()) ** 2).sum())
-    if sxx <= 0 or sigma2 <= 0:
-        return False, None
-    se_k = (sigma2 / sxx) ** 0.5
-    t_stat = k / se_k                      # чем отрицательнее, тем сильнее коинтеграция
-    # критическое значение ADF (грубо -2.9 при 5%); берём строже -3.0
-    T_CRIT = float(os.environ.get("COINT_T", "-3.0"))
-    if t_stat > T_CRIT:
-        return False, None
-    half_life = -np.log(2) / k
-    HL_MAX = float(os.environ.get("HALFLIFE_MAX", "120"))   # свечей; дольше — не берём
-    if half_life <= 0 or half_life > HL_MAX:
-        return False, half_life
-    return True, float(half_life)
-
-
 def atr_pct(sym):
     """ATR(1ч) в % от цены — мера волатильности для стопа"""
     try:
@@ -901,30 +804,40 @@ def open_pair(chat_id, p):
 
 
 def close_pair(s, reason):
-    """закрыть ногу: снять стоп, закрыть по реальному размеру с биржи"""
-    try:
-        cancel_algo(s["fa"])
-    except Exception as e:
-        print("cancel stop", s["fa"], ":", str(e)[:60])
+    """
+    Закрыть ногу. ПОРЯДОК ВАЖЕН: сначала закрываем позицию маркетом,
+    и только потом снимаем защитный стоп. Так между шагами нет окна,
+    где позиция голая без стопа.
+    """
+    fa = s["fa"]
     try:
         pos = binance_positions()
     except Exception:
         pos = {}
-    amt = abs(pos.get(s["fa"], {}).get("amt", 0))
+    amt = abs(pos.get(fa, {}).get("amt", 0))
+
+    closed = False
     if amt <= 0:
-        opened_keys.discard(s["fa"])
-        return True                       # позиции уже нет (стоп сработал) — успех
-    try:
-        close_now(s["fa"], s.get("bn_side_a", "BUY"), amt)
-        opened_keys.discard(s["fa"])
-        return True
-    except Exception as e:
-        msg = str(e)
-        if "-2022" in msg or "ReduceOnly" in msg or "-4046" in msg:
-            opened_keys.discard(s["fa"])
-            return True
-        print("close solo", s["fa"], ":", msg[:80])
-        return False
+        closed = True                     # позиции уже нет (стоп сработал)
+    else:
+        try:
+            close_now(fa, s.get("bn_side_a", "BUY"), amt)
+            closed = True
+        except Exception as e:
+            msg = str(e)
+            if "-2022" in msg or "ReduceOnly" in msg or "-4046" in msg:
+                closed = True             # уже закрыта встречно
+            else:
+                print("close solo", fa, ":", msg[:80])
+
+    # стоп снимаем ТОЛЬКО после того, как позиция закрыта
+    if closed:
+        try:
+            cancel_algo(fa)
+        except Exception as e:
+            print("cancel stop", fa, ":", str(e)[:60])
+        opened_keys.discard(fa)
+    return closed
 
 
 # ---------- МЕНЮ ----------
@@ -1100,14 +1013,29 @@ def live_funding(s):
     return v[0] if v else None
 
 
-def accrued_funding(s, held_h):
-    """сколько $ фандинга накопилось с момента входа (оценка по ставке и интервалу)"""
-    rate = s.get("rate0", 0)
-    hrs = s.get("hrs", 8)
-    if hrs <= 0:
-        hrs = 8
-    payouts = int(held_h // hrs)          # сколько раз уже выплатили
-    return SIZE * abs(rate) / 100 * payouts
+def accrued_funding(s):
+    """
+    РЕАЛЬНЫЙ накопленный фандинг с биржи (FUNDING_FEE по монете с момента входа).
+    Раньше считалось по ставке входа × число выплат — это выдумка, которая
+    двигала безубыток на основе несуществующих денег. Теперь по факту.
+    """
+    fs = s.get("fa")
+    if not fs:
+        return 0.0
+    since = s.get("bn_t", int(time.time() * 1000) - 86400000)
+    try:
+        rows = binance_income(since, fs)
+    except Exception:
+        return 0.0
+    total = 0.0
+    for x in rows:
+        if x.get("incomeType") == "FUNDING_FEE":
+            try:
+                total += float(x.get("income", 0))
+            except Exception:
+                pass
+    # нам важен положительный приход фандинга (в нашу сторону)
+    return total
 
 
 def move_stop_breakeven(s):
@@ -1176,8 +1104,8 @@ def auto_enter(chat_id, cands):
     except Exception as e:
         print("auto positions:", e)
         return
-    free = MAX_POS - len(pos)          # каждая пара занимает 2 ноги
-    if free < 2:
+    free = MAX_POS - len(pos)          # соло: 1 нога = 1 слот
+    if free < 1:
         return
     for p in cands:
         if free < 1:
@@ -1266,17 +1194,20 @@ def auto_loop():
                         changed = True
                         held_h = (time.time() - s.get("t0_s", time.time())) / 3600
 
-                        # БЕЗУБЫТОК: как фандинг накопил больше риска по стопу —
-                        # двигаем стоп к входу, дальше сделка «бесплатная»
+                        # БЕЗУБЫТОК: когда РЕАЛЬНО пришедший фандинг перекрыл риск
+                        # по стопу — двигаем стоп к входу, дальше сделка «бесплатная»
                         if not s.get("be"):
-                            got = accrued_funding(s, held_h)
+                            got = accrued_funding(s)          # реальные $ с биржи
+                            s["fund_got"] = round(got, 2)
                             risk_usd = SIZE * s.get("stop_pct", 8) / 100
                             if got >= risk_usd:
                                 if move_stop_breakeven(s):
                                     s["be"] = True
                                     try:
                                         bot.send_message(chat_id, "🛡 " + s["main"]
-                                            + ": фандинг накопил больше риска, стоп в безубытке. Дальше бесплатно.")
+                                            + ": фандинг накопил $" + format(got, ".2f")
+                                            + " (> риска $" + format(risk_usd, ".0f")
+                                            + "), стоп в безубытке. Дальше бесплатно.")
                                     except Exception:
                                         pass
 
@@ -1338,7 +1269,7 @@ if has_keys():
         print("Binance OK, открытых ног:", len(pp))
     except Exception as e:
         print("Binance ключи не работают:", e)
-    print("ПАРЫ | авто:", "ВКЛ" if auto_on else "выкл",
+    print("ФАНДИНГ-СОЛО | авто:", "ВКЛ" if auto_on else "выкл",
           "| мин.оценка", AUTO_MIN_PTS, "| потолок ног", MAX_POS, "| плечо", LEVERAGE,
           "| фандинг≥", MIN_FUNDING, "| выход<", EXIT_FUNDING, "| стоп", str(STOP_MIN)+"-"+str(STOP_MAX)+"%")
 else:
