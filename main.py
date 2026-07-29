@@ -39,9 +39,9 @@ EXIT_FUNDING = float(os.environ.get("EXIT_FUNDING", "0.2")) # выход ког�
 ATR_STOP = float(os.environ.get("ATR_STOP", "2.5"))         # стоп = ATR_STOP × ATR(1ч)
 STOP_MIN = float(os.environ.get("STOP_MIN", "4.0"))         # но не ближе этого %, % от входа
 STOP_MAX = float(os.environ.get("STOP_MAX", "8.0"))         # и не дальше этого %
-MAX_IMPULSE = float(os.environ.get("MAX_IMPULSE", "12.0"))  # не входим если цена сдвинулась >этого % за IMPULSE_H
+MAX_IMPULSE = float(os.environ.get("MAX_IMPULSE", "20.0"))  # не входим если цена сдвинулась >этого % за IMPULSE_H
 IMPULSE_H = int(os.environ.get("IMPULSE_H", "12"))          # окно проверки импульса, часов
-MAX_ATR_RATIO = float(os.environ.get("MAX_ATR_RATIO", "2.0")) # пропускаем если ATR сейчас > этого × среднего ATR
+MAX_ATR_RATIO = float(os.environ.get("MAX_ATR_RATIO", "3.0")) # пропускаем если ATR сейчас > этого × среднего ATR
 TRAIL_CALLBACK = float(os.environ.get("TRAIL_CALLBACK", "2.0"))  # отступ трейлинга, % (биржевой callbackRate)
 TRAIL_ACTIVATE = float(os.environ.get("TRAIL_ACTIVATE", "3.0"))  # активация трейлинга при +этого % от входа
 TRAIL_START = float(os.environ.get("TRAIL_START", "4.0"))   # (устар., прогр. трейлинг больше не используется)
@@ -1317,10 +1317,18 @@ def adopt_positions(chat_id):
 def do_scan(chat_id, manual=False):
     try:
         setups = scan_pairs()
+        # busy = занятые монеты. Считаем от РЕАЛЬНЫХ позиций биржи + tracked,
+        # чтобы после редеплоя не задваивать вход и не блокировать закрытые.
         busy = set()
         for x in tracked.get(chat_id, []):
             if x.get("kind") == "pair":
                 busy.add(x["main"])
+        try:
+            live_pos = set(binance_positions().keys())
+            for s in live_pos:
+                busy.add(s.replace("1000", "").replace("USDT", ""))
+        except Exception:
+            pass
         fresh = [p for p in setups if p["main"] not in busy]
 
         if auto_on and has_keys():
@@ -1440,6 +1448,31 @@ def auto_loop():
     while True:
         try:
             changed = False
+            # СИНХРОНИЗАЦИЯ с биржей: если позиция закрылась сама (стоп/трейлинг),
+            # но бот думает что открыта — фиксируем закрытие и чистим opened_keys.
+            try:
+                live = binance_positions()
+                live_syms = {k for k, v in live.items() if abs(v.get("amt", 0)) > 0}
+                # чистим opened_keys от того, чего нет на бирже
+                for k in list(opened_keys):
+                    if k not in live_syms:
+                        opened_keys.discard(k)
+                # ловим осиротевшие tracked-позиции (закрыты биржей)
+                for chat_id, lst in list(tracked.items()):
+                    for s in list(lst):
+                        if s.get("kind") != "pair":
+                            continue
+                        if s.get("fa") and s["fa"] not in live_syms:
+                            # позиции нет на бирже — закрылась стопом/трейлингом
+                            try:
+                                record_pair_close(chat_id, s, "🎯", "закрыто на бирже (стоп/трейлинг)")
+                            except Exception as e:
+                                print("sync close:", str(e)[:60])
+                            lst.remove(s)
+                            changed = True
+            except Exception as e:
+                print("sync loop:", str(e)[:60])
+
             for chat_id, lst in list(tracked.items()):
                 for s in list(lst):
                     if s.get("kind") != "pair":
