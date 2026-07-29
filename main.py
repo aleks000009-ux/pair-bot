@@ -1462,6 +1462,11 @@ def auto_loop():
                     for s in list(lst):
                         if s.get("kind") != "pair":
                             continue
+                        # защита от гонки: свежую позицию (моложе 90с) не трогаем,
+                        # биржа могла ещё не показать её в binance_positions()
+                        age_s = time.time() - s.get("t0_s", time.time())
+                        if age_s < 90:
+                            continue
                         if s.get("fa") and s["fa"] not in live_syms:
                             # позиции нет на бирже — закрылась стопом/трейлингом
                             try:
