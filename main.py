@@ -39,6 +39,9 @@ EXIT_FUNDING = float(os.environ.get("EXIT_FUNDING", "0.2")) # выход ког�
 ATR_STOP = float(os.environ.get("ATR_STOP", "2.5"))         # стоп = ATR_STOP × ATR(1ч)
 STOP_MIN = float(os.environ.get("STOP_MIN", "4.0"))         # но не ближе этого %, % от входа
 STOP_MAX = float(os.environ.get("STOP_MAX", "8.0"))         # и не дальше этого %
+MAX_IMPULSE = float(os.environ.get("MAX_IMPULSE", "12.0"))  # не входим если цена сдвинулась >этого % за IMPULSE_H
+IMPULSE_H = int(os.environ.get("IMPULSE_H", "12"))          # окно проверки импульса, часов
+MAX_ATR_RATIO = float(os.environ.get("MAX_ATR_RATIO", "2.0")) # пропускаем если ATR сейчас > этого × среднего ATR
 TF = os.environ.get("PAIR_TF", "1h")                        # ТФ для ATR
 CAND_COINS = int(os.environ.get("CAND_COINS", "80"))        # из скольких монет ищем фандинг
 MAX_HOLD_H = float(os.environ.get("MAX_HOLD_H", "168"))     # макс. удержание, часов
@@ -637,6 +640,44 @@ def closes_tf(sym, limit):
     return [k["c"] for k in kl]
 
 
+def impulse_and_vol(sym):
+    """
+    Проверка перед входом. Возвращает (impulse_pct, atr_now_pct, atr_ratio) или None.
+    impulse_pct — движение цены за IMPULSE_H часов, %
+    atr_ratio — текущий ATR к среднему ATR за месяц (аномалия если >1)
+    """
+    try:
+        kl = get_klines_tf(sym + "USDT", "1h", 200)
+    except Exception:
+        return None
+    if not kl or len(kl) < 40:
+        return None
+    closes = [k["c"] for k in kl]
+    price = closes[-1]
+
+    # импульс: насколько цена ушла за последние IMPULSE_H часов
+    look = min(IMPULSE_H, len(closes) - 1)
+    past = closes[-1 - look]
+    impulse = (price - past) / past * 100 if past > 0 else 0.0
+
+    # ATR сейчас (14) vs средний ATR за длинное окно
+    def atr_window(kldata, period=14):
+        if len(kldata) < period + 1:
+            return None
+        trs = [max(kldata[i]["h"] - kldata[i]["l"],
+                   abs(kldata[i]["h"] - kldata[i-1]["c"]),
+                   abs(kldata[i]["l"] - kldata[i-1]["c"])) for i in range(1, len(kldata))]
+        return float(np.mean(trs[-period:]))
+    atr_now = atr_window(kl[-20:])
+    atr_long = atr_window(kl)          # по всему окну (≈месяц на 1ч? 200ч ≈ 8 дней)
+    if not atr_now or not atr_long or atr_long <= 0:
+        return None
+    atr_now_pct = atr_now / price * 100
+    ratio = atr_now / atr_long
+
+    return (impulse, atr_now_pct, ratio)
+
+
 def atr_pct(sym):
     """ATR(1ч) в % от цены — мера волатильности для стопа"""
     try:
@@ -683,19 +724,33 @@ def scan_pairs():
     if not hot:
         return []
 
-    # для каждой считаем ATR -> размер стопа. Хедж не нужен.
+    # для каждой считаем ATR -> размер стопа + фильтры импульса и аномалии
     found = []
     for main, rate, hrs, daily in hot:
-        ap = atr_pct(main)
-        if ap is None:
-            fn("нет ATR")
+        iv = impulse_and_vol(main)
+        if iv is None:
+            fn("нет данных")
             continue
-        # стоп = ATR_STOP × ATR, зажатый в [STOP_MIN, STOP_MAX]
-        stop_pct = min(STOP_MAX, max(STOP_MIN, ap * ATR_STOP))
+        impulse, atr_now_pct, atr_ratio = iv
+
+        # ФИЛЬТР 1: не входим против свежего импульса.
+        # фандинг<0 (лонгуем) — опасен недавний ОБВАЛ (past->now вниз): ловим нож.
+        # фандинг>0 (шортим) — опасен недавний ВЗЛЁТ (past->now вверх).
         side_main = "short" if rate > 0 else "long"
+        if side_main == "long" and impulse <= -MAX_IMPULSE:
+            fn("обвал — не лонгуем"); continue
+        if side_main == "short" and impulse >= MAX_IMPULSE:
+            fn("взлёт — не шортим"); continue
+
+        # ФИЛЬТР 2: аномальная волатильность = манипуляция/неликвид, ложный фандинг
+        if atr_ratio > MAX_ATR_RATIO:
+            fn("аномальный ATR"); continue
+
+        stop_pct = min(STOP_MAX, max(STOP_MIN, atr_now_pct * ATR_STOP))
         found.append({
             "main": main, "rate": rate, "hrs": hrs, "daily": daily,
-            "side_main": side_main, "stop_pct": stop_pct, "atr_pct": ap,
+            "side_main": side_main, "stop_pct": stop_pct, "atr_pct": atr_now_pct,
+            "impulse": impulse, "atr_ratio": atr_ratio,
             "net": abs(daily),
         })
         fn("готов к входу")
@@ -716,6 +771,8 @@ def grade_pair(p):
     if sp <= 5.0: pts += 2
     elif sp <= 6.5: pts += 1
     if daily >= 4.5: pts += 1
+    # спокойный вход (нет свежего импульса) — надёжнее
+    if abs(p.get("impulse", 99)) <= 5.0: pts += 1
     if pts >= 5: return pts, "🟢 ЖИРНЫЙ ФАНДИНГ"
     if pts >= 3: return pts, "🟡 СРЕДНИЙ"
     return pts, "🔴 СЛАБЫЙ"
@@ -732,7 +789,8 @@ def pair_card(p):
         + lab + "  (" + str(pts) + "/6)\n\n"
         "⚡ фандинг: " + format(p["rate"], "+.3f") + "% каждые " + str(hrs) + "ч (" + who + ")\n"
         "🧮 суточная доходность: ~" + format(p["daily"], "+.3f") + "%\n"
-        "🛑 стоп: " + format(p["stop_pct"], ".1f") + "%  (ATR " + format(p.get("atr_pct",0), ".1f") + "%)\n\n"
+        "🛑 стоп: " + format(p["stop_pct"], ".1f") + "%  (ATR " + format(p.get("atr_pct",0), ".1f") + "%)\n"
+        "📈 движение за " + str(IMPULSE_H) + "ч: " + format(p.get("impulse",0), "+.1f") + "%  (вход спокойный)\n\n"
         "Собираем фандинг каждые " + str(hrs) + "ч.\n"
         "Стоп в безубыток двигаю, как фандинг перекроет риск.\n"
         "Выход: фандинг < " + str(EXIT_FUNDING) + "% или стоп.\n"
@@ -996,7 +1054,8 @@ def funnel_text():
     if not funnel:
         return ""
     order = ["монет с фандингом", "монет в пуле", "жирный фандинг",
-             "нашёлся хедж", "нет хеджа", "нетто мал", "готовы к входу"]
+             "нет данных", "обвал — не лонгуем", "взлёт — не шортим",
+             "аномальный ATR", "готовы к входу"]
     t = "\n📉 ВОРОНКА:"
     for k in order:
         if funnel.get(k):
