@@ -548,15 +548,6 @@ def load():
         print("нет сохранённых данных, старт с нуля")
 
 
-def menu():
-    kb = types.ReplyKeyboardMarkup(resize_keyboard=True)
-    kb.row("🔍 Найти пробои")
-    kb.row("📋 Мои сделки", "📊 Статистика")
-    kb.row("📐 Анализ", "🤖 Автоторговля")
-    kb.row("🗑 Очистить")
-    return kb
-
-
 def _api_get(path, tries=None):
     """GET по рыночным данным с перебором зеркал Binance"""
     n = len(DATA_HOSTS)
@@ -1385,6 +1376,7 @@ def auto_enter(chat_id, cands):
             bot.send_message(chat_id, "🤖 " + p["main"] + " — " + str(info)[:120])
             continue
         free -= 1
+        pos[fa] = {"amt": info["qa"]}     # чтобы не войти в ту же монету дважды за скан
         tracked.setdefault(chat_id, [])
         tracked[chat_id].append({
             "kind": "pair", "main": p["main"],
