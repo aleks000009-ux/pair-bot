@@ -42,6 +42,8 @@ STOP_MAX = float(os.environ.get("STOP_MAX", "8.0"))         # и не дальш
 MAX_IMPULSE = float(os.environ.get("MAX_IMPULSE", "12.0"))  # не входим если цена сдвинулась >этого % за IMPULSE_H
 IMPULSE_H = int(os.environ.get("IMPULSE_H", "12"))          # окно проверки импульса, часов
 MAX_ATR_RATIO = float(os.environ.get("MAX_ATR_RATIO", "2.0")) # пропускаем если ATR сейчас > этого × среднего ATR
+TRAIL_START = float(os.environ.get("TRAIL_START", "4.0"))   # активировать трейлинг когда прибыль по телу ≥ этого %
+TRAIL_GAP = float(os.environ.get("TRAIL_GAP", "2.0"))       # отступ трейлинга от пика прибыли, %
 TF = os.environ.get("PAIR_TF", "1h")                        # ТФ для ATR
 CAND_COINS = int(os.environ.get("CAND_COINS", "80"))        # из скольких монет ищем фандинг
 MAX_HOLD_H = float(os.environ.get("MAX_HOLD_H", "168"))     # макс. удержание, часов
@@ -904,7 +906,7 @@ def menu():
     kb = types.ReplyKeyboardMarkup(resize_keyboard=True)
     kb.row("🔍 Найти фандинг")
     kb.row("📋 Мои фармы", "📊 Статистика")
-    kb.row("🤖 Автоторговля")
+    kb.row("🔄 Подхватить позиции", "🤖 Автоторговля")
     kb.row("🗑 Очистить")
     return kb
 
@@ -1021,6 +1023,24 @@ def btn_stats(m):
         bot.send_message(m.chat.id, "Ошибка Binance: " + str(e), reply_markup=menu())
 
 
+@bot.message_handler(func=lambda m: m.text == "🔄 Подхватить позиции")
+def btn_adopt(m):
+    if not has_keys():
+        bot.send_message(m.chat.id, "⚠️ Нет ключей Binance.", reply_markup=menu())
+        return
+    bot.send_message(m.chat.id, "Ищу открытые позиции на бирже...")
+    try:
+        n = adopt_positions(m.chat.id)
+        if n:
+            bot.send_message(m.chat.id, "✅ Подхватил " + str(n)
+                + " позиц. Теперь веду их: фандинг, безубыток, трейлинг.", reply_markup=menu())
+        else:
+            bot.send_message(m.chat.id, "Новых позиций на бирже нет (все уже отслеживаются "
+                "или счёт пуст).", reply_markup=menu())
+    except Exception as e:
+        bot.send_message(m.chat.id, "Ошибка: " + str(e)[:80], reply_markup=menu())
+
+
 @bot.message_handler(func=lambda m: m.text == "🤖 Автоторговля")
 def btn_auto(m):
     global auto_on
@@ -1116,6 +1136,92 @@ def move_stop_breakeven(s):
     except Exception as e:
         print("move BE", fa, ":", str(e)[:60])
         return False
+
+
+def move_stop_profit(s, lock_pct):
+    """
+    Передвигаем стоп на уровень фиксации прибыли: вход ± lock_pct%.
+    Для лонга стоп выше входа, для шорта ниже — так фиксируется часть движения.
+    """
+    fa = s["fa"]
+    f = _filters.get(fa)
+    if not f:
+        return False
+    p0 = s.get("bn_pa", 0)
+    if p0 <= 0:
+        return False
+    opp = "BUY" if s.get("bn_side_a") == "SELL" else "SELL"
+    # уровень стопа: для лонга вход*(1+lock), для шорта вход*(1-lock)
+    if s.get("bn_side_a") == "SELL":
+        sl_price = p0 * (1 - lock_pct / 100)   # шорт: прибыль когда цена ниже входа
+    else:
+        sl_price = p0 * (1 + lock_pct / 100)   # лонг: прибыль когда цена выше входа
+    sl_price = step_round(sl_price, f["tick"])
+    try:
+        cancel_algo(fa)
+    except Exception:
+        pass
+    try:
+        place_cond(fa, opp, "STOP_MARKET", sl_price)
+        return True
+    except Exception as e:
+        print("move profit", fa, ":", str(e)[:60])
+        return False
+
+
+def adopt_positions(chat_id):
+    """
+    Подхватываем живые позиции с биржи, которых нет в трекинге.
+    Нужно после редеплоя: trades.json сбросился, а позиции на бирже живут.
+    Бот начинает ими управлять (фандинг, безубыток, трейлинг, выход).
+    """
+    try:
+        pos = binance_positions()
+    except Exception as e:
+        print("adopt positions:", e)
+        return 0
+    known = set()
+    for x in tracked.get(chat_id, []):
+        if x.get("kind") == "pair":
+            known.add(x.get("fa"))
+    n = 0
+    for fs, v in pos.items():
+        if fs in known:
+            continue
+        if fs.upper() in STATS_IGNORE:
+            continue
+        amt = v.get("amt", 0)
+        if abs(amt) <= 0:
+            continue
+        sym = fs.replace("USDT", "")
+        entry = v.get("entry", get_price(fs))
+        side_a = "BUY" if amt > 0 else "SELL"      # amt>0 лонг, <0 шорт
+        side_main = "long" if amt > 0 else "short"
+        # текущий фандинг монеты
+        fund = fetch_funding()
+        rate, hrs = fund.get(fs, (0, 8))
+        tracked.setdefault(chat_id, [])
+        tracked[chat_id].append({
+            "kind": "pair", "main": sym,
+            "side_main": side_main, "rate0": rate, "hrs": hrs,
+            "daily0": daily_funding_pct(rate, hrs),
+            "stop_pct": STOP_MAX,       # консервативно, безубыток подтянет
+            "fa": fs, "bn_qa": abs(amt), "bn_pa": entry,
+            "bn_side_a": side_a, "be": False, "peak_profit": 0,
+            "t0_s": time.time(),
+            "bn_t": int(time.time() * 1000) - 24 * 3600 * 1000,
+            "adopted": True,
+        })
+        n += 1
+        try:
+            bot.send_message(chat_id, "🔄 Подхватил позицию с биржи: "
+                + ("🟢 ЛОНГ " if side_main == "long" else "🔴 ШОРТ ") + sym
+                + "\nтеперь веду её: фандинг, безубыток, трейлинг.")
+        except Exception:
+            pass
+    if n:
+        save()
+    return n
 
 
 # ---------- СКАН + АВТОВХОД ----------
@@ -1270,6 +1376,36 @@ def auto_loop():
                                     except Exception:
                                         pass
 
+                        # ТРЕЙЛИНГ: когда цена дала хороший плюс по телу —
+                        # тянем стоп следом, чтобы не упустить прибыль движения.
+                        # Работает поверх фандинга: кормушка капает, а плюс защищён.
+                        try:
+                            pnow = get_price(s["fa"])
+                            p0 = s.get("bn_pa", pnow)
+                            if p0 > 0:
+                                if s.get("bn_side_a") == "SELL":
+                                    profit_pct = (p0 - pnow) / p0 * 100    # шорт: плюс когда цена упала
+                                else:
+                                    profit_pct = (pnow - p0) / p0 * 100    # лонг: плюс когда выросла
+                                if profit_pct > s.get("peak_profit", 0):
+                                    s["peak_profit"] = round(profit_pct, 2)
+                                peak = s.get("peak_profit", 0)
+                                if peak >= TRAIL_START:
+                                    lock = peak - TRAIL_GAP        # сколько % прибыли фиксируем
+                                    if lock > s.get("trail_lock", -999):
+                                        if move_stop_profit(s, lock):
+                                            s["trail_lock"] = lock
+                                            s["be"] = True
+                                            try:
+                                                bot.send_message(chat_id, "📈 " + s["main"]
+                                                    + ": прибыль +" + format(peak, ".1f")
+                                                    + "%, трейлинг подтянут, фиксирую +"
+                                                    + format(lock, ".1f") + "%. Фандинг капает дальше.")
+                                            except Exception:
+                                                pass
+                        except Exception as e:
+                            print("trail", s.get("main"), ":", str(e)[:50])
+
                         reason = None
                         if rate is not None and abs(rate) < EXIT_FUNDING:
                             reason = ("🎯", "фандинг упал до " + format(rate, "+.3f") + "%, фиксируем")
@@ -1326,6 +1462,14 @@ if has_keys():
     try:
         pp = binance_positions()
         print("Binance OK, открытых ног:", len(pp))
+        # подхватываем осиротевшие после редеплоя позиции
+        for _uid in list(users):
+            try:
+                _n = adopt_positions(_uid)
+                if _n:
+                    print("подхвачено позиций с биржи:", _n, "для", _uid)
+            except Exception as _e:
+                print("adopt при старте:", _e)
     except Exception as e:
         print("Binance ключи не работают:", e)
     print("ФАНДИНГ-СОЛО | авто:", "ВКЛ" if auto_on else "выкл",
