@@ -42,8 +42,10 @@ STOP_MAX = float(os.environ.get("STOP_MAX", "8.0"))         # и не дальш
 MAX_IMPULSE = float(os.environ.get("MAX_IMPULSE", "12.0"))  # не входим если цена сдвинулась >этого % за IMPULSE_H
 IMPULSE_H = int(os.environ.get("IMPULSE_H", "12"))          # окно проверки импульса, часов
 MAX_ATR_RATIO = float(os.environ.get("MAX_ATR_RATIO", "2.0")) # пропускаем если ATR сейчас > этого × среднего ATR
-TRAIL_START = float(os.environ.get("TRAIL_START", "4.0"))   # активировать трейлинг когда прибыль по телу ≥ этого %
-TRAIL_GAP = float(os.environ.get("TRAIL_GAP", "2.0"))       # отступ трейлинга от пика прибыли, %
+TRAIL_CALLBACK = float(os.environ.get("TRAIL_CALLBACK", "2.0"))  # отступ трейлинга, % (биржевой callbackRate)
+TRAIL_ACTIVATE = float(os.environ.get("TRAIL_ACTIVATE", "3.0"))  # активация трейлинга при +этого % от входа
+TRAIL_START = float(os.environ.get("TRAIL_START", "4.0"))   # (устар., прогр. трейлинг больше не используется)
+TRAIL_GAP = float(os.environ.get("TRAIL_GAP", "2.0"))       # (устар.)
 TF = os.environ.get("PAIR_TF", "1h")                        # ТФ для ATR
 CAND_COINS = int(os.environ.get("CAND_COINS", "80"))        # из скольких монет ищем фандинг
 MAX_HOLD_H = float(os.environ.get("MAX_HOLD_H", "168"))     # макс. удержание, часов
@@ -195,6 +197,86 @@ def cancel_algo(fs):
         except Exception as e:
             print("cancel_algo", path, ":", str(e)[:90])
     return ok
+
+
+def algo_orders_count(fs):
+    """сколько условных ордеров реально стоит на бирже по символу"""
+    for path in ("/fapi/v1/algoOpenOrders", "/fapi/v1/openOrders"):
+        try:
+            r = signed_get(path, {"symbol": fs})
+            if isinstance(r, list):
+                return len(r)
+            if isinstance(r, dict) and "orders" in r:
+                return len(r["orders"])
+        except Exception as e:
+            print("algo count", path, ":", str(e)[:60])
+    return -1        # не смогли проверить
+
+
+def place_stop_verified(fs, side, trig, tries=3):
+    """
+    Ставим защитный стоп и ПРОВЕРЯЕМ, что он реально появился на бирже.
+    До tries попыток. Возвращает True только если ордер подтверждён.
+    """
+    for attempt in range(tries):
+        try:
+            place_cond(fs, side, "STOP_MARKET", trig)
+        except Exception as e:
+            print("place_stop", fs, "attempt", attempt + 1, ":", str(e)[:80])
+            time.sleep(1)
+            continue
+        time.sleep(1)        # даём бирже записать ордер
+        n = algo_orders_count(fs)
+        if n > 0:
+            return True      # ордер подтверждён на бирже
+        if n == 0:
+            # ордер не появился — пробуем ещё раз
+            print("stop не подтверждён на бирже, попытка", attempt + 1)
+            time.sleep(1)
+            continue
+        # n == -1: проверить не смогли, считаем что поставили (не блокируем)
+        return True
+    return False
+
+
+def place_trailing(fs, side, activate_price, callback_rate, qty):
+    """
+    Биржевой трейлинг-стоп через algoOrder.
+    side — сторона ЗАКРЫТИЯ (для лонга SELL, для шорта BUY).
+    activate_price — цена активации (для SELL выше текущей, для BUY ниже).
+    callback_rate — отступ в % (1.0 = 1%).
+    Биржа сама тянет стоп за ценой — надёжнее программного.
+    """
+    p = {"algoType": "CONDITIONAL", "symbol": fs, "side": side,
+         "type": "TRAILING_STOP_MARKET",
+         "activatePrice": activate_price, "callbackRate": callback_rate,
+         "quantity": qty, "reduceOnly": "true",
+         "workingType": "CONTRACT_PRICE"}
+    return signed_post("/fapi/v1/algoOrder", p)
+
+
+def place_trailing_verified(fs, side, activate_price, callback_rate, qty, tries=3):
+    """ставим трейлинг и проверяем, что он появился на бирже"""
+    for attempt in range(tries):
+        try:
+            place_trailing(fs, side, activate_price, callback_rate, qty)
+        except Exception as e:
+            msg = str(e)
+            print("trailing", fs, "attempt", attempt + 1, ":", msg[:90])
+            # -2021 = activation price мимо, пересчитывать бессмысленно повтором
+            if "-2021" in msg:
+                return False
+            time.sleep(1)
+            continue
+        time.sleep(1)
+        n = algo_orders_count(fs)
+        if n > 0:
+            return True
+        if n == 0:
+            time.sleep(1)
+            continue
+        return True      # проверить не смогли — считаем ок
+    return False
 
 
 def close_now(fs, side, qty):
@@ -844,23 +926,37 @@ def open_pair(chat_id, p):
         return False, main + " не встал: " + str(e)
     opened_keys.add(key)
 
-    # ЗАЩИТНЫЙ СТОП на бирже по stop_pct
+    # 1) ЗАЩИТНЫЙ СТОП (страховка от обвала до активации трейлинга)
     stop_pct = p.get("stop_pct", STOP_MAX) / 100
     sl_price = pa * (1 + stop_pct) if side_a == "SELL" else pa * (1 - stop_pct)
     sl_price = step_round(sl_price, ffa["tick"])
-    sl_ok = True
-    try:
-        place_cond(fa, opp_a, "STOP_MARKET", sl_price)
-    except Exception as e:
-        sl_ok = False
+    sl_ok = place_stop_verified(fa, opp_a, sl_price)
+
+    # 2) БИРЖЕВОЙ ТРЕЙЛИНГ — биржа сама тянет стоп за прибылью.
+    # активируется при +TRAIL_ACTIVATE% от входа, отступ TRAIL_CALLBACK%.
+    act = pa * (1 + TRAIL_ACTIVATE / 100) if side_a == "BUY" else pa * (1 - TRAIL_ACTIVATE / 100)
+    act = step_round(act, ffa["tick"])
+    cb = max(0.1, min(5.0, TRAIL_CALLBACK))     # биржа принимает 0.1..5%
+    trail_ok = place_trailing_verified(fa, opp_a, act, cb, qa)
+
+    if not sl_ok and not trail_ok:
         try:
-            bot.send_message(chat_id, "⚠️ " + main + " открыт, но стоп не встал: "
-                             + str(e)[:70] + "\nСледи вручную!")
+            bot.send_message(chat_id,
+                "🆘 ВНИМАНИЕ: " + main + " ОТКРЫТ БЕЗ ЗАЩИТЫ!\n\n"
+                "Ни стоп, ни трейлинг не встали. Поставь руками:\n"
+                "TP/SL → Стоп-лосс → цена " + fmt(sl_price))
+        except Exception:
+            pass
+    elif not trail_ok:
+        try:
+            bot.send_message(chat_id, "⚠️ " + main + ": трейлинг не встал, "
+                "но защитный стоп на " + fmt(sl_price) + " стоит. Прибыль не трейлится.")
         except Exception:
             pass
 
     return True, {"fa": fa, "qa": qa, "pa": pa, "side_a": side_a,
-                  "sl_price": sl_price, "sl_ok": sl_ok}
+                  "sl_price": sl_price, "sl_ok": sl_ok, "trail_ok": trail_ok,
+                  "trail_act": act}
 
 
 def close_pair(s, reason):
@@ -1129,13 +1225,10 @@ def move_stop_breakeven(s):
         pass
     opp = "BUY" if s.get("bn_side_a") == "SELL" else "SELL"
     be = step_round(s.get("bn_pa", 0), f["tick"])
-    try:
-        place_cond(fa, opp, "STOP_MARKET", be)
+    if place_stop_verified(fa, opp, be):
         s["stop_pct"] = 0.0
         return True
-    except Exception as e:
-        print("move BE", fa, ":", str(e)[:60])
-        return False
+    return False
 
 
 def move_stop_profit(s, lock_pct):
@@ -1161,12 +1254,7 @@ def move_stop_profit(s, lock_pct):
         cancel_algo(fa)
     except Exception:
         pass
-    try:
-        place_cond(fa, opp, "STOP_MARKET", sl_price)
-        return True
-    except Exception as e:
-        print("move profit", fa, ":", str(e)[:60])
-        return False
+    return place_stop_verified(fa, opp, sl_price)
 
 
 def adopt_positions(chat_id):
@@ -1301,10 +1389,13 @@ def auto_enter(chat_id, cands):
         })
         save()
         side = "🔴 ШОРТ" if p["side_main"] == "short" else "🟢 ЛОНГ"
+        tr = "✅" if info.get("trail_ok") else "⚠️нет"
         bot.send_message(chat_id,
             "🤖 ОТКРЫЛ: " + side + " " + p["main"] + " под фандинг\n"
             "фандинг " + format(p["rate"], "+.3f") + "% каждые " + str(p.get("hrs",8)) + "ч · сутки ~" + format(p.get("daily",0), "+.3f") + "%\n"
-            "🛑 стоп " + format(p.get("stop_pct",0), ".1f") + "% · безубыток при накоплении. Руками не трогаем.", reply_markup=menu())
+            "🛑 стоп " + format(p.get("stop_pct",0), ".1f") + "% · 📈 биржевой трейлинг " + tr
+            + " (актив. +" + format(TRAIL_ACTIVATE, ".0f") + "%, отступ " + format(TRAIL_CALLBACK, ".0f") + "%)\n"
+            "Руками не трогаем.", reply_markup=menu())
         time.sleep(1)
 
 
@@ -1359,52 +1450,9 @@ def auto_loop():
                         changed = True
                         held_h = (time.time() - s.get("t0_s", time.time())) / 3600
 
-                        # БЕЗУБЫТОК: когда РЕАЛЬНО пришедший фандинг перекрыл риск
-                        # по стопу — двигаем стоп к входу, дальше сделка «бесплатная»
-                        if not s.get("be"):
-                            got = accrued_funding(s)          # реальные $ с биржи
-                            s["fund_got"] = round(got, 2)
-                            risk_usd = SIZE * s.get("stop_pct", 8) / 100
-                            if got >= risk_usd:
-                                if move_stop_breakeven(s):
-                                    s["be"] = True
-                                    try:
-                                        bot.send_message(chat_id, "🛡 " + s["main"]
-                                            + ": фандинг накопил $" + format(got, ".2f")
-                                            + " (> риска $" + format(risk_usd, ".0f")
-                                            + "), стоп в безубытке. Дальше бесплатно.")
-                                    except Exception:
-                                        pass
-
-                        # ТРЕЙЛИНГ: когда цена дала хороший плюс по телу —
-                        # тянем стоп следом, чтобы не упустить прибыль движения.
-                        # Работает поверх фандинга: кормушка капает, а плюс защищён.
-                        try:
-                            pnow = get_price(s["fa"])
-                            p0 = s.get("bn_pa", pnow)
-                            if p0 > 0:
-                                if s.get("bn_side_a") == "SELL":
-                                    profit_pct = (p0 - pnow) / p0 * 100    # шорт: плюс когда цена упала
-                                else:
-                                    profit_pct = (pnow - p0) / p0 * 100    # лонг: плюс когда выросла
-                                if profit_pct > s.get("peak_profit", 0):
-                                    s["peak_profit"] = round(profit_pct, 2)
-                                peak = s.get("peak_profit", 0)
-                                if peak >= TRAIL_START:
-                                    lock = peak - TRAIL_GAP        # сколько % прибыли фиксируем
-                                    if lock > s.get("trail_lock", -999):
-                                        if move_stop_profit(s, lock):
-                                            s["trail_lock"] = lock
-                                            s["be"] = True
-                                            try:
-                                                bot.send_message(chat_id, "📈 " + s["main"]
-                                                    + ": прибыль +" + format(peak, ".1f")
-                                                    + "%, трейлинг подтянут, фиксирую +"
-                                                    + format(lock, ".1f") + "%. Фандинг капает дальше.")
-                                            except Exception:
-                                                pass
-                        except Exception as e:
-                            print("trail", s.get("main"), ":", str(e)[:50])
+                        # Защита прибыли теперь на бирже: защитный стоп + трейлинг
+                        # выставлены при открытии, биржа ведёт их сама.
+                        # Бот следит только за фандингом и таймаутом.
 
                         reason = None
                         if rate is not None and abs(rate) < EXIT_FUNDING:
