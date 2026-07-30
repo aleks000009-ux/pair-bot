@@ -589,14 +589,6 @@ def get_price(symbol):
     return float(r["price"])
 
 
-
-# ======================= ФАНДИНГ-ФАРМ =======================
-# Классика: две коррелированные монеты, спред, z-score.
-# |z|>=Z_ENTRY -> шортим сильную, лонгуем слабую (ставка на схождение).
-# |z|<=Z_EXIT -> закрываем обе ноги (сошлись, профит).
-# |z|>=Z_STOP -> закрываем обе ноги (разъехались, убыток).
-# Держим не дольше MAX_HOLD_H часов.
-
 def fmt(p):
     if p >= 100: return format(p, ".2f")
     if p >= 1: return format(p, ".4f")
@@ -700,828 +692,428 @@ def daily_funding_pct(rate, hrs):
     return rate * payouts_per_day
 
 
-def closes_tf(sym, limit):
-    """закрытия свечей TF по монете; None при ошибке"""
+
+
+# ======================= СТРАТЕГИЯ «ЛЕСЕНКА ПЕРЕД ФАНДИНГОМ» =======================
+# Идея: при сильно ОТРИЦАТЕЛЬНОМ фандинге шорты давят цену вниз перед выплатой.
+# За NN секунд до выплаты ставим лесенку ЛИМИТНЫХ ордеров на покупку ниже рынка.
+# Цена проваливается -> набираем лонг по хорошим ценам -> после выплаты отскок ->
+# закрываем в плюс. Шаг лесенки = половина размера фандинга, равными частями.
+#
+# ЧЕСТНЫЙ СЧЁТ: каждая сделка логируется с реальным результатом (отскок или стоп),
+# чтобы прямо на боте видеть, работает идея или нет.
+
+# --- параметры стратегии (крутятся через Railway) ---
+LADDER_TRIGGER = float(os.environ.get("LADDER_TRIGGER", "0.8"))   # входим при |фандинг| >= этого %
+LADDER_LEGS    = int(os.environ.get("LADDER_LEGS", "4"))          # сколько лимиток в лесенке
+LADDER_SIZES   = os.environ.get("LADDER_SIZES", "100,200,300,400")# размеры лимиток $, через запятую
+ENTER_BEFORE_S = int(os.environ.get("ENTER_BEFORE_S", "15"))      # за сколько секунд до выплаты ставить лимитки
+TAKE_PCT       = float(os.environ.get("TAKE_PCT", "1.0"))         # отскок вверх на % от средней -> продаём
+STOP_PCT       = float(os.environ.get("STOP_PCT", "3.0"))         # падение на % от средней -> стоп
+WAIT_FILL_MIN  = int(os.environ.get("WAIT_FILL_MIN", "10"))       # ждём набор лимиток, минут
+MAX_HOLD_MIN   = int(os.environ.get("MAX_HOLD_MIN", "120"))       # макс. удержание позиции, минут
+LAD_SCAN_SEC   = int(os.environ.get("LAD_SCAN_SEC", "30"))        # период проверки времени выплаты, сек
+
+
+def ladder_sizes():
     try:
-        kl = get_klines_tf(sym + "USDT", TF, limit)
+        return [float(x) for x in LADDER_SIZES.split(",")][:LADDER_LEGS]
     except Exception:
-        return None
-    # достаточно данных для расчёта z-score (окно ZWIN + запас), а не половины запроса
-    if not kl or len(kl) < ZWIN + 5:
-        return None
-    now_ms = int(time.time() * 1000)
-    if kl[-1]["close_t"] > now_ms:      # выкидываем незакрытую свечу
-        kl = kl[:-1]
-    return [k["c"] for k in kl]
+        return [100, 200, 300, 400][:LADDER_LEGS]
 
 
-def impulse_and_vol(sym):
-    """
-    Проверка перед входом. Возвращает (impulse_pct, atr_now_pct, atr_ratio) или None.
-    impulse_pct — движение цены за IMPULSE_H часов, %
-    atr_ratio — текущий ATR к среднему ATR за месяц (аномалия если >1)
-    """
+def next_funding(symbol):
+    """время следующей выплаты (ms) и текущая ставка (%) по монете"""
     try:
-        kl = get_klines_tf(sym + "USDT", "1h", 200)
-    except Exception:
-        return None
-    if not kl or len(kl) < 40:
-        return None
-    closes = [k["c"] for k in kl]
-    price = closes[-1]
-
-    # импульс: насколько цена ушла за последние IMPULSE_H часов
-    look = min(IMPULSE_H, len(closes) - 1)
-    past = closes[-1 - look]
-    impulse = (price - past) / past * 100 if past > 0 else 0.0
-
-    # ATR сейчас (14) vs средний ATR за длинное окно
-    def atr_window(kldata, period=14):
-        if len(kldata) < period + 1:
-            return None
-        trs = [max(kldata[i]["h"] - kldata[i]["l"],
-                   abs(kldata[i]["h"] - kldata[i-1]["c"]),
-                   abs(kldata[i]["l"] - kldata[i-1]["c"])) for i in range(1, len(kldata))]
-        return float(np.mean(trs[-period:]))
-    atr_now = atr_window(kl[-20:])
-    atr_long = atr_window(kl)          # по всему окну (≈месяц на 1ч? 200ч ≈ 8 дней)
-    if not atr_now or not atr_long or atr_long <= 0:
-        return None
-    atr_now_pct = atr_now / price * 100
-    ratio = atr_now / atr_long
-
-    return (impulse, atr_now_pct, ratio)
+        r = _api_get_fapi("/fapi/v1/premiumIndex?symbol=" + symbol)
+        if isinstance(r, dict):
+            nt = int(r.get("nextFundingTime", 0))
+            rate = float(r.get("lastFundingRate", 0)) * 100
+            return nt, rate
+    except Exception as e:
+        print("next_funding", symbol, ":", str(e)[:60])
+    return 0, 0.0
 
 
-def atr_pct(sym):
-    """ATR(1ч) в % от цены — мера волатильности для стопа"""
+def _api_get_fapi(path):
+    """GET к fapi (для premiumIndex — нужен именно фьючерсный домен)"""
+    url = FAPI + path
+    r = requests.get(url, timeout=15)
+    return r.json()
+
+
+def place_limit(fs, side, price, qty):
+    """лимитный ордер"""
+    p = {"symbol": fs, "side": side, "type": "LIMIT",
+         "price": fmt_tick(fs, price), "quantity": qty,
+         "timeInForce": "GTC"}
+    return signed_post("/fapi/v1/order", p)
+
+
+def fmt_tick(fs, price):
+    f = _filters.get(fs)
+    if f:
+        return fmt(step_round(price, f["tick"]))
+    return fmt(price)
+
+
+def cancel_all(fs):
     try:
-        kl = get_klines_tf(sym + "USDT", TF, 30)
-    except Exception:
-        return None
-    if not kl or len(kl) < 16:
-        return None
-    trs = []
-    for i in range(1, len(kl)):
-        h, l, pc = kl[i]["h"], kl[i]["l"], kl[i-1]["c"]
-        trs.append(max(h - l, abs(h - pc), abs(l - pc)))
-    atr = float(np.mean(trs[-14:]))
-    price = kl[-1]["c"]
-    return (atr / price * 100) if price > 0 else None
+        signed_delete("/fapi/v1/allOpenOrders", {"symbol": fs})
+    except Exception as e:
+        print("cancel_all", fs, ":", str(e)[:50])
 
 
-def scan_pairs():
-    """
-    Фандинг-фарм. Ищем монету с |фандинг|>=MIN_FUNDING, к ней подбираем
-    коррелированный хедж (corr>=MIN_CORR) с фандингом послабее.
-    Направление: фандинг>0 -> ловим шортом монеты; фандинг<0 -> лонгом.
-    Хедж — противоположной ногой, чтобы гасить движение тела.
-    Возвращаем список готовых сетапов, сорт по |фандинг| убыв.
-    """
+def find_ladder_candidates():
+    """ищем монеты с сильным отрицательным фандингом и близкой выплатой"""
     funnel.clear()
-    fund = fetch_funding()          # {sym: (rate, hrs)}
+    fund = fetch_funding()      # {sym: (rate, hrs)}
     funnel["монет с фандингом"] = len(fund)
     coins = top_coins()[:CAND_COINS]
     funnel["монет в пуле"] = len(coins)
-
-    # кандидаты по СУТОЧНОЙ доходности с учётом интервала
-    hot = []
+    now_ms = int(time.time() * 1000)
+    out = []
     for c in coins:
-        v = fund.get(c + "USDT")
+        fs = c + "USDT"
+        v = fund.get(fs)
         if v is None:
             continue
         rate, hrs = v
-        daily = daily_funding_pct(rate, hrs)
-        if abs(daily) >= MIN_FUNDING * 3:
-            hot.append((c, rate, hrs, daily))
-    hot.sort(key=lambda x: -abs(x[3]))
-    funnel["жирный фандинг"] = len(hot)
-    if not hot:
-        return []
-
-    # для каждой считаем ATR -> размер стопа + фильтры импульса и аномалии
-    found = []
-    for main, rate, hrs, daily in hot:
-        iv = impulse_and_vol(main)
-        if iv is None:
-            fn("нет данных")
+        # стратегия для ОТРИЦАТЕЛЬНОГО фандинга (шорты давят -> лонгуем на просадке)
+        if rate > -LADDER_TRIGGER:
             continue
-        impulse, atr_now_pct, atr_ratio = iv
-
-        # ФИЛЬТР 1: не входим против свежего импульса.
-        # фандинг<0 (лонгуем) — опасен недавний ОБВАЛ (past->now вниз): ловим нож.
-        # фандинг>0 (шортим) — опасен недавний ВЗЛЁТ (past->now вверх).
-        side_main = "short" if rate > 0 else "long"
-        if side_main == "long" and impulse <= -MAX_IMPULSE:
-            fn("обвал — не лонгуем"); continue
-        if side_main == "short" and impulse >= MAX_IMPULSE:
-            fn("взлёт — не шортим"); continue
-
-        # ФИЛЬТР 2: аномальная волатильность = манипуляция/неликвид, ложный фандинг
-        if atr_ratio > MAX_ATR_RATIO:
-            fn("аномальный ATR"); continue
-
-        stop_pct = min(STOP_MAX, max(STOP_MIN, atr_now_pct * ATR_STOP))
-        found.append({
-            "main": main, "rate": rate, "hrs": hrs, "daily": daily,
-            "side_main": side_main, "stop_pct": stop_pct, "atr_pct": atr_now_pct,
-            "impulse": impulse, "atr_ratio": atr_ratio,
-            "net": abs(daily),
-        })
-        fn("готов к входу")
-    funnel["готовы к входу"] = len(found)
-    found.sort(key=lambda x: -x["net"])
-    return found
+        fn("жирный минус-фандинг")
+        nt, live_rate = next_funding(fs)
+        if nt <= 0:
+            continue
+        mins_left = (nt - now_ms) / 60000
+        out.append({"sym": c, "fs": fs, "rate": rate, "next": nt,
+                    "mins_left": mins_left})
+    funnel["готовы к лесенке"] = len(out)
+    out.sort(key=lambda x: x["mins_left"])   # ближайшие выплаты первыми
+    return out
 
 
-def grade_pair(p):
-    """оценка сетапа 0..6: чем жирнее СУТОЧНАЯ доходность и выше corr, тем лучше"""
-    pts = 0
-    daily = abs(p.get("daily", 0))
-    if daily >= 6.0: pts += 3
-    elif daily >= 3.0: pts += 2
-    elif daily >= 1.5: pts += 1
-    # узкий стоп = меньше риск = лучше
-    sp = p.get("stop_pct", 8)
-    if sp <= 5.0: pts += 2
-    elif sp <= 6.5: pts += 1
-    if daily >= 4.5: pts += 1
-    # спокойный вход (нет свежего импульса) — надёжнее
-    if abs(p.get("impulse", 99)) <= 5.0: pts += 1
-    if pts >= 5: return pts, "🟢 ЖИРНЫЙ ФАНДИНГ"
-    if pts >= 3: return pts, "🟡 СРЕДНИЙ"
-    return pts, "🔴 СЛАБЫЙ"
-
-
-def pair_card(p):
-    pts, lab = grade_pair(p)
-    hrs = p.get("hrs", 8)
-    per_day = 24 // hrs if hrs else 3
-    side = "🔴 ШОРТ" if p["side_main"] == "short" else "🟢 ЛОНГ"
-    who = "лонги платят" if p["side_main"] == "short" else "шорты платят"
-    return (
-        "💰 " + side + " " + p["main"] + "  под фандинг\n"
-        + lab + "  (" + str(pts) + "/6)\n\n"
-        "⚡ фандинг: " + format(p["rate"], "+.3f") + "% каждые " + str(hrs) + "ч (" + who + ")\n"
-        "🧮 суточная доходность: ~" + format(p["daily"], "+.3f") + "%\n"
-        "🛑 стоп: " + format(p["stop_pct"], ".1f") + "%  (ATR " + format(p.get("atr_pct",0), ".1f") + "%)\n"
-        "📈 движение за " + str(IMPULSE_H) + "ч: " + format(p.get("impulse",0), "+.1f") + "%  (вход спокойный)\n\n"
-        "Собираем фандинг каждые " + str(hrs) + "ч.\n"
-        "Стоп в безубыток двигаю, как фандинг перекроет риск.\n"
-        "Выход: фандинг < " + str(EXIT_FUNDING) + "% или стоп.\n"
-        "⚙️ $" + str(SIZE) + " · плечо " + str(LEVERAGE) + "x"
-    )
-
-
-# ---------- ИСПОЛНЕНИЕ ПАРЫ (две ноги рынком) ----------
-
-def _market_leg(fs, side, qty):
-    return signed_post("/fapi/v1/order", {"symbol": fs, "side": side,
-                                          "type": "MARKET", "quantity": qty})
-
-
-def open_pair(chat_id, p):
+def open_ladder(chat_id, cand):
     """
-    Соло-фандинг: ОДНА нога под фандинг + защитный стоп-ордер на бирже.
-    side_main="short" -> шортим (лонги платят); "long" -> лонгуем (шорты платят).
-    Стоп на stop_pct от входа, реальным algo-ордером — держит даже при падении бота.
+    Ставим лесенку лимиток на покупку.
+    Шаг = половина |фандинга|, равными частями между ценой и (цена - фандинг/2).
     """
-    main = p["main"]
-    fa = auto_symbol(main)
-    if not fa:
-        return False, "нет фьючерса на " + main
-    key = fa
-    if key in opened_keys:
-        return False, "уже открывали"
-
-    if p["side_main"] == "short":
-        side_a, opp_a = "SELL", "BUY"
-    else:
-        side_a, opp_a = "BUY", "SELL"
+    fs = cand["fs"]
+    price = get_price(fs)
+    depth = abs(cand["rate"]) / 2 / 100        # половина фандинга в долях
+    sizes = ladder_sizes()
+    n = len(sizes)
+    f = _filters.get(fs)
+    if not f:
+        return False, "нет фильтров " + fs
 
     try:
-        signed_post("/fapi/v1/leverage", {"symbol": fa, "leverage": LEVERAGE})
-    except Exception as e:
-        print("leverage", fa, e)
+        signed_post("/fapi/v1/leverage", {"symbol": fs, "leverage": LEVERAGE})
+    except Exception:
+        pass
 
-    pa = get_price(fa)
-    ffa = _filters[fa]
-    qa = step_round(SIZE / pa, ffa["step"])
-    if qa < ffa["minQty"] or qa * pa < ffa["minNot"]:
-        return False, main + ": размер меньше минимума"
-
-    # открываем ногу
-    try:
-        _market_leg(fa, side_a, qa)
-    except Exception as e:
-        return False, main + " не встал: " + str(e)
-    opened_keys.add(key)
-
-    # 1) ЗАЩИТНЫЙ СТОП (страховка от обвала до активации трейлинга)
-    stop_pct = p.get("stop_pct", STOP_MAX) / 100
-    sl_price = pa * (1 + stop_pct) if side_a == "SELL" else pa * (1 - stop_pct)
-    sl_price = step_round(sl_price, ffa["tick"])
-    sl_ok = place_stop_verified(fa, opp_a, sl_price)
-
-    # 2) БИРЖЕВОЙ ТРЕЙЛИНГ — биржа сама тянет стоп за прибылью.
-    # активируется при +TRAIL_ACTIVATE% от входа, отступ TRAIL_CALLBACK%.
-    act = pa * (1 + TRAIL_ACTIVATE / 100) if side_a == "BUY" else pa * (1 - TRAIL_ACTIVATE / 100)
-    act = step_round(act, ffa["tick"])
-    cb = max(0.1, min(5.0, TRAIL_CALLBACK))     # биржа принимает 0.1..5%
-    trail_ok = place_trailing_verified(fa, opp_a, act, cb, qa)
-
-    if not sl_ok and not trail_ok:
+    placed = []
+    total_qty = 0.0
+    weighted = 0.0
+    for i in range(n):
+        # равные части вниз: от цены до цены*(1-depth)
+        frac = (i + 1) / n * depth
+        lp = price * (1 - frac)
+        qty = step_round(sizes[i] / lp, f["step"])
+        if qty < f["minQty"] or qty * lp < f["minNot"]:
+            continue
         try:
-            bot.send_message(chat_id,
-                "🆘 ВНИМАНИЕ: " + main + " ОТКРЫТ БЕЗ ЗАЩИТЫ!\n\n"
-                "Ни стоп, ни трейлинг не встали. Поставь руками:\n"
-                "TP/SL → Стоп-лосс → цена " + fmt(sl_price))
-        except Exception:
-            pass
-    elif not trail_ok:
-        try:
-            bot.send_message(chat_id, "⚠️ " + main + ": трейлинг не встал, "
-                "но защитный стоп на " + fmt(sl_price) + " стоит. Прибыль не трейлится.")
-        except Exception:
-            pass
+            place_limit(fs, "BUY", lp, qty)
+            placed.append((lp, qty))
+            total_qty += qty
+            weighted += lp * qty
+        except Exception as e:
+            print("limit", fs, i, ":", str(e)[:60])
+    if not placed:
+        return False, "лимитки не встали"
 
-    return True, {"fa": fa, "qa": qa, "pa": pa, "side_a": side_a,
-                  "sl_price": sl_price, "sl_ok": sl_ok, "trail_ok": trail_ok,
-                  "trail_act": act}
+    avg_planned = weighted / total_qty if total_qty else price
+    tracked.setdefault(chat_id, [])
+    tracked[chat_id].append({
+        "kind": "ladder", "sym": cand["sym"], "fs": fs,
+        "rate0": cand["rate"], "price0": price,
+        "avg_planned": avg_planned, "planned_qty": total_qty,
+        "legs": placed, "state": "waiting_fill",
+        "t0": time.time(), "next": cand["next"],
+        "bn_t": int(time.time() * 1000) - 60000,
+    })
+    save()
+    lines = "\n".join("  $" + format(s, ".0f") + " @ " + fmt(p)
+                      for (p, q), s in zip(placed, sizes))
+    bot.send_message(chat_id,
+        "🪜 ЛЕСЕНКА ВЫСТАВЛЕНА: " + cand["sym"] + "\n"
+        "фандинг " + format(cand["rate"], "+.3f") + "% · выплата через "
+        + format(cand["mins_left"], ".0f") + " мин\n"
+        "лимитки на покупку:\n" + lines + "\n"
+        "жду набора, потом отскок +" + format(TAKE_PCT, ".1f") + "% или стоп -"
+        + format(STOP_PCT, ".1f") + "%", reply_markup=menu())
+    return True, "ok"
 
 
-def close_pair(s, reason):
+def manage_ladder(chat_id, s):
     """
-    Закрыть ногу. ПОРЯДОК ВАЖЕН: сначала закрываем позицию маркетом,
-    и только потом снимаем защитный стоп. Так между шагами нет окна,
-    где позиция голая без стопа.
+    Ведём позицию-лесенку:
+      waiting_fill -> ждём набора лимиток (WAIT_FILL_MIN)
+      in_position  -> ждём отскок (TAKE) или стоп (STOP) или таймаут
+    Возвращает True если позицию надо убрать из трекинга.
     """
-    fa = s["fa"]
+    fs = s["fs"]
     try:
         pos = binance_positions()
     except Exception:
-        pos = {}
-    amt = abs(pos.get(fa, {}).get("amt", 0))
+        return False
+    amt = abs(pos.get(fs, {}).get("amt", 0))
+    entry = pos.get(fs, {}).get("entry", 0)
+    held_min = (time.time() - s.get("t0", time.time())) / 60
 
-    closed = False
-    if amt <= 0:
-        closed = True                     # позиции уже нет (стоп сработал)
-    else:
-        try:
-            close_now(fa, s.get("bn_side_a", "BUY"), amt)
-            closed = True
-        except Exception as e:
-            msg = str(e)
-            if "-2022" in msg or "ReduceOnly" in msg or "-4046" in msg:
-                closed = True             # уже закрыта встречно
-            else:
-                print("close solo", fa, ":", msg[:80])
-
-    # стоп снимаем ТОЛЬКО после того, как позиция закрыта
-    if closed:
-        try:
-            cancel_algo(fa)
-        except Exception as e:
-            print("cancel stop", fa, ":", str(e)[:60])
-        opened_keys.discard(fa)
-    return closed
-
-
-# ---------- МЕНЮ ----------
-
-def menu():
-    kb = types.ReplyKeyboardMarkup(resize_keyboard=True)
-    kb.row("🔍 Найти фандинг")
-    kb.row("📋 Мои фармы", "📊 Статистика")
-    kb.row("🔄 Подхватить позиции", "🤖 Автоторговля")
-    kb.row("🗑 Очистить")
-    return kb
-
-
-# ---------- ХЕНДЛЕРЫ ----------
-
-@bot.message_handler(commands=['start'])
-def start(m):
-    users.add(m.chat.id)
-    save()
-    k = ("✅ Binance подключён — статистика с " + STATS_START + " МСК.") if has_keys() \
-        else "⚠️ Binance не подключён — добавь ключи в Railway."
-    bot.send_message(m.chat.id,
-        "Фандинг-фарм 💰 (соло)\n"
-        "Ищу монету с жирным фандингом, вхожу одной ногой под защитой стопа.\n"
-        "Стоп 2.5×ATR (" + str(STOP_MIN) + "-" + str(STOP_MAX) + "%), двигаю в безубыток когда фандинг перекроет риск.\n"
-        "Выход: фандинг < " + str(EXIT_FUNDING) + "% или стоп.\n\n" + k, reply_markup=menu())
-
-
-@bot.message_handler(func=lambda m: m.text == "🔍 Найти фандинг")
-def btn_scan(m):
-    users.add(m.chat.id)
-    save()
-    bot.send_message(m.chat.id, "Сканирую фандинг по топ-" + str(CAND_COINS) + " монетам... жди 1-3 мин")
-    do_scan(m.chat.id, manual=True)
-
-
-@bot.message_handler(func=lambda m: m.text == "📋 Мои фармы")
-def btn_list(m):
-    t = [x for x in tracked.get(m.chat.id, []) if x.get("kind") == "pair"]
-    if not t:
-        bot.send_message(m.chat.id, "Нет открытых пар.", reply_markup=menu())
-        return
-    for s in list(t):
-        try:
-            rate = s.get("rate_last")
-            if rate is None:
-                rate = live_funding(s)
-            held_h = (time.time() - s.get("t0_s", time.time())) / 3600
-            if rate is not None and abs(rate) < EXIT_FUNDING + 0.05:
-                mark = "🟢 фандинг гаснет — скоро выход"
-            else:
-                mark = "🟡 собираем фандинг"
-
-            side = "🔴 ШОРТ" if s["side_main"] == "short" else "🟢 ЛОНГ"
-            rate_t = format(rate, "+.3f") + "%" if rate is not None else "?"
-            hrs = s.get("hrs", 8)
-            per_day = 24 // hrs if hrs else 3
-            day = (abs(rate) * per_day) if rate is not None else 0
-            be = "\n🛡 стоп в безубытке" if s.get("be") else ""
-            txt = (
-                "💰 " + side + " " + s["main"] + "   " + mark + "\n\n"
-                "⚡ фандинг: " + rate_t + " каждые " + str(hrs) + "ч  (≈" + format(day, ".2f") + "%/день)\n"
-                "🛑 стоп: " + format(s.get("stop_pct", 0), ".1f") + "%" + be + "\n"
-                "вошли при " + format(s.get("rate0", 0), "+.3f") + "%\n"
-                "⏱ в позиции " + format(held_h, ".1f") + " ч из " + str(int(MAX_HOLD_H))
-            )
-            bot.send_message(m.chat.id, txt, reply_markup=menu())
-        except Exception as e:
-            bot.send_message(m.chat.id, s["main"] + ": " + str(e)[:60])
-
-
-@bot.message_handler(func=lambda m: m.text == "📊 Статистика")
-def btn_stats(m):
-    if not has_keys():
-        bot.send_message(m.chat.id, "⚠️ Binance не подключён.", reply_markup=menu())
-        return
-    bot.send_message(m.chat.id, "Тяну реальные сделки с Binance...")
-    try:
-        rows = income_all(stats_start_ms())
-        rows = [x for x in rows if (x.get("symbol") or "").upper() not in STATS_IGNORE]
-        if not rows:
-            bot.send_message(m.chat.id, "📊 С " + STATS_START + " МСК сделок нет.", reply_markup=menu())
-            return
-        tot = split_income(rows)
-        real = tot["pnl"] + tot["fee"] + tot["fund"] + tot["other"]
-        # для пар считаем закрытия по кластерам (нога A и нога B закрываются вместе)
-        tr = group_trades(rows)
-        # пара = два закрытия рядом по времени; но для простоты статистики берём разбивку по монетам
-        vals = [x["net"] for x in tr]
-        total = len(vals)
-        wins = [x for x in vals if x > BE_BAND]
-        losses = [x for x in vals if x < -BE_BAND]
-        bes = [x for x in vals if abs(x) <= BE_BAND]
-        wr = (len(wins) / total * 100) if total else 0
-        avg_w = float(np.mean(wins)) if wins else 0.0
-        avg_l = float(np.mean([abs(x) for x in losses])) if losses else 0.0
-        try:
-            pos = {k: v for k, v in binance_positions().items() if k.upper() not in STATS_IGNORE}
-        except Exception:
-            pos = {}
-        upnl = sum(v["upnl"] for v in pos.values())
-        L = []
-        L.append("📊 ФАНДИНГ-ФАРМ · с " + STATS_START + " МСК")
-        L.append(str(total) + " закрытий ног · " + str(len(pos)) + " открытых ног")
-        L.append("")
-        L.append("💵 Чистыми:  " + money(real))
-        if pos:
-            L.append("📌 Плавает:  " + money(upnl))
-            L.append("━━━━━━━━━━━━")
-            L.append("ИТОГО:       " + money(real + upnl))
-        L.append("")
-        L.append("🟢 В плюс:   " + str(len(wins)) + "   (" + format(wr, ".0f") + "%)")
-        L.append("🔴 В минус:  " + str(len(losses)))
-        L.append("🛡 В ноль:   " + str(len(bes)))
-        L.append("")
-        L.append("📈 Грязный: " + money(tot["pnl"]))
-        L.append("💸 Комиссии: " + money(tot["fee"]))
-        L.append("💱 Фандинг: " + money(tot["fund"]))
-        L.append("")
-        L.append("⚠️ ноги считаются раздельно; пара = две строки")
-        bot.send_message(m.chat.id, "\n".join(L), reply_markup=menu())
-    except Exception as e:
-        bot.send_message(m.chat.id, "Ошибка Binance: " + str(e), reply_markup=menu())
-
-
-@bot.message_handler(func=lambda m: m.text == "🔄 Подхватить позиции")
-def btn_adopt(m):
-    if not has_keys():
-        bot.send_message(m.chat.id, "⚠️ Нет ключей Binance.", reply_markup=menu())
-        return
-    bot.send_message(m.chat.id, "Ищу открытые позиции на бирже...")
-    try:
-        n = adopt_positions(m.chat.id)
-        if n:
-            bot.send_message(m.chat.id, "✅ Подхватил " + str(n)
-                + " позиц. Теперь веду их: фандинг, безубыток, трейлинг.", reply_markup=menu())
-        else:
-            bot.send_message(m.chat.id, "Новых позиций на бирже нет (все уже отслеживаются "
-                "или счёт пуст).", reply_markup=menu())
-    except Exception as e:
-        bot.send_message(m.chat.id, "Ошибка: " + str(e)[:80], reply_markup=menu())
-
-
-@bot.message_handler(func=lambda m: m.text == "🤖 Автоторговля")
-def btn_auto(m):
-    global auto_on
-    if not has_keys():
-        bot.send_message(m.chat.id, "⚠️ Нет ключей Binance.", reply_markup=menu())
-        return
-    auto_on = not auto_on
-    if auto_on:
-        try:
-            pos = len(binance_positions())
-        except Exception:
-            pos = "?"
-        bot.send_message(m.chat.id,
-            "🤖 АВТОТОРГОВЛЯ ВКЛЮЧЕНА\n\n"
-            "Вхожу в пары с оценкой ≥" + str(AUTO_MIN_PTS) + "/6\n"
-            "По $" + str(SIZE) + " на ногу · плечо " + str(LEVERAGE) + "x\n"
-            "Потолок: " + str(MAX_POS) + " ног (сейчас " + str(pos) + ")\n"
-            "Выход по z автоматом. Руками не трогай.", reply_markup=menu())
-    else:
-        bot.send_message(m.chat.id, "🤖 Автоторговля ВЫКЛЮЧЕНА.\nОткрытые пары продолжаю вести до выхода по z.", reply_markup=menu())
-
-
-@bot.message_handler(func=lambda m: m.text == "🗑 Очистить")
-def btn_clear(m):
-    tracked[m.chat.id] = []
-    save()
-    bot.send_message(m.chat.id, "Отслеживание снято. Статистика сохранена.\n(позиции на бирже не тронуты)", reply_markup=menu())
-
-
-def funnel_text():
-    if not funnel:
-        return ""
-    order = ["монет с фандингом", "монет в пуле", "жирный фандинг",
-             "нет данных", "обвал — не лонгуем", "взлёт — не шортим",
-             "аномальный ATR", "готовы к входу"]
-    t = "\n📉 ВОРОНКА:"
-    for k in order:
-        if funnel.get(k):
-            t += "\n  " + k + ": " + str(funnel[k])
-    return t
-
-
-# ---------- ТЕКУЩИЙ z ПО ОТКРЫТОЙ ПАРЕ ----------
-
-def live_funding(s):
-    """текущий фандинг основной ноги (ставка за интервал), %"""
-    fund = fetch_funding()
-    v = fund.get(s["main"] + "USDT")
-    return v[0] if v else None
-
-
-def accrued_funding(s):
-    """
-    РЕАЛЬНЫЙ накопленный фандинг с биржи (FUNDING_FEE по монете с момента входа).
-    Раньше считалось по ставке входа × число выплат — это выдумка, которая
-    двигала безубыток на основе несуществующих денег. Теперь по факту.
-    """
-    fs = s.get("fa")
-    if not fs:
-        return 0.0
-    since = s.get("bn_t", int(time.time() * 1000) - 86400000)
-    try:
-        rows = binance_income(since, fs)
-    except Exception:
-        return 0.0
-    total = 0.0
-    for x in rows:
-        if x.get("incomeType") == "FUNDING_FEE":
+    if s["state"] == "waiting_fill":
+        if amt > 0:
+            # часть лесенки набралась — переходим в позицию
+            s["state"] = "in_position"
+            s["bn_entry"] = entry
+            cancel_all(fs)     # снимаем неисполненные лимитки
             try:
-                total += float(x.get("income", 0))
+                bot.send_message(chat_id, "✅ " + s["sym"]
+                    + ": лесенка набрала лонг по средней " + fmt(entry)
+                    + "\nжду отскок +" + format(TAKE_PCT, ".1f") + "%")
             except Exception:
                 pass
-    # нам важен положительный приход фандинга (в нашу сторону)
-    return total
-
-
-def move_stop_breakeven(s):
-    """передвигаем защитный стоп на цену входа"""
-    fa = s["fa"]
-    f = _filters.get(fa)
-    if not f:
+            return False
+        # лимитки не набрались за WAIT_FILL_MIN — отменяем, сделки нет
+        if held_min >= WAIT_FILL_MIN:
+            cancel_all(fs)
+            try:
+                bot.send_message(chat_id, "⏭ " + s["sym"]
+                    + ": цена не провалилась до лимиток за " + str(WAIT_FILL_MIN)
+                    + " мин, отменил. Сделки нет.")
+            except Exception:
+                pass
+            return True
         return False
-    try:
-        cancel_algo(fa)
-    except Exception:
-        pass
-    opp = "BUY" if s.get("bn_side_a") == "SELL" else "SELL"
-    be = step_round(s.get("bn_pa", 0), f["tick"])
-    if place_stop_verified(fa, opp, be):
-        s["stop_pct"] = 0.0
+
+    # in_position: ждём отскок или стоп
+    if amt <= 0:
+        # позиции нет — закрылась (стоп/тейк исполнился) — фиксируем результат
+        record_ladder_close(chat_id, s, "закрыто")
+        return True
+    entry = s.get("bn_entry", entry)
+    price = get_price(fs)
+    move = (price - entry) / entry * 100 if entry else 0
+    if move >= TAKE_PCT:
+        close_now(fs, "BUY", amt)      # продаём лонг на отскоке
+        record_ladder_close(chat_id, s, "🎯 отскок +" + format(move, ".1f") + "%")
+        return True
+    if move <= -STOP_PCT:
+        close_now(fs, "BUY", amt)
+        record_ladder_close(chat_id, s, "🛑 стоп " + format(move, ".1f") + "%")
+        return True
+    if held_min >= MAX_HOLD_MIN:
+        close_now(fs, "BUY", amt)
+        record_ladder_close(chat_id, s, "⏱ таймаут " + format(move, ".1f") + "%")
         return True
     return False
 
 
-def move_stop_profit(s, lock_pct):
-    """
-    Передвигаем стоп на уровень фиксации прибыли: вход ± lock_pct%.
-    Для лонга стоп выше входа, для шорта ниже — так фиксируется часть движения.
-    """
-    fa = s["fa"]
-    f = _filters.get(fa)
-    if not f:
-        return False
-    p0 = s.get("bn_pa", 0)
-    if p0 <= 0:
-        return False
-    opp = "BUY" if s.get("bn_side_a") == "SELL" else "SELL"
-    # уровень стопа: для лонга вход*(1+lock), для шорта вход*(1-lock)
-    if s.get("bn_side_a") == "SELL":
-        sl_price = p0 * (1 - lock_pct / 100)   # шорт: прибыль когда цена ниже входа
-    else:
-        sl_price = p0 * (1 + lock_pct / 100)   # лонг: прибыль когда цена выше входа
-    sl_price = step_round(sl_price, f["tick"])
+def record_ladder_close(chat_id, s, reason):
+    """фиксируем результат сделки с РЕАЛЬНЫМ pnl с биржи"""
+    fs = s["fs"]
+    since = s.get("bn_t", int(time.time() * 1000) - 3600000)
     try:
-        cancel_algo(fa)
+        inc = last_trade_income(fs, since)
+        net = inc["pnl"] + inc["fee"] + inc["fund"]
+        gross, fee, fund = inc["pnl"], inc["fee"], inc["fund"]
     except Exception:
-        pass
-    return place_stop_verified(fa, opp, sl_price)
-
-
-def adopt_positions(chat_id):
-    """
-    Подхватываем живые позиции с биржи, которых нет в трекинге.
-    Нужно после редеплоя: trades.json сбросился, а позиции на бирже живут.
-    Бот начинает ими управлять (фандинг, безубыток, трейлинг, выход).
-    """
-    try:
-        pos = binance_positions()
-    except Exception as e:
-        print("adopt positions:", e)
-        return 0
-    known = set()
-    for x in tracked.get(chat_id, []):
-        if x.get("kind") == "pair":
-            known.add(x.get("fa"))
-    n = 0
-    for fs, v in pos.items():
-        if fs in known:
-            continue
-        if fs.upper() in STATS_IGNORE:
-            continue
-        amt = v.get("amt", 0)
-        if abs(amt) <= 0:
-            continue
-        sym = fs.replace("USDT", "")
-        entry = v.get("entry", get_price(fs))
-        side_a = "BUY" if amt > 0 else "SELL"      # amt>0 лонг, <0 шорт
-        side_main = "long" if amt > 0 else "short"
-        # текущий фандинг монеты
-        fund = fetch_funding()
-        rate, hrs = fund.get(fs, (0, 8))
-        tracked.setdefault(chat_id, [])
-        tracked[chat_id].append({
-            "kind": "pair", "main": sym,
-            "side_main": side_main, "rate0": rate, "hrs": hrs,
-            "daily0": daily_funding_pct(rate, hrs),
-            "stop_pct": STOP_MAX,       # консервативно, безубыток подтянет
-            "fa": fs, "bn_qa": abs(amt), "bn_pa": entry,
-            "bn_side_a": side_a, "be": False, "peak_profit": 0,
-            "t0_s": time.time(),
-            "bn_t": int(time.time() * 1000) - 24 * 3600 * 1000,
-            "adopted": True,
-        })
-        n += 1
-        try:
-            bot.send_message(chat_id, "🔄 Подхватил позицию с биржи: "
-                + ("🟢 ЛОНГ " if side_main == "long" else "🔴 ШОРТ ") + sym
-                + "\nтеперь веду её: фандинг, безубыток, трейлинг.")
-        except Exception:
-            pass
-    if n:
-        save()
-    return n
-
-
-# ---------- СКАН + АВТОВХОД ----------
-
-def do_scan(chat_id, manual=False):
-    try:
-        setups = scan_pairs()
-        # busy = занятые монеты. Считаем от РЕАЛЬНЫХ позиций биржи + tracked,
-        # чтобы после редеплоя не задваивать вход и не блокировать закрытые.
-        busy = set()
-        for x in tracked.get(chat_id, []):
-            if x.get("kind") == "pair":
-                busy.add(x["main"])
-        try:
-            live_pos = set(binance_positions().keys())
-            for s in live_pos:
-                busy.add(s.replace("1000", "").replace("USDT", ""))
-        except Exception:
-            pass
-        fresh = [p for p in setups if p["main"] not in busy]
-
-        if auto_on and has_keys():
-            auto_enter(chat_id, fresh)
-
-        if not setups:
-            if manual:
-                bot.send_message(chat_id, "Жирного фандинга сейчас нет.\n"
-                                 "(нужен |фандинг|≥" + str(MIN_FUNDING) + "% и хедж corr≥" + str(MIN_CORR) + ")"
-                                 + funnel_text(), reply_markup=menu())
-            return
-        show = fresh[:6]
-        if not show:
-            if manual:
-                bot.send_message(chat_id, "Сетапы есть, но их монеты уже в работе."
-                                 + funnel_text(), reply_markup=menu())
-            return
-        head = "Нашёл сетапов: " + str(len(fresh))
-        if manual:
-            head += funnel_text()
-        bot.send_message(chat_id, head)
-        for p in show:
-            bot.send_message(chat_id, pair_card(p), reply_markup=menu())
-            time.sleep(0.6)
-    except Exception as e:
-        print("scan error:", e)
-        if manual:
-            bot.send_message(chat_id, "Ошибка при поиске.", reply_markup=menu())
-
-
-def auto_enter(chat_id, cands):
-    try:
-        pos = binance_positions()
-    except Exception as e:
-        print("auto positions:", e)
-        return
-    free = MAX_POS - len(pos)          # соло: 1 нога = 1 слот
-    if free < 1:
-        return
-    for p in cands:
-        if free < 1:
-            break
-        if grade_pair(p)[0] < AUTO_MIN_PTS:
-            continue
-        fa = auto_symbol(p["main"])
-        if not fa or fa in pos:
-            continue
-        try:
-            ok, info = open_pair(chat_id, p)
-        except Exception as e:
-            bot.send_message(chat_id, "🤖 ❌ " + p["main"] + ": " + str(e)[:80])
-            continue
-        if not ok:
-            bot.send_message(chat_id, "🤖 " + p["main"] + " — " + str(info)[:120])
-            continue
-        free -= 1
-        pos[fa] = {"amt": info["qa"]}     # чтобы не войти в ту же монету дважды за скан
-        tracked.setdefault(chat_id, [])
-        tracked[chat_id].append({
-            "kind": "pair", "main": p["main"],
-            "side_main": p["side_main"], "rate0": p["rate"], "hrs": p.get("hrs", 8),
-            "daily0": p.get("daily", 0), "stop_pct": p.get("stop_pct", 8),
-            "fa": info["fa"], "bn_qa": info["qa"], "bn_pa": info["pa"],
-            "bn_side_a": info["side_a"], "be": False,
-            "t0_s": time.time(),
-            "bn_t": int(time.time() * 1000) - 5 * 60 * 1000,
-        })
-        save()
-        side = "🔴 ШОРТ" if p["side_main"] == "short" else "🟢 ЛОНГ"
-        tr = "✅" if info.get("trail_ok") else "⚠️нет"
-        bot.send_message(chat_id,
-            "🤖 ОТКРЫЛ: " + side + " " + p["main"] + " под фандинг\n"
-            "фандинг " + format(p["rate"], "+.3f") + "% каждые " + str(p.get("hrs",8)) + "ч · сутки ~" + format(p.get("daily",0), "+.3f") + "%\n"
-            "🛑 стоп " + format(p.get("stop_pct",0), ".1f") + "% · 📈 биржевой трейлинг " + tr
-            + " (актив. +" + format(TRAIL_ACTIVATE, ".0f") + "%, отступ " + format(TRAIL_CALLBACK, ".0f") + "%)\n"
-            "Руками не трогаем.", reply_markup=menu())
-        time.sleep(1)
-
-
-# ---------- ЗАКРЫТИЕ ПАРЫ + ЗАПИСЬ PnL ----------
-
-def record_pair_close(chat_id, s, reason_ic, reason_txt):
-    """
-    Обе ноги закрыты. Тянем реальный PnL по обеим монетам с биржи и пишем в историю.
-    """
-    since = s.get("bn_t", int(time.time() * 1000) - 86400000)
-    ia = last_trade_income(s["fa"], since)
-    net = ia["pnl"] + ia["fee"] + ia["fund"]
-    gross = ia["pnl"]
-    fee = ia["fee"]
-    fund = ia["fund"]
-    history.setdefault(chat_id, [])
-    history[chat_id].append({
-        "sym": s["main"], "side": "funding", "result": reason_txt,
-        "pnl": round(net, 2), "gross": round(gross, 2),
-        "fee": round(fee, 2), "fund": round(fund, 2),
-        "src": "binance", "t": int(time.time())})
+        net = gross = fee = fund = 0.0
+    hist = history.setdefault(chat_id, [])
+    hist.append({"sym": s["sym"], "side": "ladder", "result": reason,
+                 "net": round(net, 2), "gross": round(gross, 2),
+                 "fee": round(fee, 2), "fund": round(fund, 2),
+                 "src": "binance", "t": int(time.time())})
     save()
     try:
         bot.send_message(chat_id,
-            reason_ic + " ФАРМ ЗАКРЫТ: " + s["main"] + "\n"
-            "(" + reason_txt + ")\n\n"
-            "📈 Грязный: " + money(gross) + "\n"
-            "💸 Комиссии: " + money(fee) + "\n"
-            "💱 Фандинг: " + money(fund) + "\n"
-            "━━━━━━━━━━\n"
-            "💵 Чистыми: " + money(net) + "\n\n"
-            "Записал в статистику.", reply_markup=menu())
+            "🪜 ЛЕСЕНКА ЗАКРЫТА: " + s["sym"] + "\n" + reason + "\n"
+            "💵 чистыми: " + money(net) + "  (тело " + money(gross)
+            + " · фандинг " + money(fund) + " · комиссии " + money(fee) + ")",
+            reply_markup=menu())
     except Exception:
         pass
     return net
 
 
+# ---------- МЕНЮ ----------
+
+auto_on = os.environ.get("AUTO", "1") == "1"
+
+
+def menu():
+    kb = types.ReplyKeyboardMarkup(resize_keyboard=True)
+    kb.row("🪜 Найти лесенки")
+    kb.row("📋 Мои сделки", "📊 Статистика")
+    kb.row("🤖 Автоторговля", "🗑 Очистить")
+    return kb
+
+
+@bot.message_handler(commands=['start'])
+def cmd_start(m):
+    users.add(m.chat.id); save()
+    k = "✅ Binance подключён" if has_keys() else "⚠️ нет ключей Binance"
+    bot.send_message(m.chat.id,
+        "🪜 Стратегия «Лесенка перед фандингом»\n"
+        "При фандинге ≤ -" + str(LADDER_TRIGGER) + "% ставлю лесенку лимиток на покупку "
+        "за " + str(ENTER_BEFORE_S) + " сек до выплаты.\n"
+        "Цена проваливается → набираю лонг → отскок +" + str(TAKE_PCT) + "% → продаю.\n"
+        "Стоп -" + str(STOP_PCT) + "%. Шаг лесенки = половина фандинга.\n\n" + k,
+        reply_markup=menu())
+
+
+@bot.message_handler(func=lambda m: m.text == "🪜 Найти лесенки")
+def btn_find(m):
+    bot.send_message(m.chat.id, "Ищу монеты с жирным отрицательным фандингом...")
+    try:
+        cands = find_ladder_candidates()
+        if not cands:
+            bot.send_message(m.chat.id, "Сейчас нет монет с фандингом ≤ -"
+                + str(LADDER_TRIGGER) + "%." + funnel_text(), reply_markup=menu())
+            return
+        head = "Нашёл " + str(len(cands)) + " кандидатов" + funnel_text()
+        bot.send_message(m.chat.id, head)
+        for c in cands[:6]:
+            bot.send_message(m.chat.id,
+                "💰 " + c["sym"] + "\n"
+                "фандинг " + format(c["rate"], "+.3f") + "%\n"
+                "выплата через " + format(c["mins_left"], ".0f") + " мин",
+                reply_markup=menu())
+            time.sleep(0.4)
+    except Exception as e:
+        bot.send_message(m.chat.id, "Ошибка: " + str(e)[:80], reply_markup=menu())
+
+
+@bot.message_handler(func=lambda m: m.text == "📋 Мои сделки")
+def btn_list(m):
+    t = [x for x in tracked.get(m.chat.id, []) if x.get("kind") == "ladder"]
+    if not t:
+        bot.send_message(m.chat.id, "Нет активных лесенок.", reply_markup=menu())
+        return
+    for s in t:
+        held = (time.time() - s.get("t0", time.time())) / 60
+        st = {"waiting_fill": "⏳ жду набора лимиток",
+              "in_position": "📈 в позиции, жду отскок"}.get(s.get("state"), s.get("state"))
+        bot.send_message(m.chat.id,
+            "🪜 " + s["sym"] + "  " + st + "\n"
+            "фандинг входа " + format(s.get("rate0", 0), "+.3f") + "%\n"
+            "средняя (план) " + fmt(s.get("avg_planned", 0)) + "\n"
+            "в работе " + format(held, ".0f") + " мин", reply_markup=menu())
+
+
+@bot.message_handler(func=lambda m: m.text == "📊 Статистика")
+def btn_stats(m):
+    bot.send_message(m.chat.id, "Считаю статистику...")
+    hist = history.get(m.chat.id, [])
+    lad = [h for h in hist if h.get("side") == "ladder"]
+    if not lad:
+        bot.send_message(m.chat.id, "Пока нет закрытых сделок.", reply_markup=menu())
+        return
+    total = sum(h["net"] for h in lad)
+    wins = [h for h in lad if h["net"] > 0]
+    losses = [h for h in lad if h["net"] < 0]
+    gross = sum(h.get("gross", 0) for h in lad)
+    fee = sum(h.get("fee", 0) for h in lad)
+    fund = sum(h.get("fund", 0) for h in lad)
+    wr = len(wins) / len(lad) * 100 if lad else 0
+    L = ["📊 ЛЕСЕНКА · с " + STATS_START + " МСК",
+         str(len(lad)) + " закрытых сделок", "",
+         "💵 Чистыми: " + money(total), "",
+         "🟢 В плюс: " + str(len(wins)) + "  (" + format(wr, ".0f") + "%)",
+         "🔴 В минус: " + str(len(losses)), "",
+         "📈 Тело: " + money(gross),
+         "💸 Комиссии: " + money(fee),
+         "💱 Фандинг: " + money(fund)]
+    bot.send_message(m.chat.id, "\n".join(L), reply_markup=menu())
+
+
+@bot.message_handler(func=lambda m: m.text == "🤖 Автоторговля")
+def btn_auto(m):
+    global auto_on
+    auto_on = not auto_on
+    bot.send_message(m.chat.id, "🤖 Автоторговля: " + ("ВКЛ ✅" if auto_on else "ВЫКЛ ⛔"),
+                     reply_markup=menu())
+
+
+@bot.message_handler(func=lambda m: m.text == "🗑 Очистить")
+def btn_clear(m):
+    tracked[m.chat.id] = []
+    history[m.chat.id] = []
+    save()
+    bot.send_message(m.chat.id, "Очищено.", reply_markup=menu())
+
+
+@bot.message_handler(func=lambda m: True)
+def catch_all(m):
+    users.add(m.chat.id); save()
+    bot.send_message(m.chat.id, "Меню ниже 👇", reply_markup=menu())
+
+
 # ---------- ГЛАВНЫЙ ЦИКЛ ----------
 
-def auto_loop():
-    last = 0
+def ladder_loop():
+    last_scan = 0
     while True:
         try:
-            changed = False
-            # СИНХРОНИЗАЦИЯ с биржей: если позиция закрылась сама (стоп/трейлинг),
-            # но бот думает что открыта — фиксируем закрытие и чистим opened_keys.
-            try:
-                live = binance_positions()
-                live_syms = {k for k, v in live.items() if abs(v.get("amt", 0)) > 0}
-                # чистим opened_keys от того, чего нет на бирже
-                for k in list(opened_keys):
-                    if k not in live_syms:
-                        opened_keys.discard(k)
-                # ловим осиротевшие tracked-позиции (закрыты биржей)
-                for chat_id, lst in list(tracked.items()):
-                    for s in list(lst):
-                        if s.get("kind") != "pair":
-                            continue
-                        # защита от гонки: свежую позицию (моложе 90с) не трогаем,
-                        # биржа могла ещё не показать её в binance_positions()
-                        age_s = time.time() - s.get("t0_s", time.time())
-                        if age_s < 90:
-                            continue
-                        if s.get("fa") and s["fa"] not in live_syms:
-                            # позиции нет на бирже — закрылась стопом/трейлингом
-                            try:
-                                record_pair_close(chat_id, s, "🎯", "закрыто на бирже (стоп/трейлинг)")
-                            except Exception as e:
-                                print("sync close:", str(e)[:60])
-                            lst.remove(s)
-                            changed = True
-            except Exception as e:
-                print("sync loop:", str(e)[:60])
-
+            # 1) ведём открытые лесенки
             for chat_id, lst in list(tracked.items()):
                 for s in list(lst):
-                    if s.get("kind") != "pair":
+                    if s.get("kind") != "ladder":
                         continue
                     try:
-                        rate = live_funding(s)
-                        s["rate_last"] = round(rate, 4) if rate is not None else None
-                        changed = True
-                        held_h = (time.time() - s.get("t0_s", time.time())) / 3600
+                        if manage_ladder(chat_id, s):
+                            lst.remove(s); save()
+                    except Exception as e:
+                        print("manage", s.get("sym"), ":", str(e)[:60])
 
-                        # Защита прибыли теперь на бирже: защитный стоп + трейлинг
-                        # выставлены при открытии, биржа ведёт их сама.
-                        # Бот следит только за фандингом и таймаутом.
-
-                        reason = None
-                        if rate is not None and abs(rate) < EXIT_FUNDING:
-                            reason = ("🎯", "фандинг упал до " + format(rate, "+.3f") + "%, фиксируем")
-                        elif held_h >= MAX_HOLD_H:
-                            reason = ("⏱", "вышло время " + format(held_h, ".0f") + "ч")
-                        if reason:
-                            closed_ok = close_pair(s, reason[1])
-                            # подстраховка: если обе ноги на бирже уже нулевые —
-                            # пара фактически закрыта, убираем из трекинга
-                            if not closed_ok:
+            # 2) ищем новые входы: монеты, у которых выплата через ~ENTER_BEFORE_S сек
+            if auto_on and has_keys() and time.time() - last_scan >= LAD_SCAN_SEC:
+                last_scan = time.time()
+                try:
+                    cands = find_ladder_candidates()
+                    busy = set()
+                    for chat_id, lst in tracked.items():
+                        for s in lst:
+                            if s.get("kind") == "ladder":
+                                busy.add(s["sym"])
+                    for c in cands:
+                        if c["sym"] in busy:
+                            continue
+                        secs_left = c["mins_left"] * 60
+                        # ставим лесенку, когда до выплаты осталось <= ENTER_BEFORE_S
+                        if 0 < secs_left <= ENTER_BEFORE_S:
+                            for uid in list(users):
                                 try:
-                                    pos = binance_positions()
-                                    gone = abs(pos.get(s["fa"], {}).get("amt", 0)) <= 0
-                                except Exception:
-                                    gone = False
-                                closed_ok = gone
-                            if closed_ok:
-                                record_pair_close(chat_id, s, reason[0], reason[1])
-                                lst.remove(s)
-                                changed = True
-                            else:
-                                bot.send_message(chat_id, "⚠️ " + s["main"]
-                                                 + ": не смог закрыть обе ноги, проверь биржу.")
-                    except Exception as e:
-                        print("pair loop:", str(e)[:80])
-                    time.sleep(0.4)
-            if changed:
-                save()
-            if time.time() - last > SCAN_EVERY:
-                last = time.time()
-                for uid in list(users):
-                    try:
-                        do_scan(uid, manual=False)
-                    except Exception as e:
-                        print("автоскан error:", e)
+                                    open_ladder(uid, c)
+                                except Exception as e:
+                                    print("open", c["sym"], ":", str(e)[:60])
+                except Exception as e:
+                    print("scan loop:", str(e)[:60])
         except Exception as e:
-            print("loop error:", e)
-        time.sleep(60)
+            print("loop error:", str(e)[:60])
+        time.sleep(3)
+
+
+def funnel_text():
+    if not funnel:
+        return ""
+    order = ["монет с фандингом", "монет в пуле", "жирный минус-фандинг", "готовы к лесенке"]
+    t = "\n📉 ВОРОНКА:"
+    for k in order:
+        if funnel.get(k):
+            t += "\n  " + k + ": " + str(funnel[k])
+    return t
 
 
 # ---------- ЗАПУСК ----------
@@ -1532,7 +1124,7 @@ if CHAT_ID:
         users.add(int(CHAT_ID)); save()
     except Exception:
         pass
-print("получателей:", len(users), "| CHAT_ID:", CHAT_ID or "НЕ ЗАДАН")
+print("получателей:", len(users), "| стратегия: ЛЕСЕНКА")
 
 if has_keys():
     sync_time()
@@ -1540,50 +1132,18 @@ if has_keys():
     try:
         pp = binance_positions()
         print("Binance OK, открытых ног:", len(pp))
-        # подхватываем осиротевшие после редеплоя позиции
-        for _uid in list(users):
-            try:
-                _n = adopt_positions(_uid)
-                if _n:
-                    print("подхвачено позиций с биржи:", _n, "для", _uid)
-            except Exception as _e:
-                print("adopt при старте:", _e)
     except Exception as e:
-        print("Binance ключи не работают:", e)
-    print("ФАНДИНГ-СОЛО | авто:", "ВКЛ" if auto_on else "выкл",
-          "| мин.оценка", AUTO_MIN_PTS, "| потолок ног", MAX_POS, "| плечо", LEVERAGE,
-          "| фандинг≥", MIN_FUNDING, "| выход<", EXIT_FUNDING, "| стоп", str(STOP_MIN)+"-"+str(STOP_MAX)+"%")
-else:
-    print("Binance ключи не заданы")
+        print("Binance ключи не работают:", str(e)[:60])
 
-_ok = None
-for _h in DATA_HOSTS:
-    try:
-        _p = "/api/v3/ticker/price?symbol=BTCUSDT"
-        if "fapi.binance.com" in _h:
-            _p = _p.replace("/api/v3/", "/fapi/v1/")
-        if requests.get(_h + _p, timeout=10).status_code == 200:
-            _ok = _h; _host_idx["i"] = DATA_HOSTS.index(_h); break
-    except Exception:
-        pass
-print("источник данных:", _ok or "НИ ОДИН!")
+print("параметры: триггер -" + str(LADDER_TRIGGER) + "% | лимиток "
+      + str(LADDER_LEGS) + " | тейк +" + str(TAKE_PCT) + "% | стоп -" + str(STOP_PCT) + "%")
 
-threading.Thread(target=auto_loop, daemon=True).start()
-print("Парный бот запущен. Автоторговля:", "ВКЛ" if auto_on else "ВЫКЛ")
+threading.Thread(target=ladder_loop, daemon=True).start()
 
-try:
-    bot.remove_webhook(); time.sleep(1)
-except Exception as e:
-    print("remove_webhook:", e)
-
+print("бот запущен")
 while True:
     try:
-        bot.infinity_polling(skip_pending=True, timeout=30, long_polling_timeout=30)
+        bot.polling(none_stop=True, timeout=30)
     except Exception as e:
-        msg = str(e)
-        if "409" in msg or "Conflict" in msg:
-            print("409: другой экземпляр ещё жив, жду 15с...")
-            time.sleep(15)
-        else:
-            print("polling error:", msg[:200])
-            time.sleep(5)
+        print("polling error:", str(e)[:60])
+        time.sleep(5)
