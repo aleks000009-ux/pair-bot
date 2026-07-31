@@ -712,7 +712,8 @@ TAKE_PCT       = float(os.environ.get("TAKE_PCT", "1.0"))         # отскок
 STOP_PCT       = float(os.environ.get("STOP_PCT", "3.0"))         # падение на % от средней -> стоп
 WAIT_FILL_MIN  = int(os.environ.get("WAIT_FILL_MIN", "10"))       # ждём набор лимиток, минут
 MAX_HOLD_MIN   = int(os.environ.get("MAX_HOLD_MIN", "120"))       # макс. удержание позиции, минут
-LAD_SCAN_SEC   = int(os.environ.get("LAD_SCAN_SEC", "30"))        # период проверки времени выплаты, сек
+LAD_SCAN_SEC   = int(os.environ.get("LAD_SCAN_SEC", "5"))         # период проверки времени выплаты, сек (частый!)
+ENTER_WINDOW_S = int(os.environ.get("ENTER_WINDOW_S", "40"))      # ширина окна входа, сек (чтобы не пролетать)
 
 
 def ladder_sizes():
@@ -877,11 +878,24 @@ def manage_ladder(chat_id, s):
             # часть лесенки набралась — переходим в позицию
             s["state"] = "in_position"
             s["bn_entry"] = entry
+            s["bn_qty"] = amt
             cancel_all(fs)     # снимаем неисполненные лимитки
+            # КРИТИЧНО: ставим биржевой стоп сразу, чтобы позиция не осталась
+            # голой при падении бота. Программный мониторинг — только вдобавок.
+            f = _filters.get(fs)
+            stop_ok = False
+            if f:
+                sl_price = step_round(entry * (1 - STOP_PCT / 100), f["tick"])
+                stop_ok = place_stop_verified(fs, "SELL", sl_price)
+                s["stop_on_exchange"] = stop_ok
             try:
-                bot.send_message(chat_id, "✅ " + s["sym"]
-                    + ": лесенка набрала лонг по средней " + fmt(entry)
-                    + "\nжду отскок +" + format(TAKE_PCT, ".1f") + "%")
+                msg = ("✅ " + s["sym"] + ": лесенка набрала лонг по " + fmt(entry)
+                       + "\nобъём " + fmt(amt) + " · жду отскок +" + format(TAKE_PCT, ".1f") + "%")
+                if stop_ok:
+                    msg += "\n🛡 биржевой стоп на " + fmt(sl_price) + " стоит"
+                else:
+                    msg += "\n⚠️ биржевой стоп НЕ встал — слежу программно, проверь риск"
+                bot.send_message(chat_id, msg)
             except Exception:
                 pass
             return False
@@ -899,25 +913,61 @@ def manage_ladder(chat_id, s):
 
     # in_position: ждём отскок или стоп
     if amt <= 0:
-        # позиции нет — закрылась (стоп/тейк исполнился) — фиксируем результат
-        record_ladder_close(chat_id, s, "закрыто")
+        # позиции нет — закрылась (биржевой стоп/тейк исполнился) — фиксируем
+        try:
+            cancel_all(fs)     # снимаем возможный висящий стоп
+        except Exception:
+            pass
+        record_ladder_close(chat_id, s, "закрыто (биржевой стоп/тейк)")
         return True
     entry = s.get("bn_entry", entry)
+    # №5: если объём вырос (доисполнилась лимитка до cancel_all) — обновляем
+    prev_qty = s.get("bn_qty", amt)
+    if amt > prev_qty * 1.01:
+        s["bn_entry"] = entry = pos.get(fs, {}).get("entry", entry)
+        s["bn_qty"] = amt
+        f = _filters.get(fs)
+        if f:
+            try:
+                cancel_all(fs)
+                sl = step_round(entry * (1 - STOP_PCT / 100), f["tick"])
+                place_stop_verified(fs, "SELL", sl)
+            except Exception:
+                pass
     price = get_price(fs)
     move = (price - entry) / entry * 100 if entry else 0
+
+    reason = None
     if move >= TAKE_PCT:
-        close_now(fs, "BUY", amt)      # продаём лонг на отскоке
-        record_ladder_close(chat_id, s, "🎯 отскок +" + format(move, ".1f") + "%")
-        return True
-    if move <= -STOP_PCT:
+        reason = "🎯 отскок +" + format(move, ".1f") + "%"
+    elif move <= -STOP_PCT:
+        reason = "🛑 стоп " + format(move, ".1f") + "%"
+    elif held_min >= MAX_HOLD_MIN:
+        reason = "⏱ таймаут " + format(move, ".1f") + "%"
+    if not reason:
+        return False
+
+    # закрываем позицию рыночным; при ошибке — НЕ удаляем из трекинга, повторим
+    try:
         close_now(fs, "BUY", amt)
-        record_ladder_close(chat_id, s, "🛑 стоп " + format(move, ".1f") + "%")
-        return True
-    if held_min >= MAX_HOLD_MIN:
-        close_now(fs, "BUY", amt)
-        record_ladder_close(chat_id, s, "⏱ таймаут " + format(move, ".1f") + "%")
-        return True
-    return False
+    except Exception as e:
+        msg = str(e)
+        if "-2022" in msg or "ReduceOnly" in msg or "-4046" in msg:
+            pass       # уже закрыта встречно — ок
+        else:
+            try:
+                bot.send_message(chat_id, "⚠️ " + s["sym"]
+                    + ": не смог закрыть позицию: " + msg[:70]
+                    + "\nПовторю через цикл. Если повторяется — закрой руками!")
+            except Exception:
+                pass
+            return False    # оставляем в трекинге, попробуем снова
+    try:
+        cancel_all(fs)     # снимаем биржевой стоп после закрытия
+    except Exception:
+        pass
+    record_ladder_close(chat_id, s, reason)
+    return True
 
 
 def record_ladder_close(chat_id, s, reason):
@@ -948,8 +998,6 @@ def record_ladder_close(chat_id, s, reason):
 
 
 # ---------- МЕНЮ ----------
-
-auto_on = os.environ.get("AUTO", "1") == "1"
 
 
 def menu():
@@ -1091,8 +1139,9 @@ def ladder_loop():
                         if c["sym"] in busy:
                             continue
                         secs_left = c["mins_left"] * 60
-                        # ставим лесенку, когда до выплаты осталось <= ENTER_BEFORE_S
-                        if 0 < secs_left <= ENTER_BEFORE_S:
+                        # окно входа: [ENTER_BEFORE_S .. ENTER_BEFORE_S+ENTER_WINDOW_S]
+                        # при поллинге раз в 5с и окне 40с точно не пролетим
+                        if ENTER_BEFORE_S <= secs_left <= ENTER_BEFORE_S + ENTER_WINDOW_S:
                             for uid in list(users):
                                 try:
                                     open_ladder(uid, c)
