@@ -713,16 +713,6 @@ def main_loop():
                             continue
                         state = breakout_state[symbol].copy()
                     
-                    # БАГ FIX: пересчитываем triangle СВЕЖИЙ (не используем старый!)
-                    fresh_klines = get_klines_4h(symbol, limit=LOOKBACK_CANDLES)
-                    fresh_triangle = detect_triangle(fresh_klines)
-                    
-                    if not fresh_triangle:
-                        # Треугольник развалился, забываем пробой
-                        with data_lock:
-                            breakout_state.pop(symbol, None)
-                        continue
-                    
                     retest_zone_pct = 0.5  # ретест ±0.5% от уровня пробоя
                     level = state['level']
                     lower = level * (1 - retest_zone_pct / 100)
@@ -737,8 +727,7 @@ def main_loop():
                             'symbol': symbol,
                             'side': side,
                             'entry_price': price,
-                            'level': level,  # уровень пробоя (из breakout)
-                            'triangle': fresh_triangle,
+                            'level': level,
                             'signal': 'breakout+retest'
                         }
                         if enter_position(signal):
