@@ -712,7 +712,18 @@ def main_loop():
                         if symbol not in breakout_state:
                             continue
                         state = breakout_state[symbol].copy()
-                    retest_zone_pct = 0.5  # ретест ±0.5% от уровня
+                    
+                    # БАГ FIX: пересчитываем triangle СВЕЖИЙ (не используем старый!)
+                    fresh_klines = get_klines_4h(symbol, limit=LOOKBACK_CANDLES)
+                    fresh_triangle = detect_triangle(fresh_klines)
+                    
+                    if not fresh_triangle:
+                        # Треугольник развалился, забываем пробой
+                        with data_lock:
+                            breakout_state.pop(symbol, None)
+                        continue
+                    
+                    retest_zone_pct = 0.5  # ретест ±0.5% от уровня пробоя
                     level = state['level']
                     lower = level * (1 - retest_zone_pct / 100)
                     upper = level * (1 + retest_zone_pct / 100)
@@ -722,18 +733,12 @@ def main_loop():
                         # РЕТЕСТ! Входим
                         side = "BUY" if state['direction'] == "UP" else "SELL"
                         
-                        # ИСПРАВКА 2: level = граница треугольника, не breakout
-                        if state['direction'] == "UP":
-                            entry_level = triangle['lower']  # входим от нижней границы
-                        else:
-                            entry_level = triangle['upper']  # входим от верхней границы
-                        
                         signal = {
                             'symbol': symbol,
                             'side': side,
                             'entry_price': price,
-                            'level': entry_level,  # ← правильный уровень!
-                            'triangle': triangle,
+                            'level': level,  # уровень пробоя (из breakout)
+                            'triangle': fresh_triangle,
                             'signal': 'breakout+retest'
                         }
                         if enter_position(signal):
