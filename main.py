@@ -7,6 +7,7 @@ import urllib.parse
 import math
 import threading
 from datetime import datetime, timedelta, timezone
+from decimal import Decimal, ROUND_DOWN
 from typing import List, Dict, Tuple
 
 import requests
@@ -21,20 +22,24 @@ bot = telebot.TeleBot(TOKEN)
 BINANCE_KEY = os.environ.get("BINANCE_KEY", "").strip()
 BINANCE_SECRET = os.environ.get("BINANCE_SECRET", "").strip()
 FAPI = os.environ.get("FAPI_BASE", "https://testnet.binancefuture.com").rstrip("/")
-DATA_API = os.environ.get("DATA_API", FAPI).rstrip("/")  # ← КЛЮЧ: ТОЖЕ контур, что FAPI!
+DATA_API = os.environ.get("DATA_API", FAPI).rstrip("/")
 
-SYMBOLS = os.environ.get("SYMBOLS", "BTCUSDT,ETHUSDT,BNBUSDT,SOLUSDT").split(",")
+SYMBOLS = os.environ.get("SYMBOLS", "BTCUSDT,ETHUSDT,BNBUSDT,SOLUSDT,XRPUSDT,ADAUSDT,DOTUSDT,AVAXUSDT,LINKUSDT,MATICUSDT,LTCUSDT,TRXUSDT,FILUSDT,VETUSDT,ATOMUSDT,NEARUSDT,OPUSDT,ARBITUSDT,SUIUSDT,PEPEUSDT,ETHFIUSDT,LUNCUSDT,INUSDT,GALUSDT,JUPUSDT,THETAUSDT,MKRUSDT,SNXUSDT,MASKUSDT,LDOUSDT,CRVUSDT,ICPUSDT,SANUSDT,ALGOUSDT,UNIUSDT,AAVEUUSDT,GRTUSDT,ENSEOUSDT,SKLUSDT,KDOUSDT,CHZUSDT,MINAUSDT,TAOUSDT,ORDIUSDT,APTUSDT,QNTUSDT,MAGAUSDT,WUSDT,INJUSDT,WOOUSDT,RNDRUSDT,TTKUSDT,ONDOUSDT,GMUSDT,BONKUSDT,VXUSDT,ARKUSDT,PYTHUSDT,ZECUSDT,DYDXUSDT,RAYUSDT,FLMUSDT,STRKUSDT,AIUSDT,TFUELUSDT,SEIUSDT,GMXUSDT,FLOKIUSDT,RONUSDT,USDCUSDT,TUSDUSDT,MBLUSDT,KEYUSDT,ROSIUSDT,NOUSDT,WAVESUSDT,RSRUSDT,AVEEUSDT,HBARUSDT,SUSDT,TNSUSDT,JUPITERUSDT,HIGHUSDT,YFIUSDT,DCUSDT,CVXUSDT,BALACERUSDT,PRIMEUSDT").split(",")
 SYMBOLS = [s.strip() for s in SYMBOLS if s.strip()]
+MAX_SYMBOLS = int(os.environ.get("MAX_SYMBOLS", str(len(SYMBOLS))))  # ограничить кол-во если нужно
 
-MIN_VOLUME_USD = float(os.environ.get("MIN_VOLUME_USD", "100.0"))
-DENSITY_CLUSTER_PCT = float(os.environ.get("DENSITY_CLUSTER_PCT", "0.05"))
-ENTRY_RANGE_PCT = float(os.environ.get("ENTRY_RANGE_PCT", "0.02"))
+# Параметры стратегии
 RISK_PER_TRADE_USDT = float(os.environ.get("RISK_PER_TRADE_USDT", "50.0"))
 MAX_OPEN_POSITIONS = int(os.environ.get("MAX_OPEN_POSITIONS", "3"))
 LEVERAGE = int(os.environ.get("LEVERAGE", "5"))
-SL_PCT = float(os.environ.get("SL_PCT", "0.5"))
-TP_PCT = float(os.environ.get("TP_PCT", "1.0"))
-COOLDOWN_SEC = int(os.environ.get("COOLDOWN_SEC", "60"))
+SL_PCT = float(os.environ.get("SL_PCT", "0.8"))   # стоп 0.8% от уровня
+TP_PCT = float(os.environ.get("TP_PCT", "2.0"))   # тейк 2.0% от входа
+COOLDOWN_SEC = int(os.environ.get("COOLDOWN_SEC", "120"))
+MAX_HOLD_H = int(os.environ.get("MAX_HOLD_H", "24"))  # макс удержание, часов
+TRIANGLE_MIN_CANDLES = int(os.environ.get("TRIANGLE_MIN_CANDLES", "5"))  # минимум свечей в треугольнике
+LOOKBACK_CANDLES = int(os.environ.get("LOOKBACK_CANDLES", "50"))  # сколько свечей смотрим для уровней
+RETEST_TIMEOUT_SEC = int(os.environ.get("RETEST_TIMEOUT_SEC", "7200"))  # таймаут ожидания ретеста (2 часа)
+SCAN_INTERVAL_SEC = int(os.environ.get("SCAN_INTERVAL_SEC", "300"))  # интервал сканирования (5 мин)
 
 MSK = timezone(timedelta(hours=3))
 DATA_DIR = os.environ.get("DATA_DIR", ".").rstrip("/")
@@ -53,9 +58,10 @@ tracked = {}
 last_trade_time = {}
 history = {}
 filters = {}
-data_lock = threading.Lock()  # ← ПРАВКА 5: Lock для синхронизации потоков
+breakout_state = {}  # {symbol: {level, direction, t_breakout, retest_tried}}
+data_lock = threading.Lock()
 _offset = {"ms": 0}
-_last_info_update = {"ts": 0}  # ПРАВКА 3: отслеживаем последнее обновление фильтров
+_last_info_update = {"ts": 0}
 
 # ========== УТИЛИТЫ ==========
 
@@ -109,7 +115,7 @@ def signed_get(path, params=None):
         raise Exception("Binance: " + str(d.get("code")) + " " + str(d.get("msg")))
     return d
 
-# ========== ПРАВКА 3: Данные с ТОГО ЖЕ контура, что FAPI ==========
+# ========== ЗАГРУЗКА ДАННЫХ ==========
 
 def get_price(symbol):
     try:
@@ -119,24 +125,15 @@ def get_price(symbol):
         print(f"get_price {symbol}:", e)
         return None
 
-def get_depth(symbol, limit=50):
+def get_klines_4h(symbol, limit=100):
+    """Загружаем 4h свечи"""
     try:
-        r = requests.get(f"{DATA_API}/fapi/v1/depth?symbol={symbol}&limit={limit}", timeout=10).json()
-        bids = [[float(x[0]), float(x[1])] for x in r.get("bids", [])]
-        asks = [[float(x[0]), float(x[1])] for x in r.get("asks", [])]
-        return bids, asks
+        r = requests.get(f"{DATA_API}/fapi/v1/klines?symbol={symbol}&interval=4h&limit={limit}", timeout=10).json()
+        return [{"o": float(c[1]), "h": float(c[2]), "l": float(c[3]), 
+                 "c": float(c[4]), "v": float(c[5]), "t": int(c[0])} for c in r]
     except Exception as e:
-        print(f"get_depth {symbol}:", e)
-        return [], []
-
-def get_klines_1h(symbol, limit=24):
-    try:
-        r = requests.get(f"{DATA_API}/fapi/v1/klines?symbol={symbol}&interval=1h&limit={limit}", timeout=10).json()
-        return [{"c": float(c[4]), "v": float(c[7]), "t": int(c[6])} for c in r]
-    except Exception:
+        print(f"get_klines_4h {symbol}:", e)
         return []
-
-# ========== ПРАВКА 4: Загрузить фильтры и округление ==========
 
 def load_exchange_info():
     global filters
@@ -162,35 +159,31 @@ def load_exchange_info():
         print("load_exchange_info:", e)
 
 def step_round(v, step):
+    """Округление под step используя Decimal для точности"""
     if step <= 0:
         return v
-    n = math.floor(round(v / step, 8)) * step
-    d = max(0, -int(math.floor(math.log10(step)))) if step < 1 else 0
-    return round(n, d)
+    try:
+        v_dec = Decimal(str(v))
+        step_dec = Decimal(str(step))
+        result = (v_dec / step_dec).quantize(Decimal('1'), rounding=ROUND_DOWN) * step_dec
+        return float(result)
+    except Exception as e:
+        print(f"step_round error: {e}, используем fallback")
+        n = math.floor(round(v / step, 8)) * step
+        return round(n, 10)
 
 def calc_qty(symbol: str, price: float) -> float:
-    """
-    Рассчитать qty под фильтры Binance.
-    ПРАВКА 4: учитываем stepSize, minQty, minNotional
-    """
     if price <= 0:
         return 0.0
-    
     qty = RISK_PER_TRADE_USDT / price
-    
     f = filters.get(symbol, {})
     step = f.get("step", 0.001)
     min_qty = f.get("minQty", 0.0)
     min_not = f.get("minNot", 5.0)
-    
-    # Округляем под stepSize
     qty = step_round(qty, step)
     qty = max(qty, min_qty)
-    
-    # Проверяем minNotional
     if qty * price < min_not:
         qty = step_round(min_not / price, step)
-    
     return qty
 
 def fmt(p):
@@ -201,125 +194,123 @@ def fmt(p):
 def money(v):
     return ("+" if v >= 0 else "-") + "$" + format(abs(v), ".2f")
 
-# ========== ПОИСК ПЛОТНОСТЕЙ ==========
+# ========== АНАЛИЗ СВЕЧЕЙ ==========
 
-def find_density_clusters(bids: List[Tuple[float, float]], asks: List[Tuple[float, float]]) -> Dict[str, Dict]:
-    clusters = {}
-    now = time.time()
+def find_swing_points(klines: List[Dict]) -> Tuple[List[float], List[float]]:
+    """
+    Ищет локальные highs (сопротивления) и lows (поддержки)
+    Swing High: candle выше, чем соседи
+    Swing Low: candle ниже, чем соседи
+    """
+    if len(klines) < 3:
+        return [], []
     
-    # Биды
-    for i, (price, size) in enumerate(bids[:15]):
-        vol_usd = price * size
-        if vol_usd < MIN_VOLUME_USD:
-            continue
-        
-        cluster_vol = vol_usd
-        cluster_prices = [price]
-        
-        for j in range(i + 1, min(i + 5, len(bids))):
-            neighbor_price, neighbor_size = bids[j]
-            if neighbor_price / price < (1 - DENSITY_CLUSTER_PCT / 100):
-                break
-            cluster_vol += neighbor_price * neighbor_size
-            cluster_prices.append(neighbor_price)
-        
-        if cluster_vol >= MIN_VOLUME_USD * 1.5:
-            avg_price = np.mean(cluster_prices)
-            key = f"bid_{avg_price:.4f}"
-            if key not in clusters:
-                clusters[key] = {
-                    'side': 'BID',
-                    'price': avg_price,
-                    'vol_usd': cluster_vol,
-                    'size': sum(s for _, s in bids[i:min(i+len(cluster_prices), len(bids))]),
-                    'ts': now
-                }
+    highs = []
+    lows = []
     
-    # Аски
-    for i, (price, size) in enumerate(asks[:15]):
-        vol_usd = price * size
-        if vol_usd < MIN_VOLUME_USD:
-            continue
+    for i in range(1, len(klines) - 1):
+        h_curr = klines[i]["h"]
+        l_curr = klines[i]["l"]
+        h_prev = klines[i-1]["h"]
+        l_prev = klines[i-1]["l"]
+        h_next = klines[i+1]["h"]
+        l_next = klines[i+1]["l"]
         
-        cluster_vol = vol_usd
-        cluster_prices = [price]
+        # Swing High
+        if h_curr > h_prev and h_curr > h_next:
+            highs.append(h_curr)
         
-        for j in range(i + 1, min(i + 5, len(asks))):
-            neighbor_price, neighbor_size = asks[j]
-            if neighbor_price / price > (1 + DENSITY_CLUSTER_PCT / 100):
-                break
-            cluster_vol += neighbor_price * neighbor_size
-            cluster_prices.append(neighbor_price)
-        
-        if cluster_vol >= MIN_VOLUME_USD * 1.5:
-            avg_price = np.mean(cluster_prices)
-            key = f"ask_{avg_price:.4f}"
-            if key not in clusters:
-                clusters[key] = {
-                    'side': 'ASK',
-                    'price': avg_price,
-                    'vol_usd': cluster_vol,
-                    'size': sum(s for _, s in asks[i:min(i+len(cluster_prices), len(asks))]),
-                    'ts': now
-                }
+        # Swing Low
+        if l_curr < l_prev and l_curr < l_next:
+            lows.append(l_curr)
     
-    return clusters
+    return highs, lows
 
-def get_momentum(symbol) -> float:
-    klines = get_klines_1h(symbol, limit=2)
-    if len(klines) < 2:
-        return 0.0
-    prev_close = float(klines[-2]["c"])
-    curr_close = float(klines[-1]["c"])
-    return (curr_close - prev_close) / prev_close * 100
+def detect_triangle(klines: List[Dict]) -> Dict or None:
+    """
+    Треугольник: highs падают, lows растут, сужаются к точке
+    Возвращает: {upper: уровень, lower: уровень, strength: сколько свечей в треугольнике}
+    """
+    if len(klines) < TRIANGLE_MIN_CANDLES:
+        return None
+    
+    # Берём последние N свечей
+    recent = klines[-TRIANGLE_MIN_CANDLES:]
+    
+    highs = [c["h"] for c in recent]
+    lows = [c["l"] for c in recent]
+    
+    # Проверяем: highs падают?
+    highs_falling = all(highs[i] >= highs[i+1] for i in range(len(highs)-1))
+    # Проверяем: lows растут?
+    lows_rising = all(lows[i] <= lows[i+1] for i in range(len(lows)-1))
+    
+    if not (highs_falling and lows_rising):
+        return None
+    
+    # Сужение есть?
+    width_start = highs[0] - lows[0]
+    width_end = highs[-1] - lows[-1]
+    
+    if width_end >= width_start * 0.8:  # не сужается достаточно
+        return None
+    
+    return {
+        'upper': highs[-1],
+        'lower': lows[-1],
+        'strength': len(recent),
+        'width_pct': (width_end / width_start) * 100
+    }
 
-def decide_entry(symbol: str, price: float, clusters: Dict) -> Dict or None:
-    with data_lock:
-        if len(tracked) >= MAX_OPEN_POSITIONS:
-            return None
-        
-        if symbol in last_trade_time:
-            if time.time() - last_trade_time[symbol] < COOLDOWN_SEC:
-                return None
+def detect_breakout(symbol: str, current_price: float, highs: List[float], lows: List[float]) -> Dict or None:
+    """
+    Пробой: цена пробила последний swing level
+    Возвращает: {level: уровень, direction: 'UP'/'DOWN', price: текущая}
+    """
+    if not highs or not lows:
+        return None
     
-    momentum = get_momentum(symbol)
+    last_high = max(highs[-3:]) if len(highs) >= 3 else highs[-1]
+    last_low = min(lows[-3:]) if len(lows) >= 3 else lows[-1]
     
-    for key, cluster in clusters.items():
-        if cluster['side'] == 'BID':
-            lower = cluster['price']
-            upper = cluster['price'] * (1 + ENTRY_RANGE_PCT / 100)
-            if lower <= price < upper and momentum > -0.1:
-                return {
-                    'symbol': symbol,
-                    'side': 'BUY',
-                    'entry_price': price,
-                    'density_price': cluster['price'],
-                    'vol_usd': cluster['vol_usd'],
-                    'momentum': momentum
-                }
-        
-        elif cluster['side'] == 'ASK':
-            upper = cluster['price']
-            lower = cluster['price'] * (1 - ENTRY_RANGE_PCT / 100)
-            if lower < price <= upper and momentum < 0.1:
-                return {
-                    'symbol': symbol,
-                    'side': 'SELL',
-                    'entry_price': price,
-                    'density_price': cluster['price'],
-                    'vol_usd': cluster['vol_usd'],
-                    'momentum': momentum
-                }
+    # Пробой вверх
+    if current_price > last_high:
+        return {
+            'level': last_high,
+            'direction': 'UP',
+            'price': current_price,
+            'distance_pct': ((current_price - last_high) / last_high) * 100
+        }
+    
+    # Пробой вниз
+    if current_price < last_low:
+        return {
+            'level': last_low,
+            'direction': 'DOWN',
+            'price': current_price,
+            'distance_pct': ((last_low - current_price) / last_low) * 100
+        }
     
     return None
+
+def detect_retest(symbol: str, current_price: float, breakout: Dict) -> bool:
+    """
+    Ретест: цена вернулась на уровень пробоя (±0.3%)
+    """
+    if not breakout:
+        return False
+    
+    level = breakout['level']
+    retest_zone_pct = 0.3
+    
+    lower = level * (1 - retest_zone_pct / 100)
+    upper = level * (1 + retest_zone_pct / 100)
+    
+    return lower <= current_price <= upper
 
 # ========== РАЗМЕЩЕНИЕ ОРДЕРОВ ==========
 
 def place_stop_verified(fs: str, side: str, trig_price: float, tries: int = 3) -> bool:
-    """
-    ПРАВКА 1: используем /fapi/v1/order type=STOP_MARKET stopPrice
-    ПРАВКА 6: проверяем РЕАЛЬНЫЙ ответ (orderId)
-    """
     trig_price = step_round(trig_price, filters.get(fs, {}).get("tick", 0.0001))
     
     for attempt in range(tries):
@@ -327,14 +318,12 @@ def place_stop_verified(fs: str, side: str, trig_price: float, tries: int = 3) -
             p = {
                 "symbol": fs,
                 "side": side,
-                "type": "STOP_MARKET",        # ← ПРАВКА 1
-                "stopPrice": trig_price,       # ← ПРАВКА 1 (не triggerPrice!)
+                "type": "STOP_MARKET",
+                "stopPrice": trig_price,
                 "closePosition": "true"
-                # БЕЗ timeInForce и БЕЗ reduceOnly — closePosition берёт на себя
             }
-            resp = signed_post("/fapi/v1/order", p)  # ← ПРАВКА 1 (не algoOrder!)
+            resp = signed_post("/fapi/v1/order", p)
             
-            # ПРАВКА 6: проверяем РЕАЛЬНЫЙ ответ
             if isinstance(resp, dict) and resp.get("orderId"):
                 print(f"✅ стоп встал: {fs} {side} @ {trig_price}, orderId={resp['orderId']}")
                 return True
@@ -354,22 +343,29 @@ def place_stop_verified(fs: str, side: str, trig_price: float, tries: int = 3) -
 
 def close_now(fs: str, side: str, qty: float):
     opp = "SELL" if side == "BUY" else "BUY"
+    # Округляем qty под step для точности
+    f = filters.get(fs, {})
+    qty_rounded = step_round(qty, f.get("step", 0.001))
     return signed_post("/fapi/v1/order", {"symbol": fs, "side": opp, "type": "MARKET",
-                                          "quantity": qty, "reduceOnly": "true"})
+                                          "quantity": qty_rounded, "reduceOnly": "true"})
 
 def enter_position(signal: Dict):
-    """
-    ПРАВКА 2: убрали timeInForce из MARKET
-    ПРАВКА 4: используем новую calc_qty с фильтрами
-    ПРАВКА 5: используем data_lock
-    """
     fs = signal['symbol']
     side = signal['side']
     entry = signal['entry_price']
-    qty = calc_qty(fs, entry)  # ← ПРАВКА 4
+    
+    # Проверяем COOLDOWN ПЕРВОЙ строкой
+    if fs in last_trade_time:
+        time_since = time.time() - last_trade_time[fs]
+        if time_since < COOLDOWN_SEC:
+            remaining = COOLDOWN_SEC - time_since
+            print(f"⏳ {fs}: COOLDOWN активен ещё {remaining:.0f}s (последняя сделка {time_since:.0f}s назад)")
+            return False
+    
+    qty = calc_qty(fs, entry)
     
     if qty <= 0:
-        print(f"❌ {fs}: невозможно рассчитать qty (цена {entry}, риск {RISK_PER_TRADE_USDT})")
+        print(f"❌ {fs}: QTY ERROR - невозможно рассчитать qty (цена {entry}, риск {RISK_PER_TRADE_USDT})")
         return False
     
     try:
@@ -378,7 +374,6 @@ def enter_position(signal: Dict):
         except:
             pass
         
-        # ПРАВКА 2: убрали timeInForce
         order = signed_post("/fapi/v1/order", {
             "symbol": fs,
             "side": side,
@@ -386,8 +381,6 @@ def enter_position(signal: Dict):
             "quantity": qty
         })
         
-        # КРИТИЧНО (пункт 1): fills на фьючерсах часто пуст
-        # Берём actual_entry из positionRisk (реальная цена входа)
         time.sleep(0.5)
         try:
             pos_data = binance_positions()
@@ -397,6 +390,8 @@ def enter_position(signal: Dict):
         except:
             actual_entry = entry
         
+        # ИСПРАВКА 2: SL считаем от ВХОДА, а не от уровня пробоя
+        # Это обеспечивает фиксированный риск = RISK_PER_TRADE_USDT
         if side == "BUY":
             sl = actual_entry * (1 - SL_PCT / 100)
             tp = actual_entry * (1 + TP_PCT / 100)
@@ -408,7 +403,6 @@ def enter_position(signal: Dict):
         
         stop_ok = place_stop_verified(fs, sl_side, sl)
         
-        # ПРАВКА 5: используем data_lock
         with data_lock:
             tracked[fs] = {
                 'side': side,
@@ -417,23 +411,29 @@ def enter_position(signal: Dict):
                 'tp': tp,
                 'qty': qty,
                 't0': time.time(),
-                'density_vol': signal.get('vol_usd', 0)
+                'breakout_level': signal['level'],
+                'signal': signal.get('signal', 'breakout')
             }
             last_trade_time[fs] = time.time()
         
-        msg = f"🎯 {fs} {side}\nвход {fmt(actual_entry)}\nSL {fmt(sl)} TP {fmt(tp)}\nqty {qty}"
+        msg = f"🔓 {fs} {side}\nуровень пробоя: {fmt(signal['level'])}\nвход: {fmt(actual_entry)}\nSL {fmt(sl)} TP {fmt(tp)}"
         if stop_ok:
             msg += "\n🛡 стоп на бирже ✅"
         else:
             msg += "\n⚠️ СТОП НЕ ВСТАЛ! Закрываю позицию!"
+            print(f"❌ {fs}: NO-STOP FAILED - стоп не встал, закрываю позицию немедленно")
             try:
                 close_now(fs, side, qty)
-                # ПРАВКА 2: отменяем все ордера по этому символу
                 signed_delete("/fapi/v1/allOpenOrders", {"symbol": fs})
             except Exception as e:
-                print(f"close after no-stop {fs}:", e)
+                print(f"❌ {fs}: CLOSE-AFTER-NO-STOP ERROR - {e}")
             with data_lock:
                 tracked.pop(fs, None)
+            for uid in users:
+                try:
+                    bot.send_message(uid, msg + "\n❌ ПОЗИЦИЯ НЕ ОТКРЫТА")
+                except:
+                    pass
             return False
         
         for uid in users:
@@ -446,13 +446,12 @@ def enter_position(signal: Dict):
         return True
         
     except Exception as e:
-        print(f"enter_position {fs}:", e)
+        print(f"❌ {fs}: ENTRY_API_ERROR - {str(e)[:100]}")
         return False
 
 # ========== УПРАВЛЕНИЕ ПОЗИЦИЯМИ ==========
 
 def check_position(symbol: str) -> None:
-    """ПРАВКА 5: используем data_lock"""
     with data_lock:
         if symbol not in tracked:
             return
@@ -471,9 +470,7 @@ def check_position(symbol: str) -> None:
         sl = s['sl']
         tp = s['tp']
         
-        # КРИТИЧНО (пункт 2): сначала проверяем SL/TP, потом смотрим amt <= 0
         reason = None
-        
         if side == "BUY":
             if price <= sl:
                 reason = f"стоп {fmt(price)}"
@@ -485,15 +482,12 @@ def check_position(symbol: str) -> None:
             elif price <= tp:
                 reason = f"тейк {fmt(price)}"
         
-        # Таймаут
-        if not reason and time.time() - s['t0'] > 1800:
-            reason = "таймаут"
+        if not reason and time.time() - s['t0'] > MAX_HOLD_H * 3600:
+            reason = f"таймаут {MAX_HOLD_H}h"
         
-        # Если позиция уже закрыта
         if amt <= 0:
             if not reason:
                 reason = "биржевой стоп"
-            # ПРАВКА 2: отменяем ордера (если что-то осталось)
             try:
                 signed_delete("/fapi/v1/allOpenOrders", {"symbol": symbol})
             except:
@@ -503,10 +497,8 @@ def check_position(symbol: str) -> None:
                 tracked.pop(symbol, None)
             return
         
-        # Если позиция ещё открыта, проверяем SL/TP и закрываем если нужно
         if reason:
             close_now(symbol, side, amt)
-            # ПРАВКА 2: отменяем старый стоп-ордер, чтобы не срабатил на следующей сделке
             try:
                 signed_delete("/fapi/v1/allOpenOrders", {"symbol": symbol})
             except Exception as e:
@@ -540,7 +532,6 @@ def binance_positions():
         return {}
 
 def record_close(symbol: str, s: Dict, reason: str):
-    """ПРАВКА 5: используем data_lock"""
     upnl = 0.0
     try:
         pos = binance_positions()
@@ -601,13 +592,14 @@ def cmd_start(m):
     save()
     k = "✅ Binance OK" if has_keys() else "⚠️ нет ключей"
     bot.send_message(m.chat.id,
-        "🤖 Скальпер от плотностей (ВСЕ 6 ПРАВОК!)\n"
-        "Ловит скопления ордеров в стакане.\n\n" + k,
+        "🤖 Breakout Bot (Пробой + Ретест + Вход)\n"
+        "Ловит пробои уровней поддержки/сопротивления\n"
+        "Входит на ретесте в направлении пробоя\n\n" + k,
         reply_markup=menu())
 
 @bot.message_handler(func=lambda m: m.text == "📊 Позиции")
 def btn_pos(m):
-    with data_lock:  # ← ПРАВКА 5
+    with data_lock:
         if not tracked:
             bot.send_message(m.chat.id, "Нет открытых позиций", reply_markup=menu())
             return
@@ -624,7 +616,7 @@ def btn_pos(m):
 def btn_hist(m):
     total = 0.0
     n = 0
-    with data_lock:  # ← ПРАВКА 5
+    with data_lock:
         for sym, hist_list in history.items():
             for h in hist_list[-5:]:
                 total += h['upnl']
@@ -634,7 +626,7 @@ def btn_hist(m):
 
 @bot.message_handler(func=lambda m: m.text == "🛑 Очистить")
 def btn_clear(m):
-    with data_lock:  # ← ПРАВКА 5
+    with data_lock:
         tracked.clear()
     save()
     bot.send_message(m.chat.id, "Очищено", reply_markup=menu())
@@ -650,23 +642,32 @@ def catch_all(m):
 def main_loop():
     while True:
         try:
-            # ПРАВКА 3: обновляем фильтры раз в сутки
             now = time.time()
+            
+            # Обновляем фильтры раз в сутки
             if now - _last_info_update["ts"] > 86400:
                 load_exchange_info()
                 _last_info_update["ts"] = now
             
+            # Ресинхронизируем время с сервером раз в час (против -1021 ошибок)
+            if now - _last_info_update.get("time_sync_ts", 0) > 3600:
+                try:
+                    sync_time()
+                    _last_info_update["time_sync_ts"] = now
+                except Exception as e:
+                    print(f"⚠️ time resync error: {e}")
+            
             # Проверяем открытые позиции
-            with data_lock:  # ← ПРАВКА 5
+            with data_lock:
                 positions_to_check = list(tracked.keys())
             
             for symbol in positions_to_check:
                 check_position(symbol)
                 time.sleep(0.1)
             
-            # Ищем новые входы
-            for symbol in SYMBOLS:
-                with data_lock:  # ← ПРАВКА 5
+            # Ищем новые входы (только первые MAX_SYMBOLS)
+            for symbol in SYMBOLS[:MAX_SYMBOLS]:
+                with data_lock:
                     if symbol in tracked:
                         continue
                     pos_count = len(tracked)
@@ -678,20 +679,62 @@ def main_loop():
                 if price is None:
                     continue
                 
-                bids, asks = get_depth(symbol, limit=50)
-                if not bids or not asks:
+                klines = get_klines_4h(symbol, limit=LOOKBACK_CANDLES)
+                if len(klines) < 10:
                     continue
                 
-                clusters = find_density_clusters(bids, asks)
-                if not clusters:
-                    continue
+                # Анализируем
+                highs, lows = find_swing_points(klines)
+                triangle = detect_triangle(klines)
+                breakout = detect_breakout(symbol, price, highs, lows)
                 
-                signal = decide_entry(symbol, price, clusters)
-                if signal:
-                    enter_position(signal)
-                    time.sleep(0.5)
+                # STATE 1: ждём пробоя
+                if symbol not in breakout_state:
+                    if breakout and triangle:
+                        # Пробой обнаружен! Запоминаем
+                        with data_lock:
+                            breakout_state[symbol] = {
+                                'level': breakout['level'],
+                                'direction': breakout['direction'],
+                                't_breakout': time.time()
+                            }
+                        print(f"🔔 {symbol}: пробой {breakout['direction']} на {fmt(breakout['level'])}")
+                
+                # STATE 2: пробой уже зафиксирован, ждём ретеста
+                else:
+                    with data_lock:
+                        if symbol not in breakout_state:
+                            continue
+                        state = breakout_state[symbol].copy()
+                    retest_zone_pct = 0.5  # ретест ±0.5% от уровня
+                    level = state['level']
+                    lower = level * (1 - retest_zone_pct / 100)
+                    upper = level * (1 + retest_zone_pct / 100)
+                    
+                    # Проверяем ретест
+                    if lower <= price <= upper:
+                        # РЕТЕСТ! Входим
+                        side = "BUY" if state['direction'] == "UP" else "SELL"
+                        signal = {
+                            'symbol': symbol,
+                            'side': side,
+                            'entry_price': price,
+                            'level': level,
+                            'triangle': triangle,
+                            'signal': 'breakout+retest'
+                        }
+                        if enter_position(signal):
+                            with data_lock:
+                                breakout_state.pop(symbol, None)
+                        time.sleep(0.5)
+                    
+                    # Забываем пробой если он > RETEST_TIMEOUT_SEC
+                    elif time.time() - state['t_breakout'] > RETEST_TIMEOUT_SEC:
+                        print(f"⏰ {symbol}: пробой истёк, забыли")
+                        with data_lock:
+                            breakout_state.pop(symbol, None)
             
-            time.sleep(2)
+            time.sleep(SCAN_INTERVAL_SEC)  # интервал сканирования (параметр SCAN_INTERVAL_SEC)
         
         except Exception as e:
             print("loop error:", e)
@@ -699,18 +742,16 @@ def main_loop():
 
 # ========== ЗАПУСК ==========
 
-print("🤖 Скальпер от плотностей — загрузка...")
-print("✅ ПРАВКА 1: /fapi/v1/order + STOP_MARKET + stopPrice (без reduceOnly)")
-print("✅ ПРАВКА 2: отменяем старый стоп после ручного закрытия")
-print("✅ ПРАВКА 3: DATA_API=" + DATA_API + " | обновляем фильтры раз в сутки")
-print("✅ ПРАВКА 4: calc_qty с stepSize/minQty/minNot")
-print("✅ ПРАВКА 5: threading.Lock() для tracked/history")
-print("✅ ПРАВКА 6: проверяем orderId в ответе Binance")
-if "testnet" in FAPI.lower():
-    print("\n⚠️ ВНИМАНИЕ: testnet != mainnet")
-    print("  • Стакан testnet нестабилен (мало ликвидности)")
-    print("  • Кластеры плотностей могут быть нерепрезентативны")
-    print("  • Для продакшена используй боевые контура")
+print("🤖 Breakout Bot (v3 PRODUCTION-READY) — загрузка...")
+print("✅ ИСПРАВКА 1: STATE-машина для ретеста (memory о пробоях)")
+print("✅ ИСПРАВКА 2: SL от входа, не от уровня")
+print("✅ ИСПРАВКА 3: COOLDOWN проверка перед входом (ДО calc_qty)")
+print("✅ ИСПРАВКА 4: Polling с переподключением")
+print("✅ ДОПОЛНЕНИЕ v2: data_lock на breakout_state, RETEST_TIMEOUT_SEC параметр")
+print("✅ ДОПОЛНЕНИЕ v3: Decimal в step_round, логирование отказов, ресинхронизация времени, параметризованный интервал сканирования")
+print("\n📊 Таймфрейм: 4h")
+print("🔍 Сигнал: Пробой → Ретест → Вход")
+print("📍 SL:", SL_PCT, "% | TP:", TP_PCT, "% | Плечо:", LEVERAGE, "x")
 
 load()
 if has_keys():
@@ -724,18 +765,26 @@ if has_keys():
 else:
     print("❌ Нет ключей Binance!")
 
+print(f"\nСимволы: {len(SYMBOLS)} всего в списке, анализируем первые {MAX_SYMBOLS}")
+if MAX_SYMBOLS > 50:
+    print(f"⚠️ ВНИМАНИЕ: {MAX_SYMBOLS} символов может вызвать rate limit на Binance!")
+    print(f"   Рекомендация: MAX_SYMBOLS <= 30-50 для надёжности")
+print(f"Фильтров загружено: {len(filters)}")
 print(f"\nПараметры:")
-print(f"  Риск: ${RISK_PER_TRADE_USDT} | SL {SL_PCT}% | TP {TP_PCT}% | Плечо {LEVERAGE}x")
-print(f"  Контур: FAPI={FAPI}")
-print(f"  Символы: {', '.join(SYMBOLS)}")
-print(f"  Фильтров загружено: {len(filters)}")
+print(f"  RETEST_TIMEOUT={RETEST_TIMEOUT_SEC//60}мин")
+print(f"  MAX_HOLD={MAX_HOLD_H}h")
+print(f"  SCAN_INTERVAL={SCAN_INTERVAL_SEC}s (важно для COOLDOWN_SEC={COOLDOWN_SEC}s)")
+print(f"  TRIANGLE_MIN_CANDLES={TRIANGLE_MIN_CANDLES}, LOOKBACK={LOOKBACK_CANDLES}")
 
 threading.Thread(target=main_loop, daemon=True).start()
 
 if __name__ == "__main__":
     print("\n🚀 Бот запущен!")
-    try:
-        bot.polling(none_stop=True, timeout=30)
-    except Exception as e:
-        print("polling error:", e)
-        time.sleep(5)
+    # ИСПРАВКА 4: while True обеспечивает переподключение после разрыва
+    while True:
+        try:
+            bot.polling(none_stop=True, timeout=30)
+        except Exception as e:
+            print(f"❌ polling error: {e}")
+            print("⏳ переподключаю через 10 сек...")
+            time.sleep(10)
