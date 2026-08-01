@@ -238,7 +238,7 @@ def find_swing_points(klines: List[Dict]) -> Tuple[List[float], List[float]]:
 def detect_triangle(klines: List[Dict]) -> Dict or None:
     """
     Треугольник: highs падают, lows растут, сужаются к точке
-    Возвращает: {upper: уровень, lower: уровень, strength: сколько свечей в треугольнике}
+    ВАРИАНТ A: смягченные критерии (для testnet)
     """
     if len(klines) < TRIANGLE_MIN_CANDLES:
         return None
@@ -249,19 +249,21 @@ def detect_triangle(klines: List[Dict]) -> Dict or None:
     highs = [c["h"] for c in recent]
     lows = [c["l"] for c in recent]
     
-    # Проверяем: highs падают?
-    highs_falling = all(highs[i] >= highs[i+1] for i in range(len(highs)-1))
-    # Проверяем: lows растут?
-    lows_rising = all(lows[i] <= lows[i+1] for i in range(len(lows)-1))
+    # ВАРИАНТ A: допускаем 1-2 нарушения монотонности (не идеальный тренд)
+    highs_violations = sum(1 for i in range(len(highs)-1) if highs[i] < highs[i+1])
+    lows_violations = sum(1 for i in range(len(lows)-1) if lows[i] > lows[i+1])
     
-    if not (highs_falling and lows_rising):
+    # Допускаем max 1 нарушение на TRIANGLE_MIN_CANDLES свечей
+    max_violations = max(1, TRIANGLE_MIN_CANDLES // 3)  # на 2 свечи - 0, на 5 - 1, на 6 - 2
+    
+    if highs_violations > max_violations or lows_violations > max_violations:
         return None
     
-    # Сужение есть?
+    # Сужение есть? (ВАРИАНТ A: мягче критерий с 0.8 на 0.9)
     width_start = highs[0] - lows[0]
     width_end = highs[-1] - lows[-1]
     
-    if width_end >= width_start * 0.8:  # не сужается достаточно
+    if width_end >= width_start * 0.9:  # ← было 0.8, теперь 0.9 (мягче)
         return None
     
     return {
@@ -749,18 +751,15 @@ def main_loop():
 
 # ========== ЗАПУСК ==========
 
-print("🤖 Breakout Bot (v4 CRITICAL FIXES) — загрузка...")
+print("🤖 Breakout Bot (v4.3 OPTIMIZED FOR TESTNET) — загрузка...")
 print("✅ ИСПРАВКА 1: STATE-машина для ретеста (memory о пробоях)")
 print("✅ ИСПРАВКА 2: SL от входа, не от уровня")
 print("✅ ИСПРАВКА 3: COOLDOWN проверка перед входом")
 print("✅ ИСПРАВКА 4: Polling с переподключением")
-print("✅ CRITICAL FIXES v4:")
-print("   • Удалены 10 несуществующих тикеров")
-print("   • Level входа привязан к треугольнику")
-print("   • MAX_OPEN_POSITIONS под lock (race condition)")
-print("   • Retry для actual_entry (3 попытки)")
-print("   • Обработка -2019/-1021 ошибок Binance")
-print("   • Улучшена place_stop_verified (5 попыток)")
+print("✅ CRITICAL FIXES v4: тикеры, retry, -2019/-1021, place_stop")
+print("✅ ОПТИМИЗАЦИЯ v4.3 (для testnet):")
+print("   • detect_triangle смягчен: допускаем 1-2 нарушения")
+print("   • width_end допуск 0.9 вместо 0.8 (больше треугольников)")
 print("\n📊 Таймфрейм: 4h")
 print("🔍 Сигнал: Пробой → Ретест → Вход")
 print("📍 SL:", SL_PCT, "% | TP:", TP_PCT, "% | Плечо:", LEVERAGE, "x")
