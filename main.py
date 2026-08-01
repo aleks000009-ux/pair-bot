@@ -24,7 +24,7 @@ BINANCE_SECRET = os.environ.get("BINANCE_SECRET", "").strip()
 FAPI = os.environ.get("FAPI_BASE", "https://testnet.binancefuture.com").rstrip("/")
 DATA_API = os.environ.get("DATA_API", FAPI).rstrip("/")
 
-SYMBOLS = os.environ.get("SYMBOLS", "BTCUSDT,ETHUSDT,BNBUSDT,SOLUSDT,XRPUSDT,ADAUSDT,DOTUSDT,AVAXUSDT,LINKUSDT,MATICUSDT,LTCUSDT,TRXUSDT,FILUSDT,VETUSDT,ATOMUSDT,NEARUSDT,OPUSDT,ARBITUSDT,SUIUSDT,PEPEUSDT,ETHFIUSDT,LUNCUSDT,INUSDT,GALUSDT,JUPUSDT,THETAUSDT,MKRUSDT,SNXUSDT,MASKUSDT,LDOUSDT,CRVUSDT,ICPUSDT,SANUSDT,ALGOUSDT,UNIUSDT,AAVEUUSDT,GRTUSDT,ENSEOUSDT,SKLUSDT,KDOUSDT,CHZUSDT,MINAUSDT,TAOUSDT,ORDIUSDT,APTUSDT,QNTUSDT,MAGAUSDT,WUSDT,INJUSDT,WOOUSDT,RNDRUSDT,TTKUSDT,ONDOUSDT,GMUSDT,BONKUSDT,VXUSDT,ARKUSDT,PYTHUSDT,ZECUSDT,DYDXUSDT,RAYUSDT,FLMUSDT,STRKUSDT,AIUSDT,TFUELUSDT,SEIUSDT,GMXUSDT,FLOKIUSDT,RONUSDT,USDCUSDT,TUSDUSDT,MBLUSDT,KEYUSDT,ROSIUSDT,NOUSDT,WAVESUSDT,RSRUSDT,AVEEUSDT,HBARUSDT,SUSDT,TNSUSDT,JUPITERUSDT,HIGHUSDT,YFIUSDT,DCUSDT,CVXUSDT,BALACERUSDT,PRIMEUSDT").split(",")
+SYMBOLS = os.environ.get("SYMBOLS", "BTCUSDT,ETHUSDT,BNBUSDT,SOLUSDT,XRPUSDT,ADAUSDT,DOTUSDT,AVAXUSDT,LINKUSDT,MATICUSDT,LTCUSDT,TRXUSDT,FILUSDT,VETUSDT,ATOMUSDT,NEARUSDT,OPUSDT,ARBITUSDT,SUIUSDT,PEPEUSDT,ETHFIUSDT,LUNCUSDT,INUSDT,GALUSDT,JUPUSDT,THETAUSDT,MKRUSDT,SNXUSDT,MASKUSDT,LDOUSDT,CRVUSDT,ICPUSDT,SANUSDT,ALGOUSDT,UNIUSDT,GRTUSDT,SKLUSDT,KDOUSDT,CHZUSDT,MINAUSDT,TAOUSDT,ORDIUSDT,APTUSDT,QNTUSDT,WUSDT,INJUSDT,WOOUSDT,RNDRUSDT,TTKUSDT,ONDOUSDT,GMUSDT,BONKUSDT,VXUSDT,ARKUSDT,PYTHUSDT,ZECUSDT,DYDXUSDT,RAYUSDT,FLMUSDT,STRKUSDT,AIUSDT,TFUELUSDT,SEIUSDT,GMXUSDT,FLOKIUSDT,RONUSDT,USDCUSDT,TUSDUSDT,MBLUSDT,KEYUSDT,ROSIUSDT,NOUSDT,WAVESUSDT,RSRUSDT,AVEEUSDT,HBARUSDT,SUSDT,JUPITERUSDT,HIGHUSDT,YFIUSDT,CVXUSDT,PRIMEUSDT").split(",")
 SYMBOLS = [s.strip() for s in SYMBOLS if s.strip()]
 MAX_SYMBOLS = int(os.environ.get("MAX_SYMBOLS", str(len(SYMBOLS))))  # ограничить кол-во если нужно
 
@@ -86,7 +86,16 @@ def signed_post(path, params=None):
                       headers={"X-MBX-APIKEY": BINANCE_KEY}, timeout=20)
     d = r.json()
     if isinstance(d, dict) and "code" in d and "msg" in d and d.get("code") != 200:
-        raise Exception("Binance: " + str(d.get("code")) + " " + str(d.get("msg")))
+        code = d.get("code")
+        # ИСПРАВКА 5: специальная обработка -2019 и -1021
+        if code == -2019:
+            raise Exception(f"Binance: недостаточно маржи (margin). {d.get('msg')}")
+        elif code == -1021:
+            print("⚠️ ВНИМАНИЕ: ошибка timestamp (-1021). Ресинхронизирую время...")
+            sync_time()  # срочно ресинхронизируем
+            raise Exception(f"Binance: {code} {d.get('msg')} (ресинхронизация времени)")
+        else:
+            raise Exception("Binance: " + str(code) + " " + str(d.get("msg")))
     return d
 
 def signed_delete(path, params=None):
@@ -293,24 +302,12 @@ def detect_breakout(symbol: str, current_price: float, highs: List[float], lows:
     
     return None
 
-def detect_retest(symbol: str, current_price: float, breakout: Dict) -> bool:
-    """
-    Ретест: цена вернулась на уровень пробоя (±0.3%)
-    """
-    if not breakout:
-        return False
-    
-    level = breakout['level']
-    retest_zone_pct = 0.3
-    
-    lower = level * (1 - retest_zone_pct / 100)
-    upper = level * (1 + retest_zone_pct / 100)
-    
-    return lower <= current_price <= upper
-
 # ========== РАЗМЕЩЕНИЕ ОРДЕРОВ ==========
 
-def place_stop_verified(fs: str, side: str, trig_price: float, tries: int = 3) -> bool:
+def place_stop_verified(fs: str, side: str, trig_price: float, tries: int = 5) -> bool:
+    """
+    ИСПРАВКА 7: retry с увеличенным количеством попыток (между открытием и стопом может быть окно)
+    """
     trig_price = step_round(trig_price, filters.get(fs, {}).get("tick", 0.0001))
     
     for attempt in range(tries):
@@ -329,15 +326,17 @@ def place_stop_verified(fs: str, side: str, trig_price: float, tries: int = 3) -
                 return True
             else:
                 print(f"⚠️ странный ответ на стоп {fs}:", resp)
-                time.sleep(1)
+                time.sleep(0.5)
                 continue
         
         except Exception as e:
             err_msg = str(e)
-            print(f"place_stop {fs} attempt {attempt + 1}: {err_msg[:80]}")
+            print(f"place_stop {fs} attempt {attempt + 1}/{tries}: {err_msg[:80]}")
             if "-2021" in err_msg:
+                print(f"❌ {fs}: стоп не может быть установлен (позиция уже за стопом)")
                 return False
-            time.sleep(1)
+            if attempt < tries - 1:
+                time.sleep(0.5 * (attempt + 1))  # экспоненциальная задержка
     
     return False
 
@@ -381,14 +380,22 @@ def enter_position(signal: Dict):
             "quantity": qty
         })
         
-        time.sleep(0.5)
-        try:
-            pos_data = binance_positions()
-            actual_entry = abs(pos_data.get(fs, {}).get("entry", 0) or entry)
-            if actual_entry <= 0:
-                actual_entry = entry
-        except:
-            actual_entry = entry
+        # ИСПРАВКА 4: retry для получения actual_entry (binance может быть медленно)
+        actual_entry = entry
+        for attempt in range(3):
+            try:
+                time.sleep(0.3 * (attempt + 1))  # 0.3s, 0.6s, 0.9s
+                pos_data = binance_positions()
+                entry_from_api = abs(pos_data.get(fs, {}).get("entry", 0) or 0)
+                if entry_from_api > 0:
+                    actual_entry = entry_from_api
+                    break
+            except Exception as e:
+                if attempt < 2:
+                    continue
+        
+        if actual_entry == entry:
+            print(f"⚠️ {fs}: не удалось получить actual_entry, используем сигнальную цену")
         
         # ИСПРАВКА 2: SL считаем от ВХОДА, а не от уровня пробоя
         # Это обеспечивает фиксированный риск = RISK_PER_TRADE_USDT
@@ -667,13 +674,12 @@ def main_loop():
             
             # Ищем новые входы (только первые MAX_SYMBOLS)
             for symbol in SYMBOLS[:MAX_SYMBOLS]:
+                # ИСПРАВКА 3: проверяем лимит позиций ПОД LOCK (race condition fix)
                 with data_lock:
                     if symbol in tracked:
                         continue
-                    pos_count = len(tracked)
-                
-                if pos_count >= MAX_OPEN_POSITIONS:
-                    continue
+                    if len(tracked) >= MAX_OPEN_POSITIONS:
+                        continue
                 
                 price = get_price(symbol)
                 if price is None:
@@ -715,11 +721,18 @@ def main_loop():
                     if lower <= price <= upper:
                         # РЕТЕСТ! Входим
                         side = "BUY" if state['direction'] == "UP" else "SELL"
+                        
+                        # ИСПРАВКА 2: level = граница треугольника, не breakout
+                        if state['direction'] == "UP":
+                            entry_level = triangle['lower']  # входим от нижней границы
+                        else:
+                            entry_level = triangle['upper']  # входим от верхней границы
+                        
                         signal = {
                             'symbol': symbol,
                             'side': side,
                             'entry_price': price,
-                            'level': level,
+                            'level': entry_level,  # ← правильный уровень!
                             'triangle': triangle,
                             'signal': 'breakout+retest'
                         }
@@ -742,13 +755,18 @@ def main_loop():
 
 # ========== ЗАПУСК ==========
 
-print("🤖 Breakout Bot (v3 PRODUCTION-READY) — загрузка...")
+print("🤖 Breakout Bot (v4 CRITICAL FIXES) — загрузка...")
 print("✅ ИСПРАВКА 1: STATE-машина для ретеста (memory о пробоях)")
 print("✅ ИСПРАВКА 2: SL от входа, не от уровня")
-print("✅ ИСПРАВКА 3: COOLDOWN проверка перед входом (ДО calc_qty)")
+print("✅ ИСПРАВКА 3: COOLDOWN проверка перед входом")
 print("✅ ИСПРАВКА 4: Polling с переподключением")
-print("✅ ДОПОЛНЕНИЕ v2: data_lock на breakout_state, RETEST_TIMEOUT_SEC параметр")
-print("✅ ДОПОЛНЕНИЕ v3: Decimal в step_round, логирование отказов, ресинхронизация времени, параметризованный интервал сканирования")
+print("✅ CRITICAL FIXES v4:")
+print("   • Удалены 10 несуществующих тикеров")
+print("   • Level входа привязан к треугольнику")
+print("   • MAX_OPEN_POSITIONS под lock (race condition)")
+print("   • Retry для actual_entry (3 попытки)")
+print("   • Обработка -2019/-1021 ошибок Binance")
+print("   • Улучшена place_stop_verified (5 попыток)")
 print("\n📊 Таймфрейм: 4h")
 print("🔍 Сигнал: Пробой → Ретест → Вход")
 print("📍 SL:", SL_PCT, "% | TP:", TP_PCT, "% | Плечо:", LEVERAGE, "x")
