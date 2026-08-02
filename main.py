@@ -410,8 +410,6 @@ def enter_position(signal: Dict):
             tp = actual_entry * (1 - TP_PCT / 100)
             sl_side = "BUY"
         
-        stop_ok = place_stop_verified(fs, sl_side, sl)
-        
         with data_lock:
             tracked[fs] = {
                 'side': side,
@@ -426,24 +424,7 @@ def enter_position(signal: Dict):
             last_trade_time[fs] = time.time()
         
         msg = f"🔓 {fs} {side}\nуровень пробоя: {fmt(signal['level'])}\nвход: {fmt(actual_entry)}\nSL {fmt(sl)} TP {fmt(tp)}"
-        if stop_ok:
-            msg += "\n🛡 стоп на бирже ✅"
-        else:
-            msg += "\n⚠️ СТОП НЕ ВСТАЛ! Закрываю позицию!"
-            print(f"❌ {fs}: NO-STOP FAILED - стоп не встал, закрываю позицию немедленно")
-            try:
-                close_now(fs, side, qty)
-                signed_delete("/fapi/v1/allOpenOrders", {"symbol": fs})
-            except Exception as e:
-                print(f"❌ {fs}: CLOSE-AFTER-NO-STOP ERROR - {e}")
-            with data_lock:
-                tracked.pop(fs, None)
-            for uid in users:
-                try:
-                    bot.send_message(uid, msg + "\n❌ ПОЗИЦИЯ НЕ ОТКРЫТА")
-                except:
-                    pass
-            return False
+        msg += "\n✅ Позиция открыта (SL/TP управляются ботом)"
         
         for uid in users:
             try:
@@ -751,15 +732,15 @@ def main_loop():
 
 # ========== ЗАПУСК ==========
 
-print("🤖 Breakout Bot (v4.3 OPTIMIZED FOR TESTNET) — загрузка...")
+print("🤖 Breakout Bot (v4.4 TESTNET CRITICAL FIX) — загрузка...")
 print("✅ ИСПРАВКА 1: STATE-машина для ретеста (memory о пробоях)")
 print("✅ ИСПРАВКА 2: SL от входа, не от уровня")
 print("✅ ИСПРАВКА 3: COOLDOWN проверка перед входом")
 print("✅ ИСПРАВКА 4: Polling с переподключением")
-print("✅ CRITICAL FIXES v4: тикеры, retry, -2019/-1021, place_stop")
-print("✅ ОПТИМИЗАЦИЯ v4.3 (для testnet):")
-print("   • detect_triangle смягчен: допускаем 1-2 нарушения")
-print("   • width_end допуск 0.9 вместо 0.8 (больше треугольников)")
+print("✅ CRITICAL FIXES v4: тикеры, retry, -2019/-1021")
+print("✅ ОПТИМИЗАЦИЯ v4.3: detect_triangle смягчен")
+print("✅ TESTNET FIX v4.4: УБРАН place_stop_verified (-4120 ошибка)")
+print("   SL/TP управляются полностью в check_position (работает везде)")
 print("\n📊 Таймфрейм: 4h")
 print("🔍 Сигнал: Пробой → Ретест → Вход")
 print("📍 SL:", SL_PCT, "% | TP:", TP_PCT, "% | Плечо:", LEVERAGE, "x")
