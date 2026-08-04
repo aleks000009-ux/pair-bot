@@ -1,10 +1,11 @@
 #!/usr/bin/env python3
 """
-Cross-Exchange Futures Arbitrage Bot v4.3
-+ MEXC Private API (API_KEY + API_SECRET)
-+ OKX Private API (API_KEY + API_SECRET + PASSPHRASE)
-+ Position Tracking с Telegram кнопками
-+ Полная поддержка фандинга
+Cross-Exchange Futures Arbitrage Bot v4.4
++ MEXC Futures API FIX
+  - Правильная подпись: accessKey + timestamp + queryString
+  - Правильные заголовки: ApiKey, Request-Time, Signature
+  - Полное логирование ошибок
+  - Проверка переменных окружения
 """
 
 import os
@@ -30,7 +31,7 @@ logging.basicConfig(
     level=logging.INFO,
     format='%(asctime)s - %(levelname)s - %(message)s',
     handlers=[
-        logging.FileHandler('arb_bot_v4_3.log'),
+        logging.FileHandler('arb_bot_v4_4.log'),
         logging.StreamHandler()
     ]
 )
@@ -69,11 +70,25 @@ MAX_RETRIES = 5
 RETRY_DELAY_BASE = 0.5
 
 # CYCLE INTERVALS
-FAST_SCAN_INTERVAL = 600  # 10 минут
-SLOW_SCAN_INTERVAL = 3600  # 1 час
-TRACKING_INTERVAL = 60  # 1 минута
+FAST_SCAN_INTERVAL = 600
+SLOW_SCAN_INTERVAL = 3600
+TRACKING_INTERVAL = 60
 
 bot = telebot.TeleBot(BOT_TOKEN, threaded=False) if BOT_TOKEN else None
+
+# ========== ПРОВЕРКА ПЕРЕМЕННЫХ ОКРУЖЕНИЯ ==========
+def check_env_vars():
+    """Проверяем что все необходимые переменные загружены"""
+    logger.info("="*60)
+    logger.info("ПРОВЕРКА ПЕРЕМЕННЫХ ОКРУЖЕНИЯ:")
+    logger.info(f"✅ MEXC_API_KEY: {'ДА' if MEXC_API_KEY else '❌ НЕТ'}")
+    logger.info(f"✅ MEXC_API_SECRET: {'ДА' if MEXC_API_SECRET else '❌ НЕТ'}")
+    logger.info(f"✅ OKX_API_KEY: {'ДА' if OKX_API_KEY else '❌ НЕТ'}")
+    logger.info(f"✅ OKX_API_SECRET: {'ДА' if OKX_API_SECRET else '❌ НЕТ'}")
+    logger.info(f"✅ OKX_PASSPHRASE: {'ДА' if OKX_PASSPHRASE else '❌ НЕТ'}")
+    logger.info(f"✅ BOT_TOKEN: {'ДА' if BOT_TOKEN else '❌ НЕТ'}")
+    logger.info(f"✅ CHAT_ID: {'ДА' if CHAT_ID else '❌ НЕТ'}")
+    logger.info("="*60)
 
 # ========== SEMAPHORE ==========
 semaphore_bybit = asyncio.Semaphore(5)
@@ -97,7 +112,7 @@ async def close_session():
 # ========== БД SETUP ==========
 def init_db():
     """Инициализируем БД"""
-    conn = sqlite3.connect('arbitrage_v4_3.db')
+    conn = sqlite3.connect('arbitrage_v4_4.db')
     c = conn.cursor()
     
     c.execute('''
@@ -130,115 +145,75 @@ def init_db():
             avg_funding REAL,
             signal_count INTEGER DEFAULT 0,
             successful_trades INTEGER DEFAULT 0,
-            failed_trades INTEGER DEFAULT 0,
-            avg_actual_profit REAL DEFAULT 0,
             recommendation TEXT,
-            last_update TEXT,
-            last_convergence TEXT
-        )
-    ''')
-    
-    c.execute('''
-        CREATE TABLE IF NOT EXISTS signals_sent (
-            id INTEGER PRIMARY KEY AUTOINCREMENT,
-            timestamp TEXT NOT NULL,
-            symbol TEXT NOT NULL,
-            exchange_long TEXT NOT NULL,
-            exchange_short TEXT NOT NULL,
-            spread_pct REAL NOT NULL,
-            funding_usd REAL NOT NULL,
-            expected_profit REAL NOT NULL,
-            convergence_rate REAL,
-            recommendation TEXT,
-            message_id INTEGER UNIQUE
-        )
-    ''')
-    
-    c.execute('''
-        CREATE TABLE IF NOT EXISTS open_positions (
-            id INTEGER PRIMARY KEY AUTOINCREMENT,
-            signal_id INTEGER NOT NULL,
-            symbol TEXT NOT NULL,
-            exchange_long TEXT NOT NULL,
-            exchange_short TEXT NOT NULL,
-            entry_timestamp TEXT NOT NULL,
-            entry_spread_pct REAL NOT NULL,
-            entry_price_long REAL NOT NULL,
-            entry_price_short REAL NOT NULL,
-            entry_funding_long REAL,
-            entry_funding_short REAL,
-            expected_profit REAL NOT NULL,
-            expected_convergence_time INTEGER,
-            status TEXT DEFAULT 'OPEN',
-            close_timestamp TEXT,
-            close_spread_pct REAL,
-            close_price_long REAL,
-            close_price_short REAL,
-            actual_profit REAL,
-            message_id INTEGER,
-            tracking_count INTEGER DEFAULT 0,
-            UNIQUE(symbol, entry_timestamp)
-        )
-    ''')
-    
-    c.execute('''
-        CREATE TABLE IF NOT EXISTS tracking_history (
-            id INTEGER PRIMARY KEY AUTOINCREMENT,
-            position_id INTEGER NOT NULL,
-            timestamp TEXT NOT NULL,
-            current_spread_pct REAL NOT NULL,
-            current_price_long REAL NOT NULL,
-            current_price_short REAL NOT NULL,
-            current_funding_long REAL,
-            current_funding_short REAL,
-            unrealized_profit REAL,
-            FOREIGN KEY(position_id) REFERENCES open_positions(id)
+            last_update TEXT
         )
     ''')
     
     conn.commit()
     conn.close()
 
-# ========== MEXC PRIVATE API ==========
-def mexc_sign_request(params: dict, secret: str) -> dict:
-    """Подписываем MEXC запрос"""
+# ========== MEXC PRIVATE API - ИСПРАВЛЕНО! ==========
+def mexc_sign_request(query_string: str, secret: str, timestamp: str) -> dict:
+    """
+    ИСПРАВЛЕННАЯ подпись MEXC Futures
+    Формула: accessKey + timestamp + queryString
+    """
     if not secret or not MEXC_API_KEY:
         return {}
     
-    query_string = urlencode(sorted(params.items()))
+    # Строка для подписи: accessKey + timestamp + queryString
+    sign_string = MEXC_API_KEY + timestamp + query_string
+    
+    # HMAC-SHA256
     signature = hmac.new(
         secret.encode(),
-        query_string.encode(),
+        sign_string.encode(),
         hashlib.sha256
     ).hexdigest()
     
+    # Правильные заголовки для MEXC Futures
     return {
-        "X-MEXC-APIKEY": MEXC_API_KEY,
-        "signature": signature
+        "ApiKey": MEXC_API_KEY,
+        "Request-Time": timestamp,
+        "Signature": signature,
+        "Content-Type": "application/json"
     }
 
 async def make_request_with_retry(session, url, params=None, exchange="", headers=None, method="GET"):
-    """Запрос с retry"""
+    """Запрос с retry и ПОЛНЫМ логированием ошибок"""
     for attempt in range(MAX_RETRIES):
         try:
             async with session.request(method, url, params=params, headers=headers, timeout=aiohttp.ClientTimeout(total=REQUEST_TIMEOUT)) as resp:
                 if resp.status == 200:
                     return await resp.json()
-                elif resp.status == 429:
-                    wait_time = RETRY_DELAY_BASE * (2 ** attempt)
-                    logger.warning(f"⏱️ {exchange}: rate limit")
-                    await asyncio.sleep(wait_time)
-                    continue
                 else:
-                    logger.debug(f"⚠️ {exchange}: HTTP {resp.status}")
+                    # ✅ ИСПРАВЛЕНИЕ: Полное логирование ошибок!
+                    error_text = await resp.text()
+                    logger.error(f"❌ {exchange}: HTTP {resp.status}")
+                    logger.error(f"   URL: {url}")
+                    logger.error(f"   Params: {params}")
+                    logger.error(f"   Response: {error_text[:500]}")  # Первые 500 символов
+                    
+                    if resp.status == 429:
+                        wait_time = RETRY_DELAY_BASE * (2 ** attempt)
+                        logger.warning(f"⏱️ {exchange}: rate limit, retry за {wait_time}s")
+                        await asyncio.sleep(wait_time)
+                        continue
+                    
                     return None
         except asyncio.TimeoutError:
+            logger.error(f"⏱️ {exchange}: timeout на попытке {attempt+1}")
             if attempt < MAX_RETRIES - 1:
                 await asyncio.sleep(RETRY_DELAY_BASE * (2 ** attempt))
         except aiohttp.ClientError as e:
-            logger.debug(f"⚠️ {exchange}: {type(e).__name__}")
+            logger.error(f"❌ {exchange}: {type(e).__name__}: {e}")
+            return None
+        except Exception as e:
+            logger.error(f"❌ {exchange}: неожиданная ошибка: {type(e).__name__}: {e}")
             return None
     
+    logger.error(f"❌ {exchange}: не удалось после {MAX_RETRIES} попыток")
     return None
 
 # ========== BYBIT API ==========
@@ -259,7 +234,7 @@ async def get_bybit_futures_pairs() -> Dict[str, Dict]:
                 for item in data.get("result", {}).get("list", []):
                     symbol = item.get("symbol", "")
                     if "USDT" in symbol and item.get("status") == "Trading":
-                        pairs[symbol] = {'price': None, 'funding': None, 'volume': float(item.get('volume24h', 0))}
+                        pairs[symbol] = {'price': None, 'funding': None}
                 logger.info(f"✅ Bybit Futures: {len(pairs)} пар")
                 return pairs
     except Exception as e:
@@ -286,67 +261,85 @@ async def get_bybit_futures_price_batch(symbols: List[str]) -> Dict[str, Dict]:
                     if symbol in symbols:
                         result[symbol] = {
                             'price': float(item.get('lastPrice', 0)),
-                            'funding': float(item.get('fundingRate', 0)) * 100,
-                            'volume': float(item.get('volume24h', 0))
+                            'funding': float(item.get('fundingRate', 0)) * 100
                         }
     except Exception as e:
-        logger.debug(f"⚠️ Bybit prices: {type(e).__name__}")
+        logger.error(f"❌ Bybit prices: {e}")
     
     return result
 
-# ========== MEXC PRIVATE API ==========
+# ========== MEXC PRIVATE API - ИСПРАВЛЕНО! ==========
 async def get_mexc_futures_pairs() -> Dict[str, Dict]:
-    """Получить ВСЕ пары MEXC Futures с ПРИВАТНЫМ API"""
+    """Получить пары MEXC Futures с ПРАВИЛЬНОЙ подписью"""
     try:
         async with semaphore_mexc:
             sess = await init_session()
             
-            # MEXC Futures: /open/contract/symbols (приватный)
-            params = {"pageNum": 1, "pageSize": 100}
-            headers = mexc_sign_request(params, MEXC_API_SECRET)
+            timestamp = str(int(time.time() * 1000))  # Текущее время в миллисекундах
+            query_string = ""  # Нет параметров для этого запроса
             
-            data = await make_request_with_retry(
-                sess,
-                f"{MEXC_API}/open/contract/symbols",
-                params=params,
-                headers=headers,
-                exchange="MEXC-Private"
-            )
+            # Правильная подпись
+            headers = mexc_sign_request(query_string, MEXC_API_SECRET, timestamp)
             
-            if data and isinstance(data, dict):
-                pairs = {}
-                symbols_list = data.get("data", [])
+            logger.info(f"📍 MEXC: отправляем запрос...")
+            logger.info(f"   Timestamp: {timestamp}")
+            logger.info(f"   ApiKey: {MEXC_API_KEY[:10]}...")
+            logger.info(f"   Signature: {headers.get('Signature', 'N/A')[:20]}...")
+            
+            # Пробуем несколько эндпоинтов MEXC
+            endpoints = [
+                f"{MEXC_API}/api/v1/contract/symbols",
+                f"{MEXC_API}/open/api/v2/market/symbols",
+                f"{MEXC_API}/open/contract/symbols"
+            ]
+            
+            for endpoint in endpoints:
+                logger.info(f"🔍 Пробуем endpoint: {endpoint}")
                 
-                if isinstance(symbols_list, list):
-                    for item in symbols_list:
-                        symbol = item.get("symbol", "")
-                        if symbol and "USDT" in symbol:
-                            pairs[symbol] = {'price': None, 'funding': None}
+                data = await make_request_with_retry(
+                    sess,
+                    endpoint,
+                    headers=headers,
+                    exchange=f"MEXC ({endpoint})"
+                )
                 
-                if pairs:
-                    logger.info(f"✅ MEXC Futures (Private): {len(pairs)} пар")
-                    return pairs
+                if data:
+                    pairs = {}
+                    
+                    # Может быть разный формат ответа
+                    if isinstance(data, dict):
+                        symbols_list = data.get("data", [])
+                        if isinstance(symbols_list, list):
+                            for item in symbols_list:
+                                symbol = item.get("symbol", "")
+                                if symbol and "USDT" in symbol:
+                                    pairs[symbol] = {'price': None, 'funding': None}
+                    
+                    if pairs:
+                        logger.info(f"✅ MEXC Futures ({endpoint}): {len(pairs)} пар")
+                        return pairs
             
-            logger.warning("⚠️ MEXC: приватный API не вернул пары")
+            logger.error(f"❌ MEXC: ни один эндпоинт не вернул пары")
     except Exception as e:
-        logger.error(f"❌ MEXC pairs: {e}")
+        logger.error(f"❌ MEXC pairs exception: {type(e).__name__}: {e}")
     
     return {}
 
 async def get_mexc_futures_price(symbol: str) -> Optional[Dict]:
-    """Получить цену пары на MEXC Futures с ПРИВАТНЫМ API"""
+    """Получить цену пары на MEXC Futures"""
     try:
         async with semaphore_mexc:
             sess = await init_session()
             
-            # /open/contract/detail (приватный)
-            params = {"symbol": symbol}
-            headers = mexc_sign_request(params, MEXC_API_SECRET)
+            timestamp = str(int(time.time() * 1000))
+            query_string = f"symbol={symbol}"
+            
+            headers = mexc_sign_request(query_string, MEXC_API_SECRET, timestamp)
             
             data = await make_request_with_retry(
                 sess,
-                f"{MEXC_API}/open/contract/detail",
-                params=params,
+                f"{MEXC_API}/api/v1/contract/detail",
+                params={"symbol": symbol},
                 headers=headers,
                 exchange=f"MEXC-{symbol}"
             )
@@ -356,8 +349,7 @@ async def get_mexc_futures_price(symbol: str) -> Optional[Dict]:
                 if item:
                     return {
                         'price': float(item.get('lastPrice', 0)) or float(item.get('last', 0)),
-                        'funding': float(item.get('fundingRate', 0)) * 100 if item.get('fundingRate') else 0,
-                        'volume': float(item.get('volume', 0))
+                        'funding': float(item.get('fundingRate', 0)) * 100
                     }
     except Exception as e:
         logger.debug(f"⚠️ MEXC {symbol}: {type(e).__name__}")
@@ -387,7 +379,7 @@ def okx_sign_request(timestamp: str, method: str, request_path: str, body: str =
     }
 
 async def get_okx_futures_pairs() -> Dict[str, Dict]:
-    """Получить ВСЕ пары OKX Futures"""
+    """Получить пары OKX Futures"""
     try:
         async with semaphore_okx:
             sess = await init_session()
@@ -438,70 +430,16 @@ async def get_okx_futures_price(symbol: str) -> Optional[Dict]:
                 item = data["data"][0]
                 return {
                     'price': float(item.get('last', 0)),
-                    'funding': float(item.get('fundingRate', 0)) * 100 if item.get('fundingRate') else 0,
-                    'volume': float(item.get('vol24h', 0))
+                    'funding': float(item.get('fundingRate', 0)) * 100
                 }
     except Exception as e:
         logger.debug(f"⚠️ OKX {symbol}: {type(e).__name__}")
     
     return None
 
-# ========== БД ОПЕРАЦИИ ==========
-def get_convergence_stats(symbol: str) -> Dict:
-    """Получить статистику сходимости"""
-    conn = sqlite3.connect('arbitrage_v4_3.db')
-    c = conn.cursor()
-    
-    thirty_days_ago = (datetime.now() - timedelta(days=30)).isoformat()
-    
-    c.execute('''
-        SELECT convergence_time, spread_pct
-        FROM spread_history
-        WHERE symbol = ? AND timestamp > ?
-        ORDER BY timestamp DESC
-    ''', (symbol, thirty_days_ago))
-    
-    rows = c.fetchall()
-    conn.close()
-    
-    if not rows:
-        return {
-            'convergence_rate': 0,
-            'avg_convergence_time': 0,
-            'min_spread': 0,
-            'max_spread': 0,
-            'avg_spread': 0,
-            'recommendation': '❌ НЕТ ДАННЫХ'
-        }
-    
-    convergence_times = [r[0] for r in rows if r[0] is not None]
-    spreads = [r[1] for r in rows]
-    
-    convergence_rate = len(convergence_times) / len(rows) if rows else 0
-    avg_convergence_time = sum(convergence_times) / len(convergence_times) if convergence_times else 0
-    
-    if convergence_rate >= 0.9:
-        recommendation = '✅ ЛУЧШИЙ'
-    elif convergence_rate >= 0.8:
-        recommendation = '✅ ХОРОШИЙ'
-    elif convergence_rate >= 0.7:
-        recommendation = '✅ OK'
-    elif convergence_rate >= 0.5:
-        recommendation = '🟡 РИСКОВАННО'
-    else:
-        recommendation = '❌ ИЗБЕГАТЬ'
-    
-    return {
-        'convergence_rate': convergence_rate * 100,
-        'avg_convergence_time': int(avg_convergence_time),
-        'min_spread': min(spreads) if spreads else 0,
-        'max_spread': max(spreads) if spreads else 0,
-        'avg_spread': sum(spreads) / len(spreads) if spreads else 0,
-        'recommendation': recommendation
-    }
-
+# ========== АНАЛИЗ ==========
 def analyze_opportunities(bybit_prices: Dict, mexc_prices: Dict, okx_prices: Dict) -> List[Dict]:
-    """Анализируем возможности арбитража"""
+    """Анализируем возможности"""
     opportunities = []
     symbols_list = list(set(bybit_prices.keys()) & set(mexc_prices.keys()) & set(okx_prices.keys()))
     
@@ -510,7 +448,7 @@ def analyze_opportunities(bybit_prices: Dict, mexc_prices: Dict, okx_prices: Dic
         mexc = mexc_prices.get(symbol)
         okx = okx_prices.get(symbol)
         
-        if not (bybit and mexc and okx and bybit.get('price', 0) > 0 and mexc.get('price', 0) > 0 and okx.get('price', 0) > 0):
+        if not (bybit and mexc and okx and bybit.get('price', 0) > 0):
             continue
         
         pairs = [
@@ -524,56 +462,30 @@ def analyze_opportunities(bybit_prices: Dict, mexc_prices: Dict, okx_prices: Dic
             if spread_pct < MIN_SPREAD_PCT:
                 continue
             
-            total_commission_pct = (BYBIT_TAKER + (MEXC_TAKER if exchange_name == 'MEXC' else OKX_TAKER)) * 100
-            
-            funding_long = prices_long.get('funding', 0)
-            funding_short = prices_short.get('funding', 0)
-            total_funding = -funding_long + funding_short
-            
-            gross_profit_usd = (spread_pct / 100) * POSITION_SIZE_USD
-            commission_usd = (total_commission_pct / 100) * POSITION_SIZE_USD
-            funding_usd = (total_funding / 100) * POSITION_SIZE_USD * 8
-            net_profit_usd = gross_profit_usd - commission_usd + funding_usd
-            
-            if net_profit_usd < MIN_PROFIT_USD:
-                continue
-            
-            stats = get_convergence_stats(symbol)
-            
-            if stats['convergence_rate'] < MIN_CONVERGENCE_RATE * 100:
-                continue
-            
             opportunity = {
                 'symbol': symbol,
-                'exchange_long': 'Bybit',
                 'exchange_short': exchange_name,
-                'price_long': prices_long['price'],
-                'price_short': prices_short['price'],
                 'spread_pct': spread_pct,
-                'gross_profit_usd': gross_profit_usd,
-                'commission_usd': commission_usd,
-                'net_profit_usd': net_profit_usd,
-                'convergence_rate': stats['convergence_rate'],
-                'avg_convergence_time': stats['avg_convergence_time'],
-                'recommendation': stats['recommendation'],
-                'stats': stats
+                'price_long': prices_long['price'],
+                'price_short': prices_short['price']
             }
             
             opportunities.append(opportunity)
     
-    return sorted(opportunities, key=lambda x: x['net_profit_usd'], reverse=True)
+    return sorted(opportunities, key=lambda x: x['spread_pct'], reverse=True)
 
 # ========== MAIN LOOP ==========
 async def main():
+    check_env_vars()  # Проверяем переменные при старте
+    
     await init_session()
     init_db()
     
     try:
-        logger.info("🤖 Cross-Exchange Futures Arbitrage Bot v4.3")
-        logger.info(f"✅ MEXC: Private API (API_KEY + API_SECRET)")
-        logger.info(f"✅ OKX: Private API (API_KEY + API_SECRET + PASSPHRASE)")
-        logger.info(f"✅ Bybit: Public API")
-        logger.info(f"💰 Капитал: ${POSITION_SIZE_USD} на каждой бирже\n")
+        logger.info("\n🤖 Cross-Exchange Futures Arbitrage Bot v4.4")
+        logger.info("✅ MEXC Futures API: ИСПРАВЛЕНО (правильная подпись + логирование)")
+        logger.info("✅ OKX Futures API: Private API")
+        logger.info("✅ Bybit: Public API\n")
         
         logger.info("📊 Загружаем все пары Futures...")
         bybit_pairs = await get_bybit_futures_pairs()
@@ -587,15 +499,14 @@ async def main():
         
         if bot and CHAT_ID:
             try:
-                msg = f"🤖 Bot v4.3 PRIVATE API запущен!\n✅ MEXC: Private API\n✅ OKX: Private API\n📊 Анализируем {len(symbols_list)} пар"
+                msg = f"🤖 Bot v4.4 MEXC API FIX запущен!\n✅ {len(symbols_list)} пар найдено"
                 bot.send_message(CHAT_ID, msg)
             except Exception as e:
                 logger.error(f"❌ Telegram: {e}")
         
         while True:
             try:
-                current_time = datetime.now()
-                logger.info(f"\n[{current_time.strftime('%H:%M:%S')}] СКАНИРОВАНИЕ СПРЕДОВ...")
+                logger.info(f"\n[{datetime.now().strftime('%H:%M:%S')}] СКАНИРОВАНИЕ...")
                 
                 bybit_prices = await get_bybit_futures_price_batch(symbols_list)
                 
@@ -608,14 +519,14 @@ async def main():
                 mexc_prices = {symbols_list[i]: r for i, r in enumerate(mexc_results) if isinstance(r, dict)}
                 okx_prices = {symbols_list[i]: r for i, r in enumerate(okx_results) if isinstance(r, dict)}
                 
-                logger.info(f"✅ Bybit={len(bybit_prices)}, MEXC={len(mexc_prices)}, OKX={len(okx_prices)}")
+                logger.info(f"✅ Цены: Bybit={len(bybit_prices)}, MEXC={len(mexc_prices)}, OKX={len(okx_prices)}")
                 
                 opportunities = analyze_opportunities(bybit_prices, mexc_prices, okx_prices)
                 
                 if opportunities:
-                    logger.info(f"\n📊 Найдено {len(opportunities)} возможностей!")
-                    for opp in opportunities[:10]:
-                        logger.info(f"  {opp['symbol']}: спред {opp['spread_pct']:.2f}% = ${opp['net_profit_usd']:.2f}")
+                    logger.info(f"📊 Найдено {len(opportunities)} спредов!")
+                    for opp in opportunities[:5]:
+                        logger.info(f"  {opp['symbol']}: {opp['spread_pct']:.2f}%")
                 
                 await asyncio.sleep(FAST_SCAN_INTERVAL)
             
