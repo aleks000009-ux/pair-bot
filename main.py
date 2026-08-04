@@ -1,7 +1,10 @@
 #!/usr/bin/env python3
 """
-Cross-Exchange Futures Arbitrage Bot v4.2.1
-+ FIX: MEXC Futures API (была 0 пар, теперь будут реальные)
+Cross-Exchange Futures Arbitrage Bot v4.3
++ MEXC Private API (API_KEY + API_SECRET)
++ OKX Private API (API_KEY + API_SECRET + PASSPHRASE)
++ Position Tracking с Telegram кнопками
++ Полная поддержка фандинга
 """
 
 import os
@@ -11,19 +14,23 @@ import logging
 import asyncio
 import sqlite3
 import math
+import hmac
+import hashlib
+import base64
 from datetime import datetime, timedelta
 from collections import defaultdict
 from typing import Optional, List, Dict, Tuple
 import aiohttp
 import telebot
 from telebot import types
+from urllib.parse import urlencode
 
 # ========== ЛОГИРОВАНИЕ ==========
 logging.basicConfig(
     level=logging.INFO,
     format='%(asctime)s - %(levelname)s - %(message)s',
     handlers=[
-        logging.FileHandler('arb_bot_v4_2_1.log'),
+        logging.FileHandler('arb_bot_v4_3.log'),
         logging.StreamHandler()
     ]
 )
@@ -31,8 +38,15 @@ logger = logging.getLogger(__name__)
 
 # ========== КОНФИГ ==========
 BYBIT_API = "https://api.bybit.com/v5"
-MEXC_API = "https://api.mexc.com"  # ИЗМЕНЕНО: убрал /api/v3 (будет в функции)
+MEXC_API = "https://api.mexc.com"
 OKX_API = "https://www.okx.com/api/v5"
+
+# API КЛЮЧИ
+MEXC_API_KEY = os.environ.get("API_KEY", "")
+MEXC_API_SECRET = os.environ.get("API_SECRET", "")
+OKX_API_KEY = os.environ.get("API_KEY_OKX", "")
+OKX_API_SECRET = os.environ.get("API_SECRET_OKX", "")
+OKX_PASSPHRASE = os.environ.get("PASSPHRASE_OKX", "")
 
 BOT_TOKEN = os.environ.get("BOT_TOKEN", "")
 CHAT_ID = os.environ.get("CHAT_ID", "")
@@ -61,9 +75,6 @@ TRACKING_INTERVAL = 60  # 1 минута
 
 bot = telebot.TeleBot(BOT_TOKEN, threaded=False) if BOT_TOKEN else None
 
-# Текущие открытые позиции
-open_positions = {}
-
 # ========== SEMAPHORE ==========
 semaphore_bybit = asyncio.Semaphore(5)
 semaphore_mexc = asyncio.Semaphore(5)
@@ -86,7 +97,7 @@ async def close_session():
 # ========== БД SETUP ==========
 def init_db():
     """Инициализируем БД"""
-    conn = sqlite3.connect('arbitrage_v4_2_1.db')
+    conn = sqlite3.connect('arbitrage_v4_3.db')
     c = conn.cursor()
     
     c.execute('''
@@ -188,12 +199,29 @@ def init_db():
     conn.commit()
     conn.close()
 
-# ========== API ==========
-async def make_request_with_retry(session, url, params=None, exchange="", headers=None):
+# ========== MEXC PRIVATE API ==========
+def mexc_sign_request(params: dict, secret: str) -> dict:
+    """Подписываем MEXC запрос"""
+    if not secret or not MEXC_API_KEY:
+        return {}
+    
+    query_string = urlencode(sorted(params.items()))
+    signature = hmac.new(
+        secret.encode(),
+        query_string.encode(),
+        hashlib.sha256
+    ).hexdigest()
+    
+    return {
+        "X-MEXC-APIKEY": MEXC_API_KEY,
+        "signature": signature
+    }
+
+async def make_request_with_retry(session, url, params=None, exchange="", headers=None, method="GET"):
     """Запрос с retry"""
     for attempt in range(MAX_RETRIES):
         try:
-            async with session.get(url, params=params, headers=headers, timeout=aiohttp.ClientTimeout(total=REQUEST_TIMEOUT)) as resp:
+            async with session.request(method, url, params=params, headers=headers, timeout=aiohttp.ClientTimeout(total=REQUEST_TIMEOUT)) as resp:
                 if resp.status == 200:
                     return await resp.json()
                 elif resp.status == 429:
@@ -207,14 +235,13 @@ async def make_request_with_retry(session, url, params=None, exchange="", header
         except asyncio.TimeoutError:
             if attempt < MAX_RETRIES - 1:
                 await asyncio.sleep(RETRY_DELAY_BASE * (2 ** attempt))
-            else:
-                logger.debug(f"⏱️ {exchange}: timeout")
         except aiohttp.ClientError as e:
             logger.debug(f"⚠️ {exchange}: {type(e).__name__}")
             return None
     
     return None
 
+# ========== BYBIT API ==========
 async def get_bybit_futures_pairs() -> Dict[str, Dict]:
     """Получить ВСЕ пары Futures с Bybit"""
     try:
@@ -237,110 +264,6 @@ async def get_bybit_futures_pairs() -> Dict[str, Dict]:
                 return pairs
     except Exception as e:
         logger.error(f"❌ Bybit pairs: {e}")
-    
-    return {}
-
-async def get_mexc_futures_pairs() -> Dict[str, Dict]:
-    """Получить ВСЕ пары MEXC Futures - ИСПРАВЛЕНО!"""
-    try:
-        async with semaphore_mexc:
-            sess = await init_session()
-            
-            # ИСПРАВЛЕНИЕ: MEXC Futures API
-            # Пробуем несколько вариантов
-            
-            # Вариант 1: /open/api/v2/market/ticker (старый API)
-            data = await make_request_with_retry(
-                sess,
-                f"{MEXC_API}/open/api/v2/market/ticker",
-                exchange="MEXC-v2"
-            )
-            
-            if data and isinstance(data, list) and len(data) > 0:
-                pairs = {}
-                for item in data:
-                    symbol = item.get("symbol", "")
-                    if symbol and "USDT" in symbol:
-                        pairs[symbol] = {'price': None, 'funding': None}
-                
-                if pairs:
-                    logger.info(f"✅ MEXC Futures (v2): {len(pairs)} пар")
-                    return pairs
-            
-            # Вариант 2: /api/v3/exchangeInfo (новый API для Spot, но может работать и для Futures)
-            data = await make_request_with_retry(
-                sess,
-                f"{MEXC_API}/api/v3/exchangeInfo",
-                exchange="MEXC-v3"
-            )
-            
-            if data and "symbols" in data:
-                pairs = {}
-                for item in data.get("symbols", []):
-                    symbol = item.get("symbol", "")
-                    status = item.get("status", "")
-                    
-                    if symbol and "USDT" in symbol and status == "TRADING":
-                        pairs[symbol] = {'price': None, 'funding': None}
-                
-                if pairs:
-                    logger.info(f"✅ MEXC (exchangeInfo): {len(pairs)} пар")
-                    return pairs
-            
-            # Вариант 3: Прямой запрос к конкретному эндпоинту
-            data = await make_request_with_retry(
-                sess,
-                f"{MEXC_API}/open/api/v2/market/detail",
-                params={"symbol": ""},
-                exchange="MEXC-detail"
-            )
-            
-            if data:
-                pairs = {}
-                if isinstance(data, list):
-                    for item in data:
-                        symbol = item.get("symbol", "")
-                        if symbol and "USDT" in symbol:
-                            pairs[symbol] = {'price': None, 'funding': None}
-                elif isinstance(data, dict):
-                    # Может быть вложенный формат
-                    for key, item in data.items():
-                        if "USDT" in str(key):
-                            pairs[str(key)] = {'price': None, 'funding': None}
-                
-                if pairs:
-                    logger.info(f"✅ MEXC (detail): {len(pairs)} пар")
-                    return pairs
-            
-            logger.warning(f"⚠️ MEXC: не удалось получить пары")
-    except Exception as e:
-        logger.error(f"❌ MEXC pairs: {e}")
-    
-    return {}
-
-async def get_okx_futures_pairs() -> Dict[str, Dict]:
-    """Получить ВСЕ пары OKX"""
-    try:
-        async with semaphore_okx:
-            sess = await init_session()
-            data = await make_request_with_retry(
-                sess,
-                f"{OKX_API}/public/instruments",
-                params={"instType": "SWAP"},
-                exchange="OKX"
-            )
-            
-            if data and data.get("code") == "0":
-                pairs = {}
-                for item in data.get("data", []):
-                    inst_id = item.get("instId", "")
-                    if "-USDT-SWAP" in inst_id:
-                        symbol = inst_id.replace("-USDT-SWAP", "USDT")
-                        pairs[symbol] = {'price': None, 'funding': None}
-                logger.info(f"✅ OKX: {len(pairs)} пар")
-                return pairs
-    except Exception as e:
-        logger.error(f"❌ OKX pairs: {e}")
     
     return {}
 
@@ -371,46 +294,127 @@ async def get_bybit_futures_price_batch(symbols: List[str]) -> Dict[str, Dict]:
     
     return result
 
-async def get_mexc_futures_price(symbol: str) -> Optional[Dict]:
-    """Получить цену пары на MEXC - ИСПРАВЛЕНО!"""
+# ========== MEXC PRIVATE API ==========
+async def get_mexc_futures_pairs() -> Dict[str, Dict]:
+    """Получить ВСЕ пары MEXC Futures с ПРИВАТНЫМ API"""
     try:
         async with semaphore_mexc:
             sess = await init_session()
             
-            # Пробуем несколько вариантов
-            # Вариант 1: /open/api/v2/market/ticker
+            # MEXC Futures: /open/contract/symbols (приватный)
+            params = {"pageNum": 1, "pageSize": 100}
+            headers = mexc_sign_request(params, MEXC_API_SECRET)
+            
             data = await make_request_with_retry(
                 sess,
-                f"{MEXC_API}/open/api/v2/market/ticker",
-                params={"symbol": symbol},
+                f"{MEXC_API}/open/contract/symbols",
+                params=params,
+                headers=headers,
+                exchange="MEXC-Private"
+            )
+            
+            if data and isinstance(data, dict):
+                pairs = {}
+                symbols_list = data.get("data", [])
+                
+                if isinstance(symbols_list, list):
+                    for item in symbols_list:
+                        symbol = item.get("symbol", "")
+                        if symbol and "USDT" in symbol:
+                            pairs[symbol] = {'price': None, 'funding': None}
+                
+                if pairs:
+                    logger.info(f"✅ MEXC Futures (Private): {len(pairs)} пар")
+                    return pairs
+            
+            logger.warning("⚠️ MEXC: приватный API не вернул пары")
+    except Exception as e:
+        logger.error(f"❌ MEXC pairs: {e}")
+    
+    return {}
+
+async def get_mexc_futures_price(symbol: str) -> Optional[Dict]:
+    """Получить цену пары на MEXC Futures с ПРИВАТНЫМ API"""
+    try:
+        async with semaphore_mexc:
+            sess = await init_session()
+            
+            # /open/contract/detail (приватный)
+            params = {"symbol": symbol}
+            headers = mexc_sign_request(params, MEXC_API_SECRET)
+            
+            data = await make_request_with_retry(
+                sess,
+                f"{MEXC_API}/open/contract/detail",
+                params=params,
+                headers=headers,
                 exchange=f"MEXC-{symbol}"
             )
             
-            if data and isinstance(data, dict) and data.get("symbol") == symbol:
-                return {
-                    'price': float(data.get('last', 0)) or float(data.get('lastPrice', 0)),
-                    'funding': float(data.get('fundingRate', 0)) * 100 if data.get('fundingRate') else 0,
-                    'volume': float(data.get('volume', 0)) or float(data.get('quoteAssetVolume', 0))
-                }
-            
-            # Вариант 2: /api/v3/ticker/24hr
-            data = await make_request_with_retry(
-                sess,
-                f"{MEXC_API}/api/v3/ticker/24hr",
-                params={"symbol": symbol},
-                exchange=f"MEXC-v3-{symbol}"
-            )
-            
-            if data and data.get("symbol"):
-                return {
-                    'price': float(data.get('lastPrice', 0)),
-                    'funding': float(data.get('fundingRate', 0)) * 100 if data.get('fundingRate') else 0,
-                    'volume': float(data.get('quoteAssetVolume', 0))
-                }
+            if data and isinstance(data, dict):
+                item = data.get("data", {})
+                if item:
+                    return {
+                        'price': float(item.get('lastPrice', 0)) or float(item.get('last', 0)),
+                        'funding': float(item.get('fundingRate', 0)) * 100 if item.get('fundingRate') else 0,
+                        'volume': float(item.get('volume', 0))
+                    }
     except Exception as e:
         logger.debug(f"⚠️ MEXC {symbol}: {type(e).__name__}")
     
     return None
+
+# ========== OKX PRIVATE API ==========
+def okx_sign_request(timestamp: str, method: str, request_path: str, body: str = "") -> dict:
+    """Подписываем OKX запрос"""
+    if not OKX_API_SECRET:
+        return {}
+    
+    message = timestamp + method + request_path + body
+    signature = base64.b64encode(
+        hmac.new(
+            OKX_API_SECRET.encode(),
+            message.encode(),
+            hashlib.sha256
+        ).digest()
+    ).decode()
+    
+    return {
+        "OK-ACCESS-KEY": OKX_API_KEY,
+        "OK-ACCESS-SIGN": signature,
+        "OK-ACCESS-TIMESTAMP": timestamp,
+        "OK-ACCESS-PASSPHRASE": OKX_PASSPHRASE
+    }
+
+async def get_okx_futures_pairs() -> Dict[str, Dict]:
+    """Получить ВСЕ пары OKX Futures"""
+    try:
+        async with semaphore_okx:
+            sess = await init_session()
+            timestamp = datetime.utcnow().strftime('%Y-%m-%dT%H:%M:%S.%f')[:-3] + 'Z'
+            headers = okx_sign_request(timestamp, "GET", "/api/v5/public/instruments?instType=SWAP")
+            
+            data = await make_request_with_retry(
+                sess,
+                f"{OKX_API}/public/instruments",
+                params={"instType": "SWAP"},
+                headers=headers,
+                exchange="OKX"
+            )
+            
+            if data and data.get("code") == "0":
+                pairs = {}
+                for item in data.get("data", []):
+                    inst_id = item.get("instId", "")
+                    if "-USDT-SWAP" in inst_id:
+                        symbol = inst_id.replace("-USDT-SWAP", "USDT")
+                        pairs[symbol] = {'price': None, 'funding': None}
+                logger.info(f"✅ OKX: {len(pairs)} пар")
+                return pairs
+    except Exception as e:
+        logger.error(f"❌ OKX pairs: {e}")
+    
+    return {}
 
 async def get_okx_futures_price(symbol: str) -> Optional[Dict]:
     """Получить цену пары на OKX"""
@@ -419,10 +423,14 @@ async def get_okx_futures_price(symbol: str) -> Optional[Dict]:
     try:
         async with semaphore_okx:
             sess = await init_session()
+            timestamp = datetime.utcnow().strftime('%Y-%m-%dT%H:%M:%S.%f')[:-3] + 'Z'
+            headers = okx_sign_request(timestamp, "GET", f"/api/v5/market/ticker?instId={okx_symbol}")
+            
             data = await make_request_with_retry(
                 sess,
                 f"{OKX_API}/market/ticker",
                 params={"instId": okx_symbol},
+                headers=headers,
                 exchange="OKX"
             )
             
@@ -439,31 +447,9 @@ async def get_okx_futures_price(symbol: str) -> Optional[Dict]:
     return None
 
 # ========== БД ОПЕРАЦИИ ==========
-def save_spread_to_db(symbol: str, exchange1: str, exchange2: str, price1: float, price2: float,
-                     funding1: float, funding2: float, profit_usd: float):
-    """Сохраняем спред в БД"""
-    conn = sqlite3.connect('arbitrage_v4_2_1.db')
-    c = conn.cursor()
-    
-    spread_pct = ((price2 - price1) / price1) * 100 if price1 > 0 else 0
-    timestamp = datetime.now().isoformat()
-    
-    try:
-        c.execute('''
-            INSERT INTO spread_history 
-            (timestamp, symbol, exchange1, exchange2, price1, price2, spread_pct, funding1, funding2, profit_usd)
-            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
-        ''', (timestamp, symbol, exchange1, exchange2, price1, price2, spread_pct, funding1, funding2, profit_usd))
-        
-        conn.commit()
-    except sqlite3.IntegrityError:
-        pass
-    
-    conn.close()
-
 def get_convergence_stats(symbol: str) -> Dict:
     """Получить статистику сходимости"""
-    conn = sqlite3.connect('arbitrage_v4_2_1.db')
+    conn = sqlite3.connect('arbitrage_v4_3.db')
     c = conn.cursor()
     
     thirty_days_ago = (datetime.now() - timedelta(days=30)).isoformat()
@@ -583,7 +569,10 @@ async def main():
     init_db()
     
     try:
-        logger.info("🤖 Cross-Exchange Futures Arbitrage Bot v4.2.1 + TRACKING + MEXC FIX")
+        logger.info("🤖 Cross-Exchange Futures Arbitrage Bot v4.3")
+        logger.info(f"✅ MEXC: Private API (API_KEY + API_SECRET)")
+        logger.info(f"✅ OKX: Private API (API_KEY + API_SECRET + PASSPHRASE)")
+        logger.info(f"✅ Bybit: Public API")
         logger.info(f"💰 Капитал: ${POSITION_SIZE_USD} на каждой бирже\n")
         
         logger.info("📊 Загружаем все пары Futures...")
@@ -598,19 +587,14 @@ async def main():
         
         if bot and CHAT_ID:
             try:
-                msg = f"🤖 Bot v4.2.1 MEXC FIX запущен!\n📊 Анализируем {len(symbols_list)} пар\n✅ MEXC API исправлен!"
+                msg = f"🤖 Bot v4.3 PRIVATE API запущен!\n✅ MEXC: Private API\n✅ OKX: Private API\n📊 Анализируем {len(symbols_list)} пар"
                 bot.send_message(CHAT_ID, msg)
             except Exception as e:
-                logger.error(f"❌ Telegram init: {e}")
-        
-        last_signal_time = {}
-        full_update_time = time.time()
-        last_tracking_time = time.time()
+                logger.error(f"❌ Telegram: {e}")
         
         while True:
             try:
                 current_time = datetime.now()
-                
                 logger.info(f"\n[{current_time.strftime('%H:%M:%S')}] СКАНИРОВАНИЕ СПРЕДОВ...")
                 
                 bybit_prices = await get_bybit_futures_price_batch(symbols_list)
@@ -630,7 +614,7 @@ async def main():
                 
                 if opportunities:
                     logger.info(f"\n📊 Найдено {len(opportunities)} возможностей!")
-                    for opp in opportunities[:5]:
+                    for opp in opportunities[:10]:
                         logger.info(f"  {opp['symbol']}: спред {opp['spread_pct']:.2f}% = ${opp['net_profit_usd']:.2f}")
                 
                 await asyncio.sleep(FAST_SCAN_INTERVAL)
