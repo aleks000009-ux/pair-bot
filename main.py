@@ -11,7 +11,7 @@ import time
 import logging
 import json
 import threading
-from datetime import datetime, timedelta
+from datetime import datetime, timedelta, timezone
 from typing import Optional, Dict, List
 from pathlib import Path
 
@@ -19,7 +19,6 @@ from binance.client import Client
 from binance.exceptions import BinanceAPIException
 import telebot
 from telebot import types
-import numpy as np
 
 # ========== ЛОГИРОВАНИЕ ==========
 logging.basicConfig(
@@ -154,7 +153,7 @@ class WildersADX:
 bot_state = {
     'open_position': None,
     'daily_pnl': 0,
-    'daily_reset_time': datetime.utcnow().replace(hour=0, minute=0, second=0),
+    'daily_reset_time': datetime.now(timezone.utc).replace(hour=0, minute=0, second=0),
     'symbol_info': None,
     'adx': WildersADX(14),
 }
@@ -529,10 +528,10 @@ def check_entry_signal(candles: List[Dict]) -> Optional[str]:
         logger.info("⚠️ Объем низкий")
         return None
     
-    expected_profit_usd = std_dev * STD_DEV_TP * POSITION_SIZE_USD / current_price
-    
-    if expected_profit_usd < 10:
-        logger.warning(f"⚠️ Expected profit ${expected_profit_usd:.2f} < $10")
+    # TP-движение в долях цены должно с запасом покрывать комиссии round-trip
+    tp_move_pct = (std_dev * STD_DEV_TP) / current_price if current_price > 0 else 0
+    if tp_move_pct < ROUND_TRIP_FEE * 2:
+        logger.warning(f"⚠️ TP {tp_move_pct*100:.3f}% < 2x комиссии ({ROUND_TRIP_FEE*2*100:.3f}%)")
         return None
     
     if z_score < -2.0:
@@ -588,7 +587,7 @@ def run_bot():
             
             last_check = time.time()
             
-            now = datetime.utcnow()
+            now = datetime.now(timezone.utc)
             if now.date() > bot_state['daily_reset_time'].date():
                 bot_state['daily_pnl'] = 0
                 bot_state['daily_reset_time'] = now.replace(hour=0, minute=0, second=0)
