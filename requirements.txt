@@ -1,3 +1,2 @@
-pytelegrambotapi
-requests
-numpy
+python-binance
+pyTelegramBotAPI
