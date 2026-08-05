@@ -68,11 +68,19 @@ client = None
 bot = None
 
 def init_client():
-    """Инициализируем Binance Client"""
+    """Инициализируем Binance Client с retry (testnet часто отдаёт 502/timeout)"""
     global client
     if client is None:
-        client = Client(API_KEY, API_SECRET, testnet=USE_TESTNET)
-        logger.info(f"✅ Binance Client инициализирован (testnet={USE_TESTNET})")
+        attempt = 0
+        while client is None:
+            attempt += 1
+            try:
+                client = Client(API_KEY, API_SECRET, testnet=USE_TESTNET)
+                logger.info(f"✅ Binance Client инициализирован (testnet={USE_TESTNET})")
+            except Exception as e:
+                wait = min(60, 5 * attempt)
+                logger.error(f"❌ Init client (попытка {attempt}): {e}. Повтор через {wait}с")
+                time.sleep(wait)
     return client
 
 def init_bot():
