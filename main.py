@@ -1,14 +1,13 @@
 #!/usr/bin/env python3
 """
-СИГНАЛЬНЫЙ БОТ — Отскок от уровня (ЛОНГ + ШОРТ)
-
-ЛОНГ (топ роста):  импульс вверх -> коррекция вниз -> отскок от ЛОК. МИНИМУМА вверх (зелёная свеча)
-                   SL под минимум, TP вверх 1:3
-ШОРТ (топ падения): импульс вниз -> коррекция вверх -> отскок от ЛОК. МАКСИМУМА вниз (красная свеча)
-                   SL над максимум, TP вниз 1:3
-
-Фон: |движение за 24ч| >= MIN_24H_PCT + направление дня совпадает.
-НЕ торгует. Bybit-данные через прокси + сигнал в Телеграм.
+СКАНЕР УЗКИХ КОРИДОРОВ (боковик/консолидация)
+Находит монеты, зажатые в узком горизонтальном коридоре, и шлёт в Телеграм:
+  - границы коридора (низ/верх)
+  - ширину в %
+  - сколько времени монета в этом коридоре
+  - как быстро проходит от одной границы к другой
+Для торговли от границ: покупка у низа, продажа у верха (пила).
+НЕ торгует. Bybit-данные через прокси.
 """
 import os, time, logging, requests
 logging.basicConfig(level=logging.INFO, format='%(asctime)s - %(levelname)s - %(message)s')
@@ -17,22 +16,14 @@ log = logging.getLogger(__name__)
 API        = os.environ.get("API_PROXY", "https://bybit-proxy.aleks000009.workers.dev")
 BOT_TOKEN  = os.environ.get("BOT_TOKEN", "")
 CHAT_ID    = os.environ.get("CHAT_ID", "")
-MIN_VOL_USD = float(os.environ.get("MIN_VOL_USD", "10")) * 1e6
-TOP_N       = int(os.environ.get("TOP_N", "40"))
-MIN_24H_PCT = float(os.environ.get("MIN_24H_PCT", "25"))
-ENABLE_LONG  = os.environ.get("ENABLE_LONG", "1") == "1"
-ENABLE_SHORT = os.environ.get("ENABLE_SHORT", "1") == "1"
-IMPULSE_WIN = int(os.environ.get("IMPULSE_WIN", "12"))
-IMPULSE_PCT = float(os.environ.get("IMPULSE_PCT", "7"))
-CORR_WIN    = int(os.environ.get("CORR_WIN", "14"))
-CORR_MIN    = float(os.environ.get("CORR_MIN", "2"))
-CORR_MAX    = float(os.environ.get("CORR_MAX", "12"))
-MIN_BOUNCE_BARS = int(os.environ.get("MIN_BOUNCE_BARS", "1"))
-MAX_BOUNCE_BARS = int(os.environ.get("MAX_BOUNCE_BARS", "6"))
-MIN_BOUNCE_PCT  = float(os.environ.get("MIN_BOUNCE_PCT", "0.5"))
-VOL_MULT    = float(os.environ.get("VOL_MULT", "1.3"))
-SL_BUFFER   = float(os.environ.get("SL_BUFFER", "0.5"))
-SCAN_EVERY  = int(os.environ.get("SCAN_EVERY", "300"))
+MIN_VOL_USD = float(os.environ.get("MIN_VOL_USD", "3")) * 1e6
+TOP_N       = int(os.environ.get("TOP_N", "0"))       # 0 = ВСЕ монеты (не ограничивать)
+WINDOW      = int(os.environ.get("WINDOW", "20"))      # окно анализа, свечей 15м
+MIN_WIDTH   = float(os.environ.get("MIN_WIDTH", "1.0"))# мин. ширина коридора %
+MAX_WIDTH   = float(os.environ.get("MAX_WIDTH", "5.0"))# макс. ширина %
+MIN_TOUCHES = int(os.environ.get("MIN_TOUCHES", "2"))  # мин. касаний каждой границы
+MIN_TIME_MIN= int(os.environ.get("MIN_TIME_MIN", "60"))# мин. сколько времени в коридоре (мин)
+SCAN_EVERY  = int(os.environ.get("SCAN_EVERY", "600"))
 COOLDOWN    = int(os.environ.get("COOLDOWN", "3600"))
 last_signal = {}
 
@@ -51,7 +42,6 @@ def api_get(path, retries=3):
         try:
             r = requests.get(API + path, timeout=15)
             if r.status_code == 200: return r.json()
-            log.warning(f"HTTP {r.status_code}: {path[:60]}")
         except Exception as e: log.warning(f"fetch {i+1}/{retries}: {e}")
         time.sleep(2*(i+1))
     return None
@@ -62,145 +52,120 @@ def get_klines(symbol, interval, limit):
     return [{"o":float(c[1]),"h":float(c[2]),"l":float(c[3]),"c":float(c[4]),"v":float(c[5])}
             for c in reversed(d["result"]["list"])]
 
-def get_movers():
-    """Возвращает (gainers, losers) — топ роста и топ падения."""
+def get_liquid_symbols():
     d = api_get("/tickers?category=linear")
-    if not d or d.get("retCode") != 0: return [], []
+    if not d or d.get("retCode") != 0: return []
     rows = []
     for t in d["result"]["list"]:
         if not t["symbol"].endswith("USDT"): continue
         try:
-            turn = float(t.get("turnover24h") or 0); pct = float(t.get("price24hPcnt") or 0)*100
+            turn = float(t.get("turnover24h") or 0)
             if turn < MIN_VOL_USD: continue
-            rows.append((t["symbol"], pct, turn))
+            rows.append((t["symbol"], turn))
         except (TypeError, ValueError): continue
-    gainers = sorted([r for r in rows if r[1] >= MIN_24H_PCT], key=lambda x: x[1], reverse=True)[:TOP_N]
-    losers  = sorted([r for r in rows if r[1] <= -MIN_24H_PCT], key=lambda x: x[1])[:TOP_N]
-    return gainers, losers
+    rows.sort(key=lambda x: x[1], reverse=True)
+    return [s for s, _ in (rows if TOP_N <= 0 else rows[:TOP_N])]
 
-def atr(c, p=14):
-    if len(c) < p+1: return None
-    trs=[max(c[i]['h']-c[i]['l'],abs(c[i]['h']-c[i-1]['c']),abs(c[i]['l']-c[i-1]['c'])) for i in range(1,len(c))]
-    return sum(trs[-p:])/p
-
-def sma_vol(c, p): return sum(x['v'] for x in c[-p:])/p if len(c) >= p else None
-
-def check_long(symbol, pct24):
-    day = get_klines(symbol, "D", 3)
-    if not day or day[-1]['c'] <= day[-1]['o']: return None  # день зелёный
-    m = get_klines(symbol, "15", 80)
-    if not m or len(m) < 45: return None
-    price = m[-1]['c']
-    corr_zone = m[-CORR_WIN:]
-    local_low = min(c['l'] for c in corr_zone)
-    low_idx = max(i for i, c in enumerate(corr_zone) if c['l'] == local_low)
-    bars = len(corr_zone) - 1 - low_idx
-    if bars < MIN_BOUNCE_BARS or bars > MAX_BOUNCE_BARS: return None
-    imp_zone = m[-CORR_WIN-IMPULSE_WIN:-CORR_WIN]
-    imp_low = min(c['l'] for c in imp_zone); imp_high = max(c['h'] for c in imp_zone)
-    impulse = (imp_high - imp_low)/imp_low*100 if imp_low else 0
-    if impulse < IMPULSE_PCT: return None
-    bounce = (price - local_low)/local_low*100 if local_low else 0
-    if bounce < MIN_BOUNCE_PCT: return None
-    if m[-1]['c'] <= m[-1]['o']: return None  # зелёная свеча (разворот вверх)
-    depth = (imp_high - local_low)/imp_high*100 if imp_high else 0
-    if not (CORR_MIN <= depth <= CORR_MAX): return None
-    vma = sma_vol(m[:-1], 20)
-    if not vma or m[-1]['v'] < vma * VOL_MULT: return None
-    a = atr(m, 14)
-    if not a: return None
-    entry = price; sl = local_low - a*SL_BUFFER; risk = entry - sl
-    if risk <= 0: return None
-    return {"symbol":symbol,"side":"long","entry":entry,"sl":sl,"tp":entry+risk*3,
-            "risk_pct":risk/entry*100,"impulse":impulse,"level":local_low,"bounce":bounce,
-            "depth":depth,"bars":bars,"vol_x":m[-1]['v']/vma,"pct24":pct24}
-
-def check_short(symbol, pct24):
-    day = get_klines(symbol, "D", 3)
-    if not day or day[-1]['c'] >= day[-1]['o']: return None  # день красный
-    m = get_klines(symbol, "15", 80)
-    if not m or len(m) < 45: return None
-    price = m[-1]['c']
-    corr_zone = m[-CORR_WIN:]
-    local_high = max(c['h'] for c in corr_zone)
-    high_idx = max(i for i, c in enumerate(corr_zone) if c['h'] == local_high)
-    bars = len(corr_zone) - 1 - high_idx
-    if bars < MIN_BOUNCE_BARS or bars > MAX_BOUNCE_BARS: return None
-    imp_zone = m[-CORR_WIN-IMPULSE_WIN:-CORR_WIN]
-    imp_low = min(c['l'] for c in imp_zone); imp_high = max(c['h'] for c in imp_zone)
-    impulse = (imp_high - imp_low)/imp_high*100 if imp_high else 0  # падение
-    if impulse < IMPULSE_PCT: return None
-    drop = (local_high - price)/local_high*100 if local_high else 0
-    if drop < MIN_BOUNCE_PCT: return None
-    if m[-1]['c'] >= m[-1]['o']: return None  # красная свеча (разворот вниз)
-    depth = (local_high - imp_low)/imp_low*100 if imp_low else 0
-    if not (CORR_MIN <= depth <= CORR_MAX): return None
-    vma = sma_vol(m[:-1], 20)
-    if not vma or m[-1]['v'] < vma * VOL_MULT: return None
-    a = atr(m, 14)
-    if not a: return None
-    entry = price; sl = local_high + a*SL_BUFFER; risk = sl - entry
-    if risk <= 0: return None
-    return {"symbol":symbol,"side":"short","entry":entry,"sl":sl,"tp":entry-risk*3,
-            "risk_pct":risk/entry*100,"impulse":impulse,"level":local_high,"bounce":drop,
-            "depth":depth,"bars":bars,"vol_x":m[-1]['v']/vma,"pct24":pct24}
+def detect_range(candles):
+    N = WINDOW
+    if len(candles) < N + 5: return None
+    zone = candles[-N:]
+    hi = max(c['h'] for c in zone)
+    lo = min(c['l'] for c in zone)
+    mid = (hi + lo) / 2
+    if mid <= 0: return None
+    width_pct = (hi - lo) / mid * 100
+    if not (MIN_WIDTH <= width_pct <= MAX_WIDTH): return None
+    band = (hi - lo) * 0.15
+    touch_hi = sum(1 for c in zone if c['h'] >= hi - band)
+    touch_lo = sum(1 for c in zone if c['l'] <= lo + band)
+    if touch_hi < MIN_TOUCHES or touch_lo < MIN_TOUCHES: return None
+    q = max(1, N // 4)
+    first_q = sum(c['c'] for c in zone[:q]) / q
+    last_q  = sum(c['c'] for c in zone[-q:]) / q
+    drift = abs(last_q - first_q) / mid * 100
+    if drift > width_pct * 0.6: return None  # это тренд, не коридор
+    # время в коридоре
+    bars_in_range = N
+    for i in range(len(candles) - N - 1, -1, -1):
+        c = candles[i]
+        if lo <= c['l'] and c['h'] <= hi:
+            bars_in_range += 1
+        else:
+            break
+    time_in_range_min = bars_in_range * 15
+    if time_in_range_min < MIN_TIME_MIN: return None
+    # скорость: проходы через среднюю линию
+    crossings = 0
+    prev_above = zone[0]['c'] > mid
+    for c in zone[1:]:
+        above = c['c'] > mid
+        if above != prev_above:
+            crossings += 1; prev_above = above
+    speed_min = (N / crossings * 15) if crossings else N * 15
+    price = candles[-1]['c']
+    pos = (price - lo) / (hi - lo) * 100 if hi > lo else 50  # где сейчас цена в коридоре, %
+    return {'high':hi,'low':lo,'mid':mid,'width_pct':width_pct,
+            'time_in_range_min':time_in_range_min,'bars_in_range':bars_in_range,
+            'touch_hi':touch_hi,'touch_lo':touch_lo,'crossings':crossings,
+            'speed_min':speed_min,'price':price,'pos':pos}
 
 def fp(p):
     if p >= 1: return f"{p:.4f}"
     if p >= 0.01: return f"{p:.5f}"
     return f"{p:.7f}"
 
-def signal_text(s):
-    sym = s["symbol"].replace("USDT","")
-    if s["side"] == "long":
-        return (f"🟢 <b>ЛОНГ: {sym}/USDT</b>  (отскок от поддержки)\n\n"
-                f"🔥 За 24ч: +{s['pct24']:.1f}%  (топ роста)\n"
-                f"📈 Импульс вверх: +{s['impulse']:.1f}%\n"
-                f"↩️ Коррекция вниз: -{s['depth']:.1f}% к минимуму {fp(s['level'])}\n"
-                f"🟢 Отскок вверх: +{s['bounce']:.1f}%  ({s['bars']} св. назад дно)\n"
-                f"📊 Объём: ×{s['vol_x']:.1f}\n\n"
-                f"💰 <b>Вход:</b> {fp(s['entry'])}\n"
-                f"🛑 <b>Stop:</b> {fp(s['sl'])}  под минимум (риск {s['risk_pct']:.2f}%)\n"
-                f"✅ <b>Take 1:3:</b> {fp(s['tp'])}  (+{s['risk_pct']*3:.2f}%)\n\n"
-                f"⚠️ Цена оттолкнулась от поддержки вверх. Подтверди разворот. Стоп/тейк не двигай.\n"
-                f"📊 https://www.bybit.com/trade/usdt/{s['symbol']}?interval=15")
+def fmt_time(minutes):
+    if minutes < 60: return f"{minutes}мин"
+    h = minutes // 60; m = minutes % 60
+    return f"{h}ч {m}мин" if m else f"{h}ч"
+
+def signal_text(sym, r):
+    s = sym.replace("USDT","")
+    # где цена сейчас — подсказка что делать
+    if r['pos'] <= 25:
+        hint = "🟢 Цена у НИЗА коридора — зона покупки (лонг к верху)"
+    elif r['pos'] >= 75:
+        hint = "🔴 Цена у ВЕРХА коридора — зона продажи (шорт к низу)"
     else:
-        return (f"🔴 <b>ШОРТ: {sym}/USDT</b>  (отскок от сопротивления)\n\n"
-                f"🔥 За 24ч: {s['pct24']:.1f}%  (топ падения)\n"
-                f"📉 Импульс вниз: -{s['impulse']:.1f}%\n"
-                f"↪️ Коррекция вверх: +{s['depth']:.1f}% к максимуму {fp(s['level'])}\n"
-                f"🔴 Отскок вниз: -{s['bounce']:.1f}%  ({s['bars']} св. назад пик)\n"
-                f"📊 Объём: ×{s['vol_x']:.1f}\n\n"
-                f"💰 <b>Вход:</b> {fp(s['entry'])}\n"
-                f"🛑 <b>Stop:</b> {fp(s['sl'])}  над максимум (риск {s['risk_pct']:.2f}%)\n"
-                f"✅ <b>Take 1:3:</b> {fp(s['tp'])}  ({s['risk_pct']*3:.2f}%)\n\n"
-                f"⚠️ Цена оттолкнулась от сопротивления вниз. Подтверди разворот. Стоп/тейк не двигай.\n"
-                f"📊 https://www.bybit.com/trade/usdt/{s['symbol']}?interval=15")
+        hint = "⚪ Цена в середине — жди подхода к границе"
+    return (f"📊 <b>КОРИДОР: {s}/USDT</b>\n\n"
+            f"⬆️ Верх: {fp(r['high'])}\n"
+            f"⬇️ Низ:  {fp(r['low'])}\n"
+            f"📏 Ширина: {r['width_pct']:.2f}%\n"
+            f"⏱ В коридоре: {fmt_time(r['time_in_range_min'])}\n"
+            f"🔄 Проход между границами: ~{fmt_time(int(r['speed_min']))}\n"
+            f"📍 Сейчас цена: {fp(r['price'])} ({r['pos']:.0f}% от низа)\n\n"
+            f"{hint}\n\n"
+            f"⚠️ Торговля от границ: покупка у низа, продажа у верха. "
+            f"Стоп ЗА границу коридора — если пробьёт, боковик кончился, выходи. "
+            f"Комиссии съедают часть узкого хода, считай прибыль после них.\n"
+            f"📊 https://www.bybit.com/trade/usdt/{sym}?interval=15")
 
 def run():
-    log.info("🤖 Сигнальный бот (ЛОНГ+ШОРТ, отскок от уровня) запущен")
-    log.info(f"Фон: топ{TOP_N} |24ч|>={MIN_24H_PCT}% | Лонг={ENABLE_LONG} Шорт={ENABLE_SHORT} | импульс>={IMPULSE_PCT}% коррекция{CORR_MIN}-{CORR_MAX}% объём×{VOL_MULT}")
-    send_tg(f"🤖 <b>Сигнальный бот запущен</b>\n🟢 Топы роста → отскок от поддержки → лонг 1:3\n🔴 Топы падения → отскок от сопротивления → шорт 1:3\nСкан каждые {SCAN_EVERY//60} мин.")
+    log.info("🤖 Сканер узких коридоров запущен")
+    log.info(f"Монеты: {'ВСЕ' if TOP_N<=0 else TOP_N} | ширина {MIN_WIDTH}-{MAX_WIDTH}% | окно {WINDOW}св | мин.время {MIN_TIME_MIN}мин | касаний>={MIN_TOUCHES}")
+    send_tg(f"🤖 <b>Сканер коридоров запущен</b>\nИщу монеты в узком боковике (ширина {MIN_WIDTH}-{MAX_WIDTH}%).\nДам границы, ширину, время в коридоре и скорость хода.\nСкан каждые {SCAN_EVERY//60} мин.")
     while True:
         try:
-            gainers, losers = get_movers()
-            log.info(f"Сканирую: {len(gainers)} растущих (лонг), {len(losers)} падающих (шорт)")
+            symbols = get_liquid_symbols()
+            if not symbols:
+                log.warning("нет символов, повтор 60с"); time.sleep(60); continue
+            log.info(f"Сканирую {len(symbols)} монет на коридоры...")
             found = 0; now = time.time()
-            tasks = []
-            if ENABLE_LONG:  tasks += [("long", g) for g in gainers]
-            if ENABLE_SHORT: tasks += [("short", l) for l in losers]
-            for side, (sym, pct, turn) in tasks:
-                key = f"{sym}_{side}"
-                if key in last_signal and now - last_signal[key] < COOLDOWN: continue
+            for sym in symbols:
+                if sym in last_signal and now - last_signal[sym] < COOLDOWN: continue
                 try:
-                    sig = check_long(sym, pct) if side == "long" else check_short(sym, pct)
+                    m = get_klines(sym, "15", 60)
+                    if not m: continue
+                    r = detect_range(m)
                 except Exception as e:
-                    log.warning(f"{sym} {side}: {e}"); continue
-                if sig:
-                    log.info(f"✅ {side.upper()} {sym} (24ч {pct:+.1f}%)")
-                    send_tg(signal_text(sig)); last_signal[key] = now; found += 1
+                    log.warning(f"{sym}: {e}"); continue
+                if r:
+                    log.info(f"✅ КОРИДОР {sym} ширина {r['width_pct']:.1f}% время {r['time_in_range_min']}мин")
+                    send_tg(signal_text(sym, r)); last_signal[sym] = now; found += 1
                 time.sleep(0.3)
-            log.info(f"Скан завершён. Сигналов: {found}")
+            log.info(f"Скан завершён. Коридоров: {found}")
         except Exception as e: log.error(f"цикл: {e}")
         time.sleep(SCAN_EVERY)
 
