@@ -13,8 +13,8 @@ log = logging.getLogger(__name__)
 API        = os.environ.get("API_PROXY", "https://bybit-proxy.aleks000009.workers.dev")
 BOT_TOKEN  = os.environ.get("BOT_TOKEN", "")
 CHAT_ID    = os.environ.get("CHAT_ID", "")
-MIN_VOL_USD = float(os.environ.get("MIN_VOL_USD", "20")) * 1e6
-TOP_N       = int(os.environ.get("TOP_N", "80"))
+MIN_VOL_USD = float(os.environ.get("MIN_VOL_USD", "5")) * 1e6
+TOP_N       = int(os.environ.get("TOP_N", "0"))
 ENABLE_LONG  = os.environ.get("ENABLE_LONG", "1") == "1"
 ENABLE_SHORT = os.environ.get("ENABLE_SHORT", "1") == "1"
 DROP_WIN    = int(os.environ.get("DROP_WIN", "5"))          # окно импульса (свечей 15м)
