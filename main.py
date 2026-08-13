@@ -1,13 +1,12 @@
 #!/usr/bin/env python3
 """
-КАСКАДНЫЙ БОТ — пробой каскада уровней (мультитаймфрейм)
-Уровни строятся на 4ч, пробой ловится на 15м. Логика пользователя.
-Карточка-сигнал: направление, что пробиваем, стоп %, тейк % (next_level или 1:3), почему.
+БОТ ЛОВЛИ НОЖА (разворот после резкого импульса) — ЛОНГ + ШОРТ
+ЛОНГ:  резкое ПАДЕНИЕ >=DROP% -> зелёная разворотная свеча + объём -> лонг. Стоп под дно, тейк 1:3.
+ШОРТ:  резкий ВЗЛЁТ  >=DROP% -> красная разворотная свеча + объём -> шорт. Стоп над пик, тейк 1:3.
+Вход только на РАЗВОРОТЕ (не в летящий импульс). Карточка с % стопа и тейка.
 НЕ торгует. Bybit через прокси + Телеграм.
 """
 import os, time, logging, requests
-from typing import List, Dict, Tuple, Optional
-
 logging.basicConfig(level=logging.INFO, format='%(asctime)s - %(levelname)s - %(message)s')
 log = logging.getLogger(__name__)
 
@@ -15,30 +14,19 @@ API        = os.environ.get("API_PROXY", "https://bybit-proxy.aleks000009.worker
 BOT_TOKEN  = os.environ.get("BOT_TOKEN", "")
 CHAT_ID    = os.environ.get("CHAT_ID", "")
 MIN_VOL_USD = float(os.environ.get("MIN_VOL_USD", "20")) * 1e6
-TOP_N       = int(os.environ.get("TOP_N", "60"))
-SCAN_EVERY  = int(os.environ.get("SCAN_EVERY", "600"))
+TOP_N       = int(os.environ.get("TOP_N", "80"))
+ENABLE_LONG  = os.environ.get("ENABLE_LONG", "1") == "1"
+ENABLE_SHORT = os.environ.get("ENABLE_SHORT", "1") == "1"
+DROP_WIN    = int(os.environ.get("DROP_WIN", "5"))          # окно импульса (свечей 15м)
+DROP_PCT    = float(os.environ.get("DROP_PCT", "7"))        # мин. импульс %
+MAX_BARS_AFTER = int(os.environ.get("MAX_BARS_AFTER", "2")) # дно/пик было не дальше N свечей
+MIN_BOUNCE  = float(os.environ.get("MIN_BOUNCE", "0.5"))    # мин. отскок от дна/пика %
+MAX_BOUNCE  = float(os.environ.get("MAX_BOUNCE", "4"))      # макс. отскок (иначе поздно)
+VOL_MULT    = float(os.environ.get("VOL_MULT", "1.5"))      # объём на развороте
+SL_BUFFER   = float(os.environ.get("SL_BUFFER", "0.5"))    # ATR-буфер за дно/пик
+RETRACE_CAP = float(os.environ.get("RETRACE_CAP", "0.7"))  # потолок тейка = X% отката импульса
+SCAN_EVERY  = int(os.environ.get("SCAN_EVERY", "300"))
 COOLDOWN    = int(os.environ.get("COOLDOWN", "3600"))
-USE_TREND_FILTER = os.environ.get("USE_TREND_FILTER", "1") == "1"
-# Подход к сильным 4ч уровням (отдельный сигнал)
-ENABLE_LEVEL_APPROACH = os.environ.get("ENABLE_LEVEL_APPROACH", "1") == "1"
-LEVEL_WINDOW   = int(os.environ.get("LEVEL_WINDOW", "6"))    # окно поиска 4ч экстремумов
-LEVEL_LOOKBACK = int(os.environ.get("LEVEL_LOOKBACK", "60")) # за сколько 4ч свечей (~10 дней)
-APPROACH_PCT   = float(os.environ.get("APPROACH_PCT", "1.0"))# за сколько % до уровня слать
-
-CASCADE_CONFIG = {
-    "min_levels": int(os.environ.get("MIN_LEVELS", "3")),
-    "max_levels": int(os.environ.get("MAX_LEVELS", "5")),
-    "level_dist_min": float(os.environ.get("LEVEL_DIST_MIN", "0.003")),
-    "level_dist_max": float(os.environ.get("LEVEL_DIST_MAX", "0.015")),
-    "max_dist_from_price": float(os.environ.get("MAX_DIST_FROM_PRICE", "0.05")),
-    "pressure_window": int(os.environ.get("PRESSURE_WINDOW", "8")),
-    "pressure_min_bars": int(os.environ.get("PRESSURE_MIN_BARS", "4")),
-    "vol_ma_lookback": int(os.environ.get("VOL_MA_LOOKBACK", "20")),
-    "vol_threshold_mult": float(os.environ.get("VOL_THRESHOLD_MULT", "1.3")),
-    "confirm_candles": int(os.environ.get("CONFIRM_CANDLES", "2")),
-    "impulse_candles": int(os.environ.get("IMPULSE_CANDLES", "5")),
-    "extrema_window": int(os.environ.get("EXTREMA_WINDOW", "3")),  # ИСПРАВЛЕНО: 3 вместо 5
-}
 last_signal = {}
 
 def send_tg(text):
@@ -61,10 +49,9 @@ def api_get(path, retries=3):
     return None
 
 def get_klines(symbol, interval, limit):
-    """Возвращает свечи в формате [ts,o,h,l,c,v] старые->новые (как ждёт логика)."""
     d = api_get(f"/kline?category=linear&symbol={symbol}&interval={interval}&limit={limit}")
     if not d or d.get("retCode") != 0 or not d.get("result", {}).get("list"): return None
-    return [[int(c[0]),float(c[1]),float(c[2]),float(c[3]),float(c[4]),float(c[5])]
+    return [{"o":float(c[1]),"h":float(c[2]),"l":float(c[3]),"c":float(c[4]),"v":float(c[5])}
             for c in reversed(d["result"]["list"])]
 
 def get_symbols():
@@ -81,237 +68,138 @@ def get_symbols():
     rows.sort(key=lambda x: x[1], reverse=True)
     return [s for s,_ in (rows if TOP_N<=0 else rows[:TOP_N])]
 
-# ===== ЛОГИКА КАСКАДОВ (пользователя, окно исправлено на 3) =====
-def build_cascades(candles, level_type, config):
-    if len(candles) < 40: return []
-    highs = [c[2] for c in candles]
-    lows = [c[3] for c in candles]
-    W = config["extrema_window"]
-    def find_extrema(prices, window=W):
-        extrema = []
-        for i in range(window, len(prices) - window):
-            if prices[i] >= max(prices[i-window:i+window+1]):
-                extrema.append((i, prices[i], 'resistance'))
-            elif prices[i] <= min(prices[i-window:i+window+1]):
-                extrema.append((i, prices[i], 'support'))
-        return extrema
-    extrema_list = find_extrema(highs) if level_type == 'resistance' else find_extrema(lows)
-    # ФИКС: берём только экстремумы нужного типа (иначе support между resistance рвёт каскад)
-    extrema_sorted = sorted([e for e in extrema_list if e[2] == level_type], key=lambda x: x[0])
-    cascades = []
-    for start_idx in range(len(extrema_sorted)):
-        cascade = [extrema_sorted[start_idx]]
-        for j in range(start_idx + 1, min(start_idx + config["max_levels"], len(extrema_sorted))):
-            prev_idx, prev_price, _ = cascade[-1]
-            curr_idx, curr_price, curr_type = extrema_sorted[j]
-            if curr_type != level_type: break
-            dist = abs(curr_price - prev_price) / prev_price
-            if not (config["level_dist_min"] <= dist <= config["level_dist_max"]): break
-            if level_type == 'resistance' and curr_price <= prev_price: break
-            if level_type == 'support' and curr_price >= prev_price: break
-            cascade.append(extrema_sorted[j])
-        if len(cascade) >= config["min_levels"]:
-            cascades.append(cascade)
-    return cascades
+def atr(c, p=14):
+    if len(c) < p+1: return None
+    trs=[max(c[i]['h']-c[i]['l'],abs(c[i]['h']-c[i-1]['c']),abs(c[i]['l']-c[i-1]['c'])) for i in range(1,len(c))]
+    return sum(trs[-p:])/p
 
-def check_cascade_breakout_mtf(high_tf, low_tf, config, trend=None):
-    if len(low_tf) < config["pressure_window"] + 5: return False, {}
-    closes = [c[4] for c in low_tf]; highs = [c[2] for c in low_tf]
-    lows = [c[3] for c in low_tf]; volumes = [c[5] for c in low_tf]
-    last_close = closes[-1]; last_idx = len(closes) - 1
-    res_c = build_cascades(high_tf, 'resistance', config)
-    sup_c = build_cascades(high_tf, 'support', config)
-    def sort_prox(cascades, cp):
-        return sorted(cascades, key=lambda c: abs(cp - c[0][1]) / c[0][1])
-    res_c = sort_prox(res_c, last_close); sup_c = sort_prox(sup_c, last_close)
+def sma_vol(c, p): return sum(x['v'] for x in c[-p:])/p if len(c) >= p else None
 
-    if trend != 'down':
-        for cascade in res_c:
-            l1_price = cascade[0][1]
-            l2_price = cascade[1][1] if len(cascade) > 1 else None
-            if abs(last_close - l1_price)/l1_price > config["max_dist_from_price"]: continue
-            if last_close <= l1_price: continue
-            bi = last_idx
-            pl = lows[max(0, bi-config["pressure_window"]):bi]
-            if len(pl) < config["pressure_min_bars"] or pl[-1] <= pl[0]: continue
-            vs = volumes[max(0, bi-config["vol_ma_lookback"]):bi]
-            if len(vs) < 10: continue
-            if volumes[bi] < config["vol_threshold_mult"] * (sum(vs)/len(vs)): continue
-            ce = min(len(closes), bi+config["confirm_candles"]+1)
-            if any(c < l1_price for c in closes[bi+1:ce]): continue
-            return True, {"direction":"LONG","levels":[l[1] for l in cascade],
-                "break_level":l1_price,"next_level":l2_price,"stop_loss":l1_price*0.993,
-                "entry_price":last_close}
-    if trend != 'up':
-        for cascade in sup_c:
-            l1_price = cascade[0][1]
-            l2_price = cascade[1][1] if len(cascade) > 1 else None
-            if abs(last_close - l1_price)/l1_price > config["max_dist_from_price"]: continue
-            if last_close >= l1_price: continue
-            bi = last_idx
-            ph = highs[max(0, bi-config["pressure_window"]):bi]
-            if len(ph) < config["pressure_min_bars"] or ph[-1] >= ph[0]: continue
-            vs = volumes[max(0, bi-config["vol_ma_lookback"]):bi]
-            if len(vs) < 10: continue
-            if volumes[bi] < config["vol_threshold_mult"] * (sum(vs)/len(vs)): continue
-            ce = min(len(closes), bi+config["confirm_candles"]+1)
-            if any(c > l1_price for c in closes[bi+1:ce]): continue
-            return True, {"direction":"SHORT","levels":[l[1] for l in cascade],
-                "break_level":l1_price,"next_level":l2_price,"stop_loss":l1_price*1.007,
-                "entry_price":last_close}
-    return False, {}
+def check_knife_long(m):
+    """Нож вниз -> отскок вверх (лонг)."""
+    if len(m) < DROP_WIN + 25: return None
+    price = m[-1]['c']
+    look = m[-(DROP_WIN+3):]
+    peak = max(c['h'] for c in look)
+    bottom = min(c['l'] for c in look)
+    drop = (peak - bottom)/peak*100 if peak else 0
+    if drop < DROP_PCT: return None
+    bi = max(i for i,c in enumerate(look) if c['l']==bottom)
+    if len(look)-1-bi > MAX_BARS_AFTER: return None
+    if m[-1]['c'] <= m[-1]['o']: return None          # зелёная разворотная
+    bounce = (price-bottom)/bottom*100 if bottom else 0
+    if bounce < MIN_BOUNCE or bounce > MAX_BOUNCE: return None
+    vma = sma_vol(m[:-1],20)
+    if not vma or m[-1]['v'] < vma*VOL_MULT: return None
+    a = atr(m,14)
+    sl = bottom - (a*SL_BUFFER if a else bottom*0.002)
+    risk = price - sl
+    if risk <= 0: return None
+    tp = price + risk*3
+    # с учётом отката: тейк не должен быть выше реалистичной зоны отскока.
+    # потолок = 70% отката импульса (пик - 70% пути от дна к пику зоны отскока)
+    take_cap = bottom + (peak - bottom) * RETRACE_CAP  # напр. 0.7 = 70% импульса
+    tp_src = "1:3 от стопа"
+    if tp > take_cap:
+        tp = take_cap
+        tp_src = f"обрезан до {int(RETRACE_CAP*100)}% отката импульса"
+    return {"side":"long","entry":price,"sl":sl,"tp":tp,"extreme":bottom,"peak":peak,
+            "impulse":drop,"bounce":bounce,"vol_x":m[-1]['v']/vma,"risk_pct":risk/price*100,
+            "reward_pct":(tp-price)/price*100,"tp_src":tp_src}
 
-def find_key_levels(h4):
-    """Значимые 4ч уровни (крупные максимумы/минимумы за LEVEL_LOOKBACK свечей)."""
-    candles = h4[-LEVEL_LOOKBACK:] if len(h4) > LEVEL_LOOKBACK else h4
-    highs = [c[2] for c in candles]; lows = [c[3] for c in candles]
-    W = LEVEL_WINDOW
-    res, sup = [], []
-    for i in range(W, len(candles)-W):
-        if highs[i] >= max(highs[i-W:i+W+1]): res.append(highs[i])
-        if lows[i] <= min(lows[i-W:i+W+1]): sup.append(lows[i])
-    def merge(levels):
-        levels = sorted(levels); m = []
-        for l in levels:
-            if m and abs(l-m[-1])/m[-1] < 0.003: m[-1] = (m[-1]+l)/2
-            else: m.append(l)
-        return m
-    return merge(res), merge(sup)
+def check_knife_short(m):
+    """Памп вверх -> откат вниз (шорт)."""
+    if len(m) < DROP_WIN + 25: return None
+    price = m[-1]['c']
+    look = m[-(DROP_WIN+3):]
+    peak = max(c['h'] for c in look)
+    trough = min(c['l'] for c in look)
+    rise = (peak - trough)/trough*100 if trough else 0
+    if rise < DROP_PCT: return None
+    pi = max(i for i,c in enumerate(look) if c['h']==peak)
+    if len(look)-1-pi > MAX_BARS_AFTER: return None
+    if m[-1]['c'] >= m[-1]['o']: return None          # красная разворотная
+    drop_from_peak = (peak-price)/peak*100 if peak else 0
+    if drop_from_peak < MIN_BOUNCE or drop_from_peak > MAX_BOUNCE: return None
+    vma = sma_vol(m[:-1],20)
+    if not vma or m[-1]['v'] < vma*VOL_MULT: return None
+    a = atr(m,14)
+    sl = peak + (a*SL_BUFFER if a else peak*0.002)
+    risk = sl - price
+    if risk <= 0: return None
+    tp = price - risk*3
+    # с учётом отката: тейк не ниже реалистичной зоны отката вниз (70% импульса)
+    take_cap = peak - (peak - trough) * RETRACE_CAP
+    tp_src = "1:3 от стопа"
+    if tp < take_cap:
+        tp = take_cap
+        tp_src = f"обрезан до {int(RETRACE_CAP*100)}% отката импульса"
+    return {"side":"short","entry":price,"sl":sl,"tp":tp,"extreme":peak,"trough":trough,
+            "impulse":rise,"bounce":drop_from_peak,"vol_x":m[-1]['v']/vma,"risk_pct":risk/price*100,
+            "reward_pct":(price-tp)/price*100,"tp_src":tp_src}
 
-def check_approach(h4, price):
-    res, sup = find_key_levels(h4)
-    out = []
-    for lvl in res:
-        if lvl > price:
-            d = (lvl-price)/price*100
-            if d <= APPROACH_PCT: out.append(('resistance', lvl, d))
-    for lvl in sup:
-        if lvl < price:
-            d = (price-lvl)/price*100
-            if d <= APPROACH_PCT: out.append(('support', lvl, d))
-    out.sort(key=lambda x: x[2])
-    return out
-
-def approach_card(sym, kind, level, dist, price):
-    s = sym.replace("USDT","")
-    if kind == 'resistance':
-        head = f"⚡ <b>{s}/USDT подходит к 4ч СОПРОТИВЛЕНИЮ</b>"
-        what = (f"Цена снизу подходит к сильному 4-часовому уровню {fp(level)}. "
-                f"Здесь возможны два сценария: <b>отскок вниз</b> (уровень держит) "
-                f"или <b>пробой вверх</b> (уровень сносят). Смотри реакцию цены у уровня.")
-    else:
-        head = f"⚡ <b>{s}/USDT подходит к 4ч ПОДДЕРЖКЕ</b>"
-        what = (f"Цена сверху подходит к сильному 4-часовому уровню {fp(level)}. "
-                f"Возможны: <b>отскок вверх</b> (поддержка держит) или "
-                f"<b>пробой вниз</b> (поддержку ломают). Смотри реакцию у уровня.")
-    return (f"{head}\n\n"
-            f"🎯 Уровень: {fp(level)}  (4ч, значимый)\n"
-            f"📍 Сейчас: {fp(price)}  (до уровня {dist:.2f}%)\n\n"
-            f"📋 {what}\n\n"
-            f"⚠️ Это НЕ сигнал на вход — предупреждение о подходе к уровню. "
-            f"Жди реакцию: отбой (свеча развернулась) или пробой (закрытие за уровнем + объём). "
-            f"Не входи заранее.\n"
-            f"📊 https://www.bybit.com/trade/usdt/{sym}?interval=60")
-
-def get_trend_4h(candles):
-    closes = [c[4] for c in candles]
-    if len(closes) < 20: return None
-    ma20 = sum(closes[-20:])/20
-    if closes[-1] > ma20: return 'up'
-    if closes[-1] < ma20: return 'down'
-    return None
-
-# ===== КАРТОЧКА =====
 def fp(p):
     if p >= 1: return f"{p:.4f}"
     if p >= 0.01: return f"{p:.5f}"
     return f"{p:.7f}"
 
-def build_card(sym, info):
-    s = sym.replace("USDT","")
-    entry = info["entry_price"]; stop = info["stop_loss"]; brk = info["break_level"]
-    nxt = info["next_level"]; direction = info["direction"]
-    # тейк: строго 1:3 от стопа (сохраняет прибыльную математику).
-    # next_level каскада обычно слишком близко (0.3-1.5%) и ломает R:R — не используем как цель.
-    risk = abs(entry - stop)
-    take = entry + risk*3 if direction=="LONG" else entry - risk*3
-    take_src = "1:3 от стопа"
-    # но если ПОСЛЕДНИЙ уровень каскада дальше тейка 1:3 — цель можно тянуть до него
-    if info["levels"]:
-        last_lvl = info["levels"][-1]
-        if direction=="LONG" and last_lvl > take:
-            take = last_lvl; take_src = "последний уровень каскада"
-        elif direction=="SHORT" and last_lvl < take:
-            take = last_lvl; take_src = "последний уровень каскада"
-    risk_pct = risk/entry*100
-    reward_pct = abs(take-entry)/entry*100
+def build_card(sym, s):
+    name = sym.replace("USDT","")
+    risk_pct = s['risk_pct']
+    reward_pct = s['reward_pct']
     rr = reward_pct/risk_pct if risk_pct else 0
-    levels_str = " → ".join(fp(l) for l in info["levels"])
-    if direction == "LONG":
-        head = f"🟢 <b>ЛОНГ: {s}/USDT</b>  (пробой каскада вверх)"
-        why = (f"Цена пробила первый уровень каскада сопротивлений {fp(brk)} "
-               f"вверх, с объёмом и поджатием (минимумы росли перед пробоем). "
-               f"Ожидание: импульс к следующим уровням каскада.")
+    if s['side'] == "long":
+        head = f"🟢 <b>ЛОНГ (ловля ножа): {name}/USDT</b>"
+        what = (f"Резкое ПАДЕНИЕ -{s['impulse']:.1f}% (нож с {fp(s['peak'])} до дна {fp(s['extreme'])}). "
+                f"Цена оттолкнулась от дна: зелёная свеча +{s['bounce']:.1f}% с объёмом ×{s['vol_x']:.1f} "
+                f"(покупатель пришёл). Вход на отскоке вверх.")
+        stop_line = f"🛑 <b>Stop:</b> {fp(s['sl'])}  под дно ножа"
+        take_line = f"✅ <b>Take:</b> {fp(s['tp'])}  вверх ({s['tp_src']})"
     else:
-        head = f"🔴 <b>ШОРТ: {s}/USDT</b>  (пробой каскада вниз)"
-        why = (f"Цена пробила первый уровень каскада поддержек {fp(brk)} "
-               f"вниз, с объёмом и поджатием (максимумы снижались перед пробоем). "
-               f"Ожидание: импульс к следующим уровням каскада вниз.")
+        head = f"🔴 <b>ШОРТ (ловля пампа): {name}/USDT</b>"
+        what = (f"Резкий ВЗЛЁТ +{s['impulse']:.1f}% (памп с {fp(s['trough'])} до пика {fp(s['extreme'])}). "
+                f"Цена откатила от пика: красная свеча -{s['bounce']:.1f}% с объёмом ×{s['vol_x']:.1f} "
+                f"(продавец пришёл). Вход на откате вниз.")
+        stop_line = f"🛑 <b>Stop:</b> {fp(s['sl'])}  над пик пампа"
+        take_line = f"✅ <b>Take:</b> {fp(s['tp'])}  вниз ({s['tp_src']})"
     return (f"{head}\n\n"
-            f"🔨 Пробили уровень: {fp(brk)}\n"
-            f"🪜 Каскад уровней: {levels_str}\n\n"
-            f"💰 <b>Вход:</b> {fp(entry)}\n"
-            f"🛑 <b>Stop:</b> {fp(stop)}  (риск {risk_pct:.2f}%)\n"
-            f"✅ <b>Take:</b> {fp(take)}  (+{reward_pct:.2f}%, {take_src})\n"
-            f"⚖️ Риск/прибыль ≈ 1:{rr:.1f}\n\n"
-            f"📋 <b>Почему:</b> {why}\n\n"
-            f"⚠️ Пробой мог быть ложным (шип за уровень → возврат). "
-            f"Стоп поставлен за уровень пробоя — если цена вернулась за него, выходи. "
-            f"Стоп/тейк не двигай.\n"
+            f"💰 <b>Вход:</b> {fp(s['entry'])}\n"
+            f"{stop_line}\n"
+            f"{take_line}\n\n"
+            f"📉 <b>СТОП-ЛОСС: -{risk_pct:.2f}%</b>\n"
+            f"📈 <b>ТЕЙК-ПРОФИТ: +{reward_pct:.2f}%</b>\n"
+            f"⚖️ Риск/прибыль: 1:{rr:.1f}\n\n"
+            f"📋 {what}\n\n"
+            f"⚠️ Ловля ножа/пампа — опасно: импульс может продолжиться. "
+            f"Стоп за экстремум обязателен, не двигай. Без большого плеча.\n"
             f"📊 https://www.bybit.com/trade/usdt/{sym}?interval=15")
 
 def run():
-    log.info("🤖 Каскадный бот (пробой каскада уровней, 4ч→15м) запущен")
-    log.info(f"Монеты топ{TOP_N} | уровни {CASCADE_CONFIG['min_levels']}-{CASCADE_CONFIG['max_levels']} "
-             f"расст {CASCADE_CONFIG['level_dist_min']*100:.1f}-{CASCADE_CONFIG['level_dist_max']*100:.1f}% "
-             f"окно {CASCADE_CONFIG['extrema_window']} | тренд-фильтр {USE_TREND_FILTER}")
-    send_tg(f"🤖 <b>Каскадный бот запущен</b>\nУровни на 4ч → пробой на 15м → сигнал с карточкой.\nЖду пробои каскадов. Сигналов будет немного — каскады редки, это нормально.")
+    log.info("🤖 Бот ловли ножа (лонг+шорт, вход на развороте) запущен")
+    log.info(f"Топ{TOP_N} | импульс>={DROP_PCT}% за {DROP_WIN}св | Лонг={ENABLE_LONG} Шорт={ENABLE_SHORT} | объём×{VOL_MULT}")
+    send_tg(f"🤖 <b>Бот ловли ножа запущен</b>\n🟢 Резкое падение → отскок → лонг\n🔴 Резкий памп → откат → шорт\nВход только на РАЗВОРОТЕ. Стоп/тейк в % в каждой карточке. 1:3.")
     while True:
         try:
             symbols = get_symbols()
             if not symbols:
                 log.warning("нет символов, повтор 60с"); time.sleep(60); continue
-            log.info(f"Сканирую {len(symbols)} монет на каскадные пробои...")
+            log.info(f"Сканирую {len(symbols)} монет на ножи/пампы...")
             found = 0; now = time.time()
             for sym in symbols:
-                if sym in last_signal and now - last_signal[sym] < COOLDOWN: continue
                 try:
-                    h4 = get_klines(sym, "240", 100)
-                    if not h4 or len(h4) < 40: continue
-                    m15 = get_klines(sym, "15", 60)
-                    if not m15 or len(m15) < 30: continue
-                    trend = get_trend_4h(h4) if USE_TREND_FILTER else None
-                    signal, info = check_cascade_breakout_mtf(h4, m15, CASCADE_CONFIG, trend)
+                    m = get_klines(sym, "15", 60)
+                    if not m: continue
+                    sig = None
+                    if ENABLE_LONG:  sig = check_knife_long(m)
+                    if not sig and ENABLE_SHORT: sig = check_knife_short(m)
+                    if not sig: continue
+                    key = f"{sym}_{sig['side']}"
+                    if key in last_signal and now - last_signal[key] < COOLDOWN: continue
                 except Exception as e:
                     log.warning(f"{sym}: {e}"); continue
-                if signal:
-                    log.info(f"✅ {info['direction']} {sym} пробой {info['break_level']}")
-                    send_tg(build_card(sym, info)); last_signal[sym] = now; found += 1
-                # отдельный сигнал: подход к сильному 4ч уровню
-                if ENABLE_LEVEL_APPROACH:
-                    try:
-                        price = m15[-1][4]
-                        approaches = check_approach(h4, price)
-                        if approaches:
-                            kind, lvl, dist = approaches[0]
-                            akey = f"{sym}_approach_{round(lvl,6)}"
-                            if akey not in last_signal or now - last_signal[akey] >= COOLDOWN:
-                                log.info(f"⚡ ПОДХОД {sym} к {kind} {lvl:.6f} ({dist:.2f}%)")
-                                send_tg(approach_card(sym, kind, lvl, dist, price))
-                                last_signal[akey] = now; found += 1
-                    except Exception as e:
-                        log.warning(f"{sym} approach: {e}")
-                time.sleep(0.4)
+                log.info(f"✅ {sig['side'].upper()} {sym} импульс {sig['impulse']:.1f}%")
+                send_tg(build_card(sym, sig)); last_signal[key] = now; found += 1
+                time.sleep(0.3)
             log.info(f"Скан завершён. Сигналов: {found}")
         except Exception as e: log.error(f"цикл: {e}")
         time.sleep(SCAN_EVERY)
