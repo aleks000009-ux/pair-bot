@@ -19,6 +19,11 @@ TOP_N       = int(os.environ.get("TOP_N", "60"))
 SCAN_EVERY  = int(os.environ.get("SCAN_EVERY", "600"))
 COOLDOWN    = int(os.environ.get("COOLDOWN", "3600"))
 USE_TREND_FILTER = os.environ.get("USE_TREND_FILTER", "1") == "1"
+# Подход к сильным 4ч уровням (отдельный сигнал)
+ENABLE_LEVEL_APPROACH = os.environ.get("ENABLE_LEVEL_APPROACH", "1") == "1"
+LEVEL_WINDOW   = int(os.environ.get("LEVEL_WINDOW", "6"))    # окно поиска 4ч экстремумов
+LEVEL_LOOKBACK = int(os.environ.get("LEVEL_LOOKBACK", "60")) # за сколько 4ч свечей (~10 дней)
+APPROACH_PCT   = float(os.environ.get("APPROACH_PCT", "1.0"))# за сколько % до уровня слать
 
 CASCADE_CONFIG = {
     "min_levels": int(os.environ.get("MIN_LEVELS", "3")),
@@ -156,6 +161,58 @@ def check_cascade_breakout_mtf(high_tf, low_tf, config, trend=None):
                 "entry_price":last_close}
     return False, {}
 
+def find_key_levels(h4):
+    """Значимые 4ч уровни (крупные максимумы/минимумы за LEVEL_LOOKBACK свечей)."""
+    candles = h4[-LEVEL_LOOKBACK:] if len(h4) > LEVEL_LOOKBACK else h4
+    highs = [c[2] for c in candles]; lows = [c[3] for c in candles]
+    W = LEVEL_WINDOW
+    res, sup = [], []
+    for i in range(W, len(candles)-W):
+        if highs[i] >= max(highs[i-W:i+W+1]): res.append(highs[i])
+        if lows[i] <= min(lows[i-W:i+W+1]): sup.append(lows[i])
+    def merge(levels):
+        levels = sorted(levels); m = []
+        for l in levels:
+            if m and abs(l-m[-1])/m[-1] < 0.003: m[-1] = (m[-1]+l)/2
+            else: m.append(l)
+        return m
+    return merge(res), merge(sup)
+
+def check_approach(h4, price):
+    res, sup = find_key_levels(h4)
+    out = []
+    for lvl in res:
+        if lvl > price:
+            d = (lvl-price)/price*100
+            if d <= APPROACH_PCT: out.append(('resistance', lvl, d))
+    for lvl in sup:
+        if lvl < price:
+            d = (price-lvl)/price*100
+            if d <= APPROACH_PCT: out.append(('support', lvl, d))
+    out.sort(key=lambda x: x[2])
+    return out
+
+def approach_card(sym, kind, level, dist, price):
+    s = sym.replace("USDT","")
+    if kind == 'resistance':
+        head = f"⚡ <b>{s}/USDT подходит к 4ч СОПРОТИВЛЕНИЮ</b>"
+        what = (f"Цена снизу подходит к сильному 4-часовому уровню {fp(level)}. "
+                f"Здесь возможны два сценария: <b>отскок вниз</b> (уровень держит) "
+                f"или <b>пробой вверх</b> (уровень сносят). Смотри реакцию цены у уровня.")
+    else:
+        head = f"⚡ <b>{s}/USDT подходит к 4ч ПОДДЕРЖКЕ</b>"
+        what = (f"Цена сверху подходит к сильному 4-часовому уровню {fp(level)}. "
+                f"Возможны: <b>отскок вверх</b> (поддержка держит) или "
+                f"<b>пробой вниз</b> (поддержку ломают). Смотри реакцию у уровня.")
+    return (f"{head}\n\n"
+            f"🎯 Уровень: {fp(level)}  (4ч, значимый)\n"
+            f"📍 Сейчас: {fp(price)}  (до уровня {dist:.2f}%)\n\n"
+            f"📋 {what}\n\n"
+            f"⚠️ Это НЕ сигнал на вход — предупреждение о подходе к уровню. "
+            f"Жди реакцию: отбой (свеча развернулась) или пробой (закрытие за уровнем + объём). "
+            f"Не входи заранее.\n"
+            f"📊 https://www.bybit.com/trade/usdt/{sym}?interval=60")
+
 def get_trend_4h(candles):
     closes = [c[4] for c in candles]
     if len(closes) < 20: return None
@@ -240,6 +297,20 @@ def run():
                 if signal:
                     log.info(f"✅ {info['direction']} {sym} пробой {info['break_level']}")
                     send_tg(build_card(sym, info)); last_signal[sym] = now; found += 1
+                # отдельный сигнал: подход к сильному 4ч уровню
+                if ENABLE_LEVEL_APPROACH:
+                    try:
+                        price = m15[-1][4]
+                        approaches = check_approach(h4, price)
+                        if approaches:
+                            kind, lvl, dist = approaches[0]
+                            akey = f"{sym}_approach_{round(lvl,6)}"
+                            if akey not in last_signal or now - last_signal[akey] >= COOLDOWN:
+                                log.info(f"⚡ ПОДХОД {sym} к {kind} {lvl:.6f} ({dist:.2f}%)")
+                                send_tg(approach_card(sym, kind, lvl, dist, price))
+                                last_signal[akey] = now; found += 1
+                    except Exception as e:
+                        log.warning(f"{sym} approach: {e}")
                 time.sleep(0.4)
             log.info(f"Скан завершён. Сигналов: {found}")
         except Exception as e: log.error(f"цикл: {e}")
