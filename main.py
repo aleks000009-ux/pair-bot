@@ -1,6 +1,5 @@
 import os
 import time
-import math
 import requests
 from datetime import datetime, timezone
 
@@ -12,21 +11,16 @@ CHAT_ID = os.environ["CHAT_ID"]
 # --- отбор монет ---
 MIN_TURNOVER_24H = 2_000_000   # лёгкий фильтр от неликвида. 0 = ВСЕ монеты
 
-# --- база значимых 4H-уровней (обновляется раз в час) ---
-LEVEL_TF = "240"               # 4 часа
-LEVEL_LIMIT = 200              # ~33 дня истории
-PIVOT_W = 2                    # локальный экстремум: выше/ниже 2 соседей с каждой стороны
-PROM_SPAN = 30                 # окно оценки «торчащести» уровня (свечей в каждую сторону)
-MIN_PROM = 0.03                # МИН. prominence 3% — уровень должен реально торчать (это и есть «глобальность»)
-CLUSTER_TOL = 0.005            # 0.5% — близкие уровни сливаются в один зональный уровень
-MAX_LEVELS_PER_SIDE = 8        # держим только N сильнейших уровней на сторону
+# --- уровни (как на сайте: max HIGH / min LOW за N свечей на 4ч и 1д) ---
+BARS_BACK = 100                # окно для экстремума (как findLevels на сайте)
+LEVEL_LIMIT = 150              # сколько свечей тянуть
 REFRESH_LEVELS_SEC = 3600      # пересобирать базу раз в час
 
+# таймфреймы уровней: (interval, подпись)
+LEVEL_TFS = [("240", "4ч"), ("D", "1д")]
+
 # --- радар подхода ---
-APPROACH_PCT = 0.005           # алерт, когда цена в пределах 0.5% от уровня
-CASCADE_RANGE = 0.03           # соседние уровни в пределах 3% = каскад
-VOID_TOL = 0.002               # уровень = ATH/ATL если в 0.2% от глобального экстремума
-ALERT_MIN_TOUCHES = 1          # мин. касаний, чтобы уровень был «хорошим» (1 = любой сильный свинг)
+APPROACH_PCT = 0.007           # алерт, когда цена в пределах 0.7% от уровня
 ALERT_COOLDOWN = 7200          # не повторять один уровень чаще раза в 2ч
 
 REQUEST_SLEEP = 0.12           # пауза между запросами к прокси (только при сборке базы)
@@ -45,7 +39,6 @@ def tg(msg):
 
 # ==================== ДАННЫЕ ====================
 def get_tickers():
-    """{symbol: (lastPrice, turnover24h)} по всем USDT-перпам одним запросом."""
     try:
         r = requests.get(f"{PROXY}/tickers?category=linear", timeout=20)
         data = r.json()["result"]["list"]
@@ -63,11 +56,12 @@ def get_tickers():
         except Exception:
             continue
         if price > 0 and turnover >= MIN_TURNOVER_24H:
-            out[sym] = (price, turnover)
+            out[sym] = price
     return out
 
 
-def get_klines(symbol, interval, limit):
+def get_hl(symbol, interval, limit):
+    """Возвращает (max_high, min_low) за последние BARS_BACK закрытых свечей."""
     try:
         url = (f"{PROXY}/kline?category=linear&symbol={symbol}"
                f"&interval={interval}&limit={limit}")
@@ -75,107 +69,28 @@ def get_klines(symbol, interval, limit):
         raw = r.json()["result"]["list"]
     except Exception:
         return None
-    raw = raw[::-1]  # новые свечи -> в хронологический порядок
-    candles = [{"high": float(k[2]), "low": float(k[3])} for k in raw]
-    return candles[:-1]  # только закрытые свечи
+    raw = raw[::-1]              # новые -> в хронологический порядок
+    raw = raw[:-1]              # только закрытые свечи
+    if len(raw) < 5:
+        return None
+    sl = raw[-BARS_BACK:] if len(raw) > BARS_BACK else raw
+    hh = max(float(k[2]) for k in sl)
+    ll = min(float(k[3]) for k in sl)
+    return hh, ll
 
 
-# ==================== PROMINENCE (глобальность уровня) ====================
-def prom_high(candles, i, span):
-    """Насколько вершина торчит: спад от пика до высшей из окружающих впадин."""
-    h = candles[i]["high"]
-    left_min = h
-    j = i - 1
-    while j >= 0 and i - j <= span:
-        if candles[j]["high"] > h:
-            break
-        left_min = min(left_min, candles[j]["low"])
-        j -= 1
-    right_min = h
-    j = i + 1
-    while j < len(candles) and j - i <= span:
-        if candles[j]["high"] > h:
-            break
-        right_min = min(right_min, candles[j]["low"])
-        j += 1
-    col = max(left_min, right_min)
-    return (h - col) / h if h > 0 else 0
-
-
-def prom_low(candles, i, span):
-    """Насколько впадина торчит вниз."""
-    l = candles[i]["low"]
-    left_max = l
-    j = i - 1
-    while j >= 0 and i - j <= span:
-        if candles[j]["low"] < l:
-            break
-        left_max = max(left_max, candles[j]["high"])
-        j -= 1
-    right_max = l
-    j = i + 1
-    while j < len(candles) and j - i <= span:
-        if candles[j]["low"] < l:
-            break
-        right_max = max(right_max, candles[j]["high"])
-        j += 1
-    col = min(left_max, right_max)
-    return (col - l) / l if l > 0 else 0
-
-
-def find_levels(candles, kind):
-    """Находит значимые (торчащие) уровни: [(price, touches, prominence), ...]."""
-    w = PIVOT_W
-    n = len(candles)
-    picks = []  # (price, prominence)
-    for i in range(w, n - w):
-        window = candles[i - w:i + w + 1]
-        if kind == "high" and candles[i]["high"] == max(c["high"] for c in window):
-            p = prom_high(candles, i, PROM_SPAN)
-            if p >= MIN_PROM:
-                picks.append((candles[i]["high"], p))
-        if kind == "low" and candles[i]["low"] == min(c["low"] for c in window):
-            p = prom_low(candles, i, PROM_SPAN)
-            if p >= MIN_PROM:
-                picks.append((candles[i]["low"], p))
-
-    if not picks:
-        return []
-
-    # кластеризуем близкие уровни в зоны
-    picks.sort(key=lambda x: x[0])
-    clusters = [[picks[0]]]
-    for pr in picks[1:]:
-        if (pr[0] - clusters[-1][-1][0]) / clusters[-1][-1][0] <= CLUSTER_TOL:
-            clusters[-1].append(pr)
-        else:
-            clusters.append([pr])
-
-    levels = []
-    for cl in clusters:
-        price = sum(x[0] for x in cl) / len(cl)
-        touches = len(cl)
-        prominence = max(x[1] for x in cl)
-        levels.append((price, touches, prominence))
-
-    # оставляем N сильнейших по (prominence * touches)
-    levels.sort(key=lambda x: x[2] * x[1], reverse=True)
-    return levels[:MAX_LEVELS_PER_SIDE]
-
-
+# ==================== БАЗА УРОВНЕЙ ====================
 def build_levels(symbols):
     db = {}
     for sym in symbols:
-        c = get_klines(sym, LEVEL_TF, LEVEL_LIMIT)
-        time.sleep(REQUEST_SLEEP)
-        if not c or len(c) < 60:
-            continue
-        db[sym] = {
-            "res": find_levels(c, "high"),
-            "sup": find_levels(c, "low"),
-            "high_all": max(x["high"] for x in c),
-            "low_all": min(x["low"] for x in c),
-        }
+        entry = {}
+        for interval, label in LEVEL_TFS:
+            hl = get_hl(sym, interval, LEVEL_LIMIT)
+            time.sleep(REQUEST_SLEEP)
+            if hl:
+                entry[label] = hl   # (hh, ll)
+        if entry:
+            db[sym] = entry
     return db
 
 
@@ -190,79 +105,40 @@ def fmt(p):
     return f"{p:.7f}"
 
 
-def is_round(level):
-    if level <= 0:
-        return False
-    exp = math.floor(math.log10(level))
-    base = 10 ** exp
-    for step in (base, base / 2):
-        r = level / step
-        if abs(r - round(r)) < 0.01:
-            return True
-    return False
-
-
-def evaluate(price, db):
-    """Лучший глобальный уровень в зоне подхода или None."""
+def evaluate(price, entry):
+    """Ближайший глобальный уровень (max/min за 100 свечей на 4ч/1д) в зоне подхода."""
     best = None
-    best_score = -1
+    best_dist = APPROACH_PCT + 1
 
-    for lvl, touches, prom in db["res"]:
-        dist = (lvl - price) / price
-        if not (0 <= dist <= APPROACH_PCT):
-            continue
-        cascade_n = sum(1 for p, _, _ in db["res"]
-                        if lvl * 1.0005 < p <= lvl * (1 + CASCADE_RANGE))
-        void = lvl >= db["high_all"] * (1 - VOID_TOL)
-        rnd = is_round(lvl)
-        if not (touches >= ALERT_MIN_TOUCHES or void or cascade_n >= 1):
-            continue
-        score = prom * 100 + touches + (3 if void else 0) + 2 * cascade_n
-        if score > best_score:
-            best_score = score
-            best = ("сопротивление ↑", lvl, dist, touches, prom, cascade_n, void, rnd)
-
-    for lvl, touches, prom in db["sup"]:
-        dist = (price - lvl) / price
-        if not (0 <= dist <= APPROACH_PCT):
-            continue
-        cascade_n = sum(1 for p, _, _ in db["sup"]
-                        if lvl * (1 - CASCADE_RANGE) <= p < lvl * 0.9995)
-        void = lvl <= db["low_all"] * (1 + VOID_TOL)
-        rnd = is_round(lvl)
-        if not (touches >= ALERT_MIN_TOUCHES or void or cascade_n >= 1):
-            continue
-        score = prom * 100 + touches + (3 if void else 0) + 2 * cascade_n
-        if score > best_score:
-            best_score = score
-            best = ("поддержка ↓", lvl, dist, touches, prom, cascade_n, void, rnd)
+    for label, (hh, ll) in entry.items():
+        # сопротивление = экстремум-хай ВЫШЕ цены
+        if hh > price:
+            d = (hh - price) / price
+            if d <= APPROACH_PCT and d < best_dist:
+                best_dist = d
+                best = (f"{label} сопротивление ↑", hh, d)
+        # поддержка = экстремум-лоу НИЖЕ цены
+        if ll < price:
+            d = (price - ll) / price
+            if d <= APPROACH_PCT and d < best_dist:
+                best_dist = d
+                best = (f"{label} поддержка ↓", ll, d)
 
     return best
 
 
 def build_alert(symbol, price, info):
-    kind, lvl, dist, touches, prom, cascade_n, void, rnd = info
-    tags = []
-    if void:
-        tags.append("🌌 ПУСТОТА за уровнем (ATH/ATL)")
-    if cascade_n >= 1:
-        tags.append(f"⛓ Каскад: ещё {cascade_n} уровн. за ним")
-    if rnd:
-        tags.append("🔢 Круглый уровень")
-    tag_block = ("\n" + "\n".join(tags)) if tags else ""
-
+    kind, lvl, dist = info
     return (
         f"🎯 <b>ПОДХОД К УРОВНЮ</b> — {symbol}\n\n"
-        f"Цена {fmt(price)} → {kind} <b>{fmt(lvl)}</b> ({dist*100:.2f}%)\n"
-        f"Сила уровня: {prom*100:.0f}% | касаний: {touches}"
-        f"{tag_block}\n\n"
+        f"Цена {fmt(price)} → {kind} <b>{fmt(lvl)}</b> ({dist*100:.2f}%)\n\n"
         f"👉 Смотри стакан: плотность / закол / срыв стопов"
     )
 
 
 # ==================== MAIN ====================
 def main():
-    tg("📡 Радар глобальных уровней запущен")
+    tg("📡 Радар глобальных уровней запущен (max/min 100 свечей · 4ч + 1д)")
     levels_db = {}
     last_build = 0
     last_alert = {}
@@ -274,18 +150,18 @@ def main():
 
         if now - last_build > REFRESH_LEVELS_SEC or not levels_db:
             ts = datetime.now(timezone.utc).strftime("%H:%M:%S")
-            print(f"[{ts}] Строю базу глобальных 4H-уровней по {len(symbols)} монетам...")
+            print(f"[{ts}] Строю базу уровней по {len(symbols)} монетам...")
             levels_db = build_levels(symbols)
             last_build = time.time()
             print(f"База готова: {len(levels_db)} монет")
 
         alerts = 0
         for sym in symbols:
-            db = levels_db.get(sym)
-            if not db:
+            entry = levels_db.get(sym)
+            if not entry:
                 continue
-            price = tickers[sym][0]
-            info = evaluate(price, db)
+            price = tickers[sym]
+            info = evaluate(price, entry)
             if not info:
                 continue
 
