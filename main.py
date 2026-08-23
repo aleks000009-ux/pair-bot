@@ -15,16 +15,19 @@ MIN_TURNOVER_24H = 2_000_000   # лёгкий фильтр от неликвид
 # --- база значимых 4H-уровней (обновляется раз в час) ---
 LEVEL_TF = "240"               # 4 часа
 LEVEL_LIMIT = 200              # ~33 дня истории
-SWING_W = 3                    # окно свинга (макс/мин среди 3 свечей слева и справа)
-CLUSTER_TOL = 0.003            # 0.3% — близкие уровни сливаются в один
+PIVOT_W = 2                    # локальный экстремум: выше/ниже 2 соседей с каждой стороны
+PROM_SPAN = 30                 # окно оценки «торчащести» уровня (свечей в каждую сторону)
+MIN_PROM = 0.03                # МИН. prominence 3% — уровень должен реально торчать (это и есть «глобальность»)
+CLUSTER_TOL = 0.005            # 0.5% — близкие уровни сливаются в один зональный уровень
+MAX_LEVELS_PER_SIDE = 8        # держим только N сильнейших уровней на сторону
 REFRESH_LEVELS_SEC = 3600      # пересобирать базу раз в час
 
 # --- радар подхода ---
 APPROACH_PCT = 0.005           # алерт, когда цена в пределах 0.5% от уровня
 CASCADE_RANGE = 0.03           # соседние уровни в пределах 3% = каскад
 VOID_TOL = 0.002               # уровень = ATH/ATL если в 0.2% от глобального экстремума
-ALERT_MIN_TOUCHES = 1          # мин. касаний, чтобы уровень был «хорошим» (1 = любой чёткий 4H-свинг)
-ALERT_COOLDOWN = 7200          # не повторять один и тот же уровень чаще, чем раз в 2ч
+ALERT_MIN_TOUCHES = 1          # мин. касаний, чтобы уровень был «хорошим» (1 = любой сильный свинг)
+ALERT_COOLDOWN = 7200          # не повторять один уровень чаще раза в 2ч
 
 REQUEST_SLEEP = 0.12           # пауза между запросами к прокси (только при сборке базы)
 LOOP_PAUSE = 30                # цикл радара, сек (лёгкий — только /tickers)
@@ -73,39 +76,91 @@ def get_klines(symbol, interval, limit):
     except Exception:
         return None
     raw = raw[::-1]  # новые свечи -> в хронологический порядок
-    candles = []
-    for k in raw:
-        candles.append({
-            "high": float(k[2]),
-            "low": float(k[3]),
-        })
+    candles = [{"high": float(k[2]), "low": float(k[3])} for k in raw]
     return candles[:-1]  # только закрытые свечи
 
 
-# ==================== 4H-УРОВНИ ====================
-def swings(candles, w, kind):
-    vals = []
+# ==================== PROMINENCE (глобальность уровня) ====================
+def prom_high(candles, i, span):
+    """Насколько вершина торчит: спад от пика до высшей из окружающих впадин."""
+    h = candles[i]["high"]
+    left_min = h
+    j = i - 1
+    while j >= 0 and i - j <= span:
+        if candles[j]["high"] > h:
+            break
+        left_min = min(left_min, candles[j]["low"])
+        j -= 1
+    right_min = h
+    j = i + 1
+    while j < len(candles) and j - i <= span:
+        if candles[j]["high"] > h:
+            break
+        right_min = min(right_min, candles[j]["low"])
+        j += 1
+    col = max(left_min, right_min)
+    return (h - col) / h if h > 0 else 0
+
+
+def prom_low(candles, i, span):
+    """Насколько впадина торчит вниз."""
+    l = candles[i]["low"]
+    left_max = l
+    j = i - 1
+    while j >= 0 and i - j <= span:
+        if candles[j]["low"] < l:
+            break
+        left_max = max(left_max, candles[j]["high"])
+        j -= 1
+    right_max = l
+    j = i + 1
+    while j < len(candles) and j - i <= span:
+        if candles[j]["low"] < l:
+            break
+        right_max = max(right_max, candles[j]["high"])
+        j += 1
+    col = min(left_max, right_max)
+    return (col - l) / l if l > 0 else 0
+
+
+def find_levels(candles, kind):
+    """Находит значимые (торчащие) уровни: [(price, touches, prominence), ...]."""
+    w = PIVOT_W
     n = len(candles)
+    picks = []  # (price, prominence)
     for i in range(w, n - w):
         window = candles[i - w:i + w + 1]
         if kind == "high" and candles[i]["high"] == max(c["high"] for c in window):
-            vals.append(candles[i]["high"])
+            p = prom_high(candles, i, PROM_SPAN)
+            if p >= MIN_PROM:
+                picks.append((candles[i]["high"], p))
         if kind == "low" and candles[i]["low"] == min(c["low"] for c in window):
-            vals.append(candles[i]["low"])
-    return vals
+            p = prom_low(candles, i, PROM_SPAN)
+            if p >= MIN_PROM:
+                picks.append((candles[i]["low"], p))
 
-
-def cluster_levels(prices, tol):
-    if not prices:
+    if not picks:
         return []
-    prices = sorted(prices)
-    clusters = [[prices[0]]]
-    for p in prices[1:]:
-        if (p - clusters[-1][-1]) / clusters[-1][-1] <= tol:
-            clusters[-1].append(p)
+
+    # кластеризуем близкие уровни в зоны
+    picks.sort(key=lambda x: x[0])
+    clusters = [[picks[0]]]
+    for pr in picks[1:]:
+        if (pr[0] - clusters[-1][-1][0]) / clusters[-1][-1][0] <= CLUSTER_TOL:
+            clusters[-1].append(pr)
         else:
-            clusters.append([p])
-    return [(sum(c) / len(c), len(c)) for c in clusters]
+            clusters.append([pr])
+
+    levels = []
+    for cl in clusters:
+        price = sum(x[0] for x in cl) / len(cl)
+        touches = len(cl)
+        prominence = max(x[1] for x in cl)
+        levels.append((price, touches, prominence))
+
+    # оставляем N сильнейших по (prominence * touches)
+    levels.sort(key=lambda x: x[2] * x[1], reverse=True)
+    return levels[:MAX_LEVELS_PER_SIDE]
 
 
 def build_levels(symbols):
@@ -113,11 +168,11 @@ def build_levels(symbols):
     for sym in symbols:
         c = get_klines(sym, LEVEL_TF, LEVEL_LIMIT)
         time.sleep(REQUEST_SLEEP)
-        if not c or len(c) < 40:
+        if not c or len(c) < 60:
             continue
         db[sym] = {
-            "res": cluster_levels(swings(c, SWING_W, "high"), CLUSTER_TOL),
-            "sup": cluster_levels(swings(c, SWING_W, "low"), CLUSTER_TOL),
+            "res": find_levels(c, "high"),
+            "sup": find_levels(c, "low"),
             "high_all": max(x["high"] for x in c),
             "low_all": min(x["low"] for x in c),
         }
@@ -136,7 +191,6 @@ def fmt(p):
 
 
 def is_round(level):
-    """Психологически круглый уровень (консервативно)."""
     if level <= 0:
         return False
     exp = math.floor(math.log10(level))
@@ -149,49 +203,45 @@ def is_round(level):
 
 
 def evaluate(price, db):
-    """Возвращает лучший уровень в зоне подхода или None.
-    Уровень «годен», если касаний >= ALERT_MIN_TOUCHES ИЛИ есть пустота/каскад.
-    Среди годных выбираем самый значимый (score) — просто чтобы не слать дубли по монете."""
+    """Лучший глобальный уровень в зоне подхода или None."""
     best = None
     best_score = -1
 
-    # --- сопротивление сверху ---
-    for lvl, touches in db["res"]:
+    for lvl, touches, prom in db["res"]:
         dist = (lvl - price) / price
         if not (0 <= dist <= APPROACH_PCT):
             continue
-        cascade_n = sum(1 for p, _ in db["res"]
+        cascade_n = sum(1 for p, _, _ in db["res"]
                         if lvl * 1.0005 < p <= lvl * (1 + CASCADE_RANGE))
         void = lvl >= db["high_all"] * (1 - VOID_TOL)
         rnd = is_round(lvl)
         if not (touches >= ALERT_MIN_TOUCHES or void or cascade_n >= 1):
             continue
-        score = touches + (3 if void else 0) + 2 * cascade_n + (1 if rnd else 0)
+        score = prom * 100 + touches + (3 if void else 0) + 2 * cascade_n
         if score > best_score:
             best_score = score
-            best = ("сопротивление ↑", lvl, dist, touches, cascade_n, void, rnd)
+            best = ("сопротивление ↑", lvl, dist, touches, prom, cascade_n, void, rnd)
 
-    # --- поддержка снизу ---
-    for lvl, touches in db["sup"]:
+    for lvl, touches, prom in db["sup"]:
         dist = (price - lvl) / price
         if not (0 <= dist <= APPROACH_PCT):
             continue
-        cascade_n = sum(1 for p, _ in db["sup"]
+        cascade_n = sum(1 for p, _, _ in db["sup"]
                         if lvl * (1 - CASCADE_RANGE) <= p < lvl * 0.9995)
         void = lvl <= db["low_all"] * (1 + VOID_TOL)
         rnd = is_round(lvl)
         if not (touches >= ALERT_MIN_TOUCHES or void or cascade_n >= 1):
             continue
-        score = touches + (3 if void else 0) + 2 * cascade_n + (1 if rnd else 0)
+        score = prom * 100 + touches + (3 if void else 0) + 2 * cascade_n
         if score > best_score:
             best_score = score
-            best = ("поддержка ↓", lvl, dist, touches, cascade_n, void, rnd)
+            best = ("поддержка ↓", lvl, dist, touches, prom, cascade_n, void, rnd)
 
     return best
 
 
 def build_alert(symbol, price, info):
-    kind, lvl, dist, touches, cascade_n, void, rnd = info
+    kind, lvl, dist, touches, prom, cascade_n, void, rnd = info
     tags = []
     if void:
         tags.append("🌌 ПУСТОТА за уровнем (ATH/ATL)")
@@ -204,7 +254,7 @@ def build_alert(symbol, price, info):
     return (
         f"🎯 <b>ПОДХОД К УРОВНЮ</b> — {symbol}\n\n"
         f"Цена {fmt(price)} → {kind} <b>{fmt(lvl)}</b> ({dist*100:.2f}%)\n"
-        f"Значимость 4H: {touches} касаний"
+        f"Сила уровня: {prom*100:.0f}% | касаний: {touches}"
         f"{tag_block}\n\n"
         f"👉 Смотри стакан: плотность / закол / срыв стопов"
     )
@@ -212,25 +262,23 @@ def build_alert(symbol, price, info):
 
 # ==================== MAIN ====================
 def main():
-    tg("📡 Радар уровней запущен (подход к значимым 4H-уровням по всем монетам)")
+    tg("📡 Радар глобальных уровней запущен")
     levels_db = {}
     last_build = 0
-    last_alert = {}  # "symbol:level" -> timestamp
+    last_alert = {}
 
     while True:
         tickers = get_tickers()
         symbols = list(tickers.keys())
         now = time.time()
 
-        # раз в час пересобираем базу уровней
         if now - last_build > REFRESH_LEVELS_SEC or not levels_db:
             ts = datetime.now(timezone.utc).strftime("%H:%M:%S")
-            print(f"[{ts}] Строю базу 4H-уровней по {len(symbols)} монетам...")
+            print(f"[{ts}] Строю базу глобальных 4H-уровней по {len(symbols)} монетам...")
             levels_db = build_levels(symbols)
             last_build = time.time()
             print(f"База готова: {len(levels_db)} монет")
 
-        # радар: только цены из tickers, без запросов на монету
         alerts = 0
         for sym in symbols:
             db = levels_db.get(sym)
