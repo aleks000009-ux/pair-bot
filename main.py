@@ -1,16 +1,25 @@
 import os
+import sys
 import time
 import requests
 
 # ── Конфиг из переменных окружения (Railway → Variables) ──────────────
-TG_TOKEN   = os.environ["TELEGRAM_TOKEN"]
-TG_CHAT    = os.environ["TELEGRAM_CHAT_ID"]
+def need(key):
+    v = os.environ.get(key)
+    if not v:
+        print(f"ОШИБКА: не задана переменная {key}", flush=True)
+        sys.exit(1)
+    return v
+
+TG_TOKEN   = need("BOT_TOKEN")
+TG_CHAT    = need("CHAT_ID")
 PROXY_URL  = os.environ.get("PROXY_URL", "https://bybit-proxy.aleks000009.workers.dev")
-CATEGORY   = os.environ.get("CATEGORY", "spot")            # spot | linear
-SPREAD_MIN = float(os.environ.get("SPREAD_THRESHOLD", "0.5"))   # % — порог сигнала
-TURN_MIN   = float(os.environ.get("MIN_TURNOVER_24H", "2000000"))  # USDT — отсекаем мёртвые пары
-POLL_SEC   = int(os.environ.get("POLL_INTERVAL", "10"))    # период опроса, сек
-COOLDOWN   = int(os.environ.get("ALERT_COOLDOWN", "300"))  # пауза по одному символу, сек
+CATEGORY   = os.environ.get("CATEGORY", "spot")               # spot | linear
+SPREAD_MIN = float(os.environ.get("SPREAD_THRESHOLD", "0.5")) # % — порог сигнала
+TURN_MIN   = float(os.environ.get("MIN_VOL_USD", "2000000"))  # USDT — отсекаем мёртвые пары
+POLL_SEC   = int(os.environ.get("SCAN_EVERY", "10"))          # период опроса, сек
+TOP_N      = int(os.environ.get("TOP_N", "10"))               # макс. сигналов за один проход
+COOLDOWN   = int(os.environ.get("ALERT_COOLDOWN", "300"))     # пауза по одному символу, сек
 
 _last_alert = {}   # symbol -> ts последнего сигнала
 
@@ -67,10 +76,14 @@ def main():
     while True:
         try:
             now = time.time()
+            sent = 0
             for spread, sym, bid, ask, turn in scan():
+                if sent >= TOP_N:
+                    break
                 if now - _last_alert.get(sym, 0) < COOLDOWN:
                     continue
                 _last_alert[sym] = now
+                sent += 1
                 send_telegram(
                     f"⚡️ <b>{sym}</b>  спред <b>{spread:.2f}%</b>\n"
                     f"bid {bid:g} / ask {ask:g}\n"
