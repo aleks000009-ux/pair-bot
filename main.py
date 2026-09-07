@@ -1,182 +1,85 @@
 import os
 import time
 import requests
-from datetime import datetime, timezone
 
-# ==================== КОНФИГ ====================
-PROXY = "https://bybit-proxy.aleks000009.workers.dev"
-BOT_TOKEN = os.environ["BOT_TOKEN"]
-CHAT_ID = os.environ["CHAT_ID"]
+# ── Конфиг из переменных окружения (Railway → Variables) ──────────────
+TG_TOKEN   = os.environ["TELEGRAM_TOKEN"]
+TG_CHAT    = os.environ["TELEGRAM_CHAT_ID"]
+PROXY_URL  = os.environ.get("PROXY_URL", "https://bybit-proxy.aleks000009.workers.dev")
+CATEGORY   = os.environ.get("CATEGORY", "spot")            # spot | linear
+SPREAD_MIN = float(os.environ.get("SPREAD_THRESHOLD", "0.5"))   # % — порог сигнала
+TURN_MIN   = float(os.environ.get("MIN_TURNOVER_24H", "2000000"))  # USDT — отсекаем мёртвые пары
+POLL_SEC   = int(os.environ.get("POLL_INTERVAL", "10"))    # период опроса, сек
+COOLDOWN   = int(os.environ.get("ALERT_COOLDOWN", "300"))  # пауза по одному символу, сек
 
-# --- отбор монет ---
-MIN_TURNOVER_24H = 2_000_000   # лёгкий фильтр от неликвида. 0 = ВСЕ монеты
-
-# --- уровни (как на сайте: max HIGH / min LOW за N свечей на 4ч и 1д) ---
-BARS_BACK = 100                # окно для экстремума (как findLevels на сайте)
-LEVEL_LIMIT = 150              # сколько свечей тянуть
-REFRESH_LEVELS_SEC = 3600      # пересобирать базу раз в час
-
-# таймфреймы уровней: (interval, подпись)
-LEVEL_TFS = [("240", "4ч"), ("D", "1д")]
-
-# --- радар подхода ---
-APPROACH_PCT = 0.007           # алерт, когда цена в пределах 0.7% от уровня
-ALERT_COOLDOWN = 7200          # не повторять один уровень чаще раза в 2ч
-
-REQUEST_SLEEP = 0.12           # пауза между запросами к прокси (только при сборке базы)
-LOOP_PAUSE = 30                # цикл радара, сек (лёгкий — только /tickers)
+_last_alert = {}   # symbol -> ts последнего сигнала
 
 
-# ==================== TELEGRAM ====================
-def tg(msg):
-    url = f"https://api.telegram.org/bot{BOT_TOKEN}/sendMessage"
+def log(msg):
+    print(time.strftime("%H:%M:%S"), msg, flush=True)
+
+
+def send_telegram(text):
     try:
-        requests.post(url, json={"chat_id": CHAT_ID, "text": msg,
-                                 "parse_mode": "HTML"}, timeout=15)
+        requests.post(
+            f"https://api.telegram.org/bot{TG_TOKEN}/sendMessage",
+            json={"chat_id": TG_CHAT, "text": text, "parse_mode": "HTML",
+                  "disable_web_page_preview": True},
+            timeout=10,
+        )
     except Exception as e:
-        print("TG error:", e)
+        log(f"telegram error: {e}")
 
 
-# ==================== ДАННЫЕ ====================
-def get_tickers():
-    try:
-        r = requests.get(f"{PROXY}/tickers?category=linear", timeout=20)
-        data = r.json()["result"]["list"]
-    except Exception as e:
-        print("tickers error:", e)
-        return {}
-    out = {}
-    for t in data:
-        sym = t.get("symbol", "")
-        if not sym.endswith("USDT"):
-            continue
+def fetch_tickers():
+    r = requests.get(f"{PROXY_URL}/tickers", params={"category": CATEGORY}, timeout=15)
+    r.raise_for_status()
+    data = r.json()
+    if data.get("retCode") != 0:
+        raise RuntimeError(f"bybit retCode={data.get('retCode')} {data.get('retMsg')}")
+    return data["result"]["list"]
+
+
+def scan():
+    hits = []
+    for t in fetch_tickers():
         try:
-            price = float(t.get("lastPrice", 0))
-            turnover = float(t.get("turnover24h", 0))
-        except Exception:
+            bid = float(t.get("bid1Price") or 0)
+            ask = float(t.get("ask1Price") or 0)
+            turn = float(t.get("turnover24h") or 0)
+        except (TypeError, ValueError):
             continue
-        if price > 0 and turnover >= MIN_TURNOVER_24H:
-            out[sym] = price
-    return out
+        if bid <= 0 or ask <= 0 or ask < bid:
+            continue
+        if turn < TURN_MIN:
+            continue
+        mid = (ask + bid) / 2
+        spread = (ask - bid) / mid * 100
+        if spread >= SPREAD_MIN:
+            hits.append((spread, t["symbol"], bid, ask, turn))
+    hits.sort(reverse=True)
+    return hits
 
 
-def get_hl(symbol, interval, limit):
-    """Возвращает (max_high, min_low) за последние BARS_BACK закрытых свечей."""
-    try:
-        url = (f"{PROXY}/kline?category=linear&symbol={symbol}"
-               f"&interval={interval}&limit={limit}")
-        r = requests.get(url, timeout=20)
-        raw = r.json()["result"]["list"]
-    except Exception:
-        return None
-    raw = raw[::-1]              # новые -> в хронологический порядок
-    raw = raw[:-1]              # только закрытые свечи
-    if len(raw) < 5:
-        return None
-    sl = raw[-BARS_BACK:] if len(raw) > BARS_BACK else raw
-    hh = max(float(k[2]) for k in sl)
-    ll = min(float(k[3]) for k in sl)
-    return hh, ll
-
-
-# ==================== БАЗА УРОВНЕЙ ====================
-def build_levels(symbols):
-    db = {}
-    for sym in symbols:
-        entry = {}
-        for interval, label in LEVEL_TFS:
-            hl = get_hl(sym, interval, LEVEL_LIMIT)
-            time.sleep(REQUEST_SLEEP)
-            if hl:
-                entry[label] = hl   # (hh, ll)
-        if entry:
-            db[sym] = entry
-    return db
-
-
-# ==================== ХЕЛПЕРЫ ====================
-def fmt(p):
-    if p >= 100:
-        return f"{p:.2f}"
-    if p >= 1:
-        return f"{p:.4f}"
-    if p >= 0.01:
-        return f"{p:.5f}"
-    return f"{p:.7f}"
-
-
-def evaluate(price, entry):
-    """Ближайший глобальный уровень (max/min за 100 свечей на 4ч/1д) в зоне подхода."""
-    best = None
-    best_dist = APPROACH_PCT + 1
-
-    for label, (hh, ll) in entry.items():
-        # сопротивление = экстремум-хай ВЫШЕ цены
-        if hh > price:
-            d = (hh - price) / price
-            if d <= APPROACH_PCT and d < best_dist:
-                best_dist = d
-                best = (f"{label} сопротивление ↑", hh, d)
-        # поддержка = экстремум-лоу НИЖЕ цены
-        if ll < price:
-            d = (price - ll) / price
-            if d <= APPROACH_PCT and d < best_dist:
-                best_dist = d
-                best = (f"{label} поддержка ↓", ll, d)
-
-    return best
-
-
-def build_alert(symbol, price, info):
-    kind, lvl, dist = info
-    return (
-        f"🎯 <b>ПОДХОД К УРОВНЮ</b> — {symbol}\n\n"
-        f"Цена {fmt(price)} → {kind} <b>{fmt(lvl)}</b> ({dist*100:.2f}%)\n\n"
-        f"👉 Смотри стакан: плотность / закол / срыв стопов"
-    )
-
-
-# ==================== MAIN ====================
 def main():
-    tg("📡 Радар глобальных уровней запущен (max/min 100 свечей · 4ч + 1д)")
-    levels_db = {}
-    last_build = 0
-    last_alert = {}
-
+    log(f"start | {CATEGORY} | порог {SPREAD_MIN}% | оборот>{TURN_MIN:.0f} | опрос {POLL_SEC}с")
+    send_telegram(f"🟢 Spread-скринер запущен\nКатегория: {CATEGORY}\nПорог: {SPREAD_MIN}%")
     while True:
-        tickers = get_tickers()
-        symbols = list(tickers.keys())
-        now = time.time()
-
-        if now - last_build > REFRESH_LEVELS_SEC or not levels_db:
-            ts = datetime.now(timezone.utc).strftime("%H:%M:%S")
-            print(f"[{ts}] Строю базу уровней по {len(symbols)} монетам...")
-            levels_db = build_levels(symbols)
-            last_build = time.time()
-            print(f"База готова: {len(levels_db)} монет")
-
-        alerts = 0
-        for sym in symbols:
-            entry = levels_db.get(sym)
-            if not entry:
-                continue
-            price = tickers[sym]
-            info = evaluate(price, entry)
-            if not info:
-                continue
-
-            lvl = info[1]
-            key = f"{sym}:{lvl:.6g}"
-            if now - last_alert.get(key, 0) < ALERT_COOLDOWN:
-                continue
-            last_alert[key] = now
-            tg(build_alert(sym, price, info))
-            alerts += 1
-            print("ALERT:", sym, fmt(lvl))
-
-        ts = datetime.now(timezone.utc).strftime("%H:%M:%S")
-        print(f"[{ts}] Алертов за цикл: {alerts}")
-        time.sleep(LOOP_PAUSE)
+        try:
+            now = time.time()
+            for spread, sym, bid, ask, turn in scan():
+                if now - _last_alert.get(sym, 0) < COOLDOWN:
+                    continue
+                _last_alert[sym] = now
+                send_telegram(
+                    f"⚡️ <b>{sym}</b>  спред <b>{spread:.2f}%</b>\n"
+                    f"bid {bid:g} / ask {ask:g}\n"
+                    f"оборот 24ч: {turn:,.0f} USDT"
+                )
+                log(f"ALERT {sym} {spread:.2f}%")
+        except Exception as e:
+            log(f"loop error: {e}")
+        time.sleep(POLL_SEC)
 
 
 if __name__ == "__main__":
